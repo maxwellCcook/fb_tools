@@ -52,6 +52,35 @@ _DEFAULTS = {
 }
 
 
+def stacked_output_path(output_root, lcp_path, scenario):
+    """
+    Return the expected path to the stacked FlamMap output for one run.
+
+    Mirrors the naming convention used by :func:`run_batch` and
+    :func:`~fb_tools.fuelscape.lcp.stack_rasters`::
+
+        output_root/<lcp_stem>/<scenario>/<scenario>_<LCP_STEM>.tif
+
+    Parameters
+    ----------
+    output_root : str or Path
+        Root directory passed to :func:`run_batch`.
+    lcp_path : str or Path
+        LCP file path (same value used in the scenarios DataFrame).
+    scenario : str
+        Scenario name (``Scenario`` column value, e.g. ``"Pct97"``).
+
+    Returns
+    -------
+    Path
+        Full path to the expected stacked GeoTIFF.  The file is not
+        checked for existence; call ``.exists()`` if needed.
+    """
+    lcp_stem = Path(lcp_path).stem
+    out_dir  = Path(output_root) / lcp_stem / scenario
+    return out_dir / f"{scenario}_{lcp_stem.upper()}.tif"
+
+
 def load_scenarios(csv_path, lcp_dir=None):
     """
     Load a FlamMap scenario CSV into a DataFrame.

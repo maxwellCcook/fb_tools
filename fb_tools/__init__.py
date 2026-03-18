@@ -35,7 +35,7 @@ from .fuelscape import (
     apply_treatment,
     build_surface_lut,
 )
-from .models import run_flammap_scenarios, load_scenarios, build_scenarios, run_batch
+from .models import run_flammap_scenarios, load_scenarios, build_scenarios, run_batch, stacked_output_path
 from .utils import (
     is_valid_geom,
     mask_raster,
@@ -60,6 +60,7 @@ __all__ = [
     "load_scenarios",
     "build_scenarios",
     "run_batch",
+    "stacked_output_path",
     # utils
     "is_valid_geom",
     "mask_raster",

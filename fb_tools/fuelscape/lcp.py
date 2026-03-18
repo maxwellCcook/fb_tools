@@ -80,10 +80,9 @@ def stack_rasters(in_dir, tag=None, out_dir=None, cleanup=True):
 
     bands, band_names = [], []
     for tif in tifs:
-        band_name = tif.stem.split("_")[1]
+        band_name = tif.stem.rsplit("_", 1)[-1]
         band_names.append(band_name)
         da = rxr.open_rasterio(tif).squeeze().load()  # .load() pulls into memory
-        da.attrs["long_name"] = f"{file_prefix}_{band_name}"
         bands.append(da)
 
     print(band_names)

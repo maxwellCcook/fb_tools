@@ -406,8 +406,10 @@ def _trail_density_grid(trails_gdf, reference_da, radius_m=56.42):
 
 # ── Public API ───────────────────────────────────────────────────────────────
 
-def calculate_sdi(lcp, flame_length, heat_area, roads_gdf, trails_gdf,
-                  rtc_path, out_path=None):
+def calculate_sdi(lcp, roads_gdf, trails_gdf, rtc_path,
+                  flammap_stack=None,
+                  flame_length=None, heat_area=None,
+                  out_path=None):
     """
     Calculate the Suppression Difficulty Index (SDI) for a landscape.
 
@@ -419,15 +421,11 @@ def calculate_sdi(lcp, flame_length, heat_area, roads_gdf, trails_gdf,
     ----------
     lcp : str, Path, or xarray.DataArray
         Landscape Characteristic Package raster.  Must contain bands named
-        ``SLP`` (slope, % rise), ``ASP`` (aspect, degrees), and ``FBFM40``
-        (40-class fuel model) in the ``long_name`` attribute.  Opened with
-        rioxarray if a file path is supplied.
-    flame_length : str, Path, or xarray.DataArray
-        FlamMap FLAMELENGTH output raster, in metres.  Reprojected to the
-        *lcp* grid if extents differ.
-    heat_area : str, Path, or xarray.DataArray
-        FlamMap HEATAREA output raster, in kJ/m².  Reprojected to the
-        *lcp* grid if extents differ.
+        ``SlpD`` (slope in degrees, as downloaded by LFPS with ``LF2020_SLPD``),
+        ``Asp`` (aspect, degrees 0–360), and ``FBFM40`` (40-class fuel model)
+        in the ``long_name`` attribute.  Slope is converted internally to
+        percent rise for SDI classification.  Opened with rioxarray if a file
+        path is supplied.
     roads_gdf : GeoDataFrame
         Road features with a ``highway_code`` column (1–9).  Obtain via
         :func:`~fb_tools.suppression.roads.fetch_osm_roads`.
@@ -438,6 +436,21 @@ def calculate_sdi(lcp, flame_length, heat_area, roads_gdf, trails_gdf,
         Path to the RTC (Resistance to Crew) lookup text file.  Format:
         ``FBFM40_code:RTC_value`` per line.  The western US 2021 version
         ships in ``code/dev/SDI/08_RTC_lookup_SDIwt_westernUS_2021_update.txt``.
+    flammap_stack : str, Path, or xarray.DataArray, optional
+        Stacked multi-band FlamMap output (produced by ``run_batch`` with
+        ``stack_out=True``).  Must contain bands named ``FLAMELENGTH`` and
+        ``HEATAREA`` in the ``long_name`` attribute.  Use
+        :func:`~fb_tools.models.scenarios.stacked_output_path` to resolve
+        the path from batch run parameters.  Mutually exclusive with
+        *flame_length* / *heat_area*; provide one or the other.
+    flame_length : str, Path, or xarray.DataArray, optional
+        FlamMap FLAMELENGTH output raster, in metres.  Required when
+        *flammap_stack* is not provided.  Reprojected to the *lcp* grid if
+        extents differ.
+    heat_area : str, Path, or xarray.DataArray, optional
+        FlamMap HEATAREA output raster, in kJ/m².  Required when
+        *flammap_stack* is not provided.  Reprojected to the *lcp* grid if
+        extents differ.
     out_path : str or Path, optional
         If provided, the SDI raster is written to this GeoTIFF path.
 
@@ -473,6 +486,20 @@ def calculate_sdi(lcp, flame_length, heat_area, roads_gdf, trails_gdf,
         output      = round(sdi_final × 100) as int16
     """
     from ..fuelscape.adjust import _normalize_band_name
+    from ..fuelscape.lcp import get_band_by_longname
+
+    # ── Accept stacked FlamMap output as single-file alternative ─────────────
+    if flammap_stack is not None:
+        if isinstance(flammap_stack, (str, Path)):
+            flammap_stack = rxr.open_rasterio(Path(flammap_stack), masked=True)
+        flame_length = get_band_by_longname(flammap_stack, "FLAMELENGTH")
+        heat_area    = get_band_by_longname(flammap_stack, "HEATAREA")
+        del flammap_stack
+        gc.collect()
+    elif flame_length is None or heat_area is None:
+        raise ValueError(
+            "Provide either 'flammap_stack' or both 'flame_length' and 'heat_area'."
+        )
 
     # ── Load rasters if paths were provided ─────────────────────────────────
     if isinstance(lcp, (str, Path)):
@@ -498,7 +525,7 @@ def calculate_sdi(lcp, flame_length, heat_area, roads_gdf, trails_gdf,
         _normalize_band_name(n): int(b)
         for n, b in zip(long_names, lcp.band.values)
     }
-    required = {"SLP", "ASP", "FBFM40"}
+    required = {"SlpD", "Asp", "FBFM40"}
     missing = required - band_map.keys()
     if missing:
         raise ValueError(
@@ -507,15 +534,18 @@ def calculate_sdi(lcp, flame_length, heat_area, roads_gdf, trails_gdf,
         )
 
     # ── Reference grid: single-band 2-D DataArray ───────────────────────────
-    ref = lcp.sel(band=band_map["SLP"]).squeeze()
+    ref = lcp.sel(band=band_map["SlpD"]).squeeze()
 
     # ── Align fire behavior outputs to LCP grid if needed ───────────────────
     flame_length = _align_to_reference(flame_length.squeeze(), ref)
     heat_area    = _align_to_reference(heat_area.squeeze(), ref)
 
     # ── Extract numpy arrays (float32 throughout to conserve memory) ─────────
-    slope  = lcp.sel(band=band_map["SLP"]).values.squeeze().astype(np.float32)
-    aspect = lcp.sel(band=band_map["ASP"]).values.squeeze().astype(np.float32)
+    # SLPD band is in degrees (as required by FlamMap); convert to percent rise
+    # for SDI classification functions (all breakpoints use percent rise).
+    slope  = lcp.sel(band=band_map["SlpD"]).values.squeeze().astype(np.float32)
+    slope  = (np.tan(np.radians(slope)) * 100.0).astype(np.float32)
+    aspect = lcp.sel(band=band_map["Asp"]).values.squeeze().astype(np.float32)
     fbfm40 = lcp.sel(band=band_map["FBFM40"]).values.squeeze()
     fl_arr = flame_length.values.astype(np.float32)
     hu_arr = heat_area.values.astype(np.float32)

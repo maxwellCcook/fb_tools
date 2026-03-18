@@ -294,3 +294,5 @@ Output paths for model runs should use Windows-style paths or UNC paths when cal
 ## Author
 
 Max C. Cook — [maxwell.cook@colostate.edu](mailto:maxwell.cook@colostate.edu)
+This README and some repo contents were developed with help from Claude Sonnet 4.6
+Claude memory available on request.

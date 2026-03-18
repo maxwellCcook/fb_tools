@@ -22,6 +22,10 @@ fb_tools.suppression
     Suppression Difficulty Index (SDI) calculation and OSM road/trail
     extraction.
 
+fb_tools.analysis
+    Treatment-level fire behavior change analysis (flame length bins,
+    crown state, SDI delta summaries).
+
 fb_tools.weather
     Weather input generation — GridMET, RAWS (coming soon).
 """
@@ -45,6 +49,7 @@ from .utils import (
     plot_bands,
 )
 from .suppression import calculate_sdi, calculate_delta_sdi, fetch_osm_roads
+from .analysis import summarize_treatments, run_treatment_pipeline
 
 __all__ = [
     # fuelscape
@@ -72,4 +77,7 @@ __all__ = [
     "calculate_sdi",
     "calculate_delta_sdi",
     "fetch_osm_roads",
+    # analysis
+    "summarize_treatments",
+    "run_treatment_pipeline",
 ]

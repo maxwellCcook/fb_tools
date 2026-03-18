@@ -1,0 +1,86 @@
+# =============================================================================
+# fb_tools — conda environment
+# =============================================================================
+# Supports macOS (Apple Silicon / Intel) and Windows (including Parallels Pro).
+# FlamMap / FSPro / FSim executables are Windows-only; data prep and fuelscape
+# workflows run on either platform.
+#
+# --- IMPORTANT: always create from Anaconda Prompt (not PowerShell) ---
+# Anaconda Prompt sets the DLL search path correctly on Windows.
+#
+# --- One-time conda config (run once per machine, then forget it) ---
+#
+#   conda config --set channel_priority strict
+#
+# --- Create the environment (run from the repo root) ---
+#
+#   conda env create -f environment.yml
+#   conda activate fb_tools
+#   pip install -e . --no-deps    ← --no-deps is critical: prevents pip from
+#                                    overwriting conda's GDAL/rasterio DLLs
+#
+# --- Rebuild after changes ---
+#
+#   conda env remove -n fb_tools
+#   conda env create -f environment.yml
+#   conda activate fb_tools
+#   pip install -e . --no-deps
+#
+# --- Why channel_priority strict? ---
+# Miniconda/Anaconda's global .condarc may silently inject the 'defaults'
+# channel even when nodefaults is listed here. strict priority + nodefaults
+# guarantees that the entire geospatial stack (GDAL/PROJ/rasterio) is built
+# from the same conda-forge ABI. Mixed-channel builds cause DLL load failures
+# on Windows.
+#
+# =============================================================================
+
+name: fb_tools
+
+channels:
+  - conda-forge    # single-channel for consistent cross-platform builds
+  - nodefaults     # removes implicit defaults fallback within this file
+
+dependencies:
+
+  # ── Python ────────────────────────────────────────────────────────────────
+  - python>=3.10,<3.13
+
+  # ── Core numerical / data ─────────────────────────────────────────────────
+  - numpy>=1.24
+  - pandas>=2.0
+  - scipy>=1.11              # future weather / statistical modules
+
+  # ── Geospatial stack ──────────────────────────────────────────────────────
+  # Explicit GDAL/PROJ pins keep the shared C libraries consistent with
+  # rasterio's compiled extensions. Mixing conda-forge and defaults builds
+  # of these packages causes DLL load failures on Windows.
+  - gdal>=3.6,<3.10
+  - proj>=9.1
+  - libgdal>=3.6,<3.10       # explicit shared-library pin (Windows DLL safety)
+  - geopandas>=0.14          # pulls in shapely>=2.0, pyproj>=3.6
+  - shapely>=2.0
+  - pyproj>=3.6
+  - pyogrio>=0.7             # fast I/O backend for geopandas (replaces fiona)
+  - rasterio>=1.3
+  - rioxarray>=0.15          # xarray + rasterio bridge; .rio accessor
+  - xarray>=2023.6
+  - geocube>=0.4             # rasterize vector → raster (rasterize() in utils)
+  - osmnx>=1.9               # OSM road/trail network fetch for SDI inputs
+
+  # ── HTTP / I-O ─────────────────────────────────────────────────────────────
+  - requests>=2.28           # LFPS REST API client
+
+  # ── Visualization ──────────────────────────────────────────────────────────
+  - matplotlib>=3.7
+
+  # ── Jupyter ────────────────────────────────────────────────────────────────
+  - jupyterlab>=4.0
+  - notebook>=7.0            # classic notebook server (IntelliJ / PyCharm)
+  - ipykernel>=6.25
+
+  # ── Dev / quality-of-life ─────────────────────────────────────────────────
+  - pip                      # needed for editable install below
+
+  # ── fb_tools (editable) ───────────────────────────────────────────────────
+  # Run `pip install -e .` from the repo root after `conda activate fb_tools`.

@@ -1,0 +1,122 @@
+"""
+FlamMap CLI wrapper.
+
+Writes the FlamMap short-term input file and command file, then invokes
+TestFlamMap.exe via the shared CLI runner.
+
+Notes on cross-platform paths
+------------------------------
+All paths are handled through ``pathlib.Path``.  The executable itself must
+be a Windows binary and is therefore typically run inside Parallels or a
+Windows VM — pass the *Windows* path to *fm_exe* when running on Windows,
+or a Parallels-accessible UNC / mapped path when calling from macOS.
+"""
+
+from pathlib import Path
+
+from .base import run_cli
+from ..fuelscape.lcp import stack_rasters
+
+
+def run_flammap_scenarios(
+    fm_exe,
+    lcp_fp,
+    fm_params,
+    output_directory,
+    n_process=1,
+    tag=None,
+    stack_out=False,
+    cleanup=False,
+):
+    """
+    Run a single FlamMap scenario for a given landscape and weather condition.
+
+    Writes ``FlamMap.input`` and ``FMcommand.txt`` into *output_directory*,
+    then executes ``TestFlamMap.exe``.
+
+    Parameters
+    ----------
+    fm_exe : str or Path
+        Path to ``TestFlamMap.exe``.
+    lcp_fp : str or Path
+        Path to the landscape file (.lcp or .tif).
+    fm_params : dict or pandas.Series
+        Scenario parameters.  Expected keys:
+
+        - ``FM_1hr``, ``FM_10hr``, ``FM_100hr``, ``FM_herb``, ``FM_woody``
+          — dead/live fuel moistures (%)
+        - ``CROWN_FIRE_METHOD`` — ``1`` (Rothermel) or ``2`` (Scott & Reinhardt)
+        - ``WIND_SPEED`` — 20-ft wind speed (mph)
+        - ``WIND_DIRECTION`` — wind azimuth (degrees); ``-1`` = uphill, ``-2`` = downhill
+        - ``GRIDDED_WINDS_GENERATE`` — ``"Yes"`` to enable WindNinja
+        - ``GRIDDED_WINDS_RESOLUTION`` — WindNinja resolution (m), required when above is ``"Yes"``
+        - ``Outputs`` — comma-separated output names, e.g.
+          ``"FLAMELENGTH, CROWNSTATE, SPREADRATE"``
+        - ``LCPType`` — label for this fuelscape (used as *tag* if not provided)
+
+    output_directory : str or Path
+        Directory where input files and outputs are written.
+    n_process : int
+        Number of processor threads passed to FlamMap (default ``1``).
+    tag : str, optional
+        Override the run label (defaults to ``fm_params["LCPType"]``).
+    stack_out : bool
+        Stack individual output TIFFs into a single multi-band file
+        (default ``False``).
+    cleanup : bool
+        Delete single-band TIFFs after stacking; only relevant when
+        *stack_out* is ``True`` (default ``False``).
+
+    Returns
+    -------
+    subprocess.CompletedProcess
+    """
+    output_directory = Path(output_directory)
+    output_directory.mkdir(parents=True, exist_ok=True)
+
+    if tag is None:
+        tag = fm_params.get("LCPType", Path(lcp_fp).stem)
+
+    input_file = output_directory / "FlamMap.input"
+    command_file = output_directory / "FMcommand.txt"
+
+    # --- Write the FlamMap short-term input file
+    with open(input_file, "w") as f:
+        f.write("ShortTerm-Inputs-File-Version-1\n\n")
+
+        f.write("FUEL_MOISTURES_DATA: 1\n")
+        f.write(
+            f"0 {fm_params['FM_1hr']} {fm_params['FM_10hr']} "
+            f"{fm_params['FM_100hr']} {fm_params['FM_herb']} {fm_params['FM_woody']}\n"
+        )
+        f.write("FOLIAR_MOISTURE_CONTENT: 100\n")
+        f.write(f"CROWN_FIRE_METHOD: {fm_params['CROWN_FIRE_METHOD']}\n")
+        f.write(f"NUMBER_PROCESSORS: {n_process}\n")
+        f.write(f"WIND_SPEED: {fm_params['WIND_SPEED']}\n")
+        f.write(f"WIND_DIRECTION: {fm_params['WIND_DIRECTION']}\n")
+
+        if fm_params.get("GRIDDED_WINDS_GENERATE") == "Yes":
+            f.write("GRIDDED_WINDS_GENERATE: Yes\n")
+            f.write(f"GRIDDED_WINDS_RESOLUTION: {fm_params['GRIDDED_WINDS_RESOLUTION']}\n")
+
+        outputs = [o.strip() for o in str(fm_params["Outputs"]).split(",") if o.strip()]
+        for output_type in outputs:
+            f.write(f"{output_type}: 1\n")
+
+    # --- Write the FlamMap command file
+    # Format: <lcp_path> <input_filename> <output_dir> <mode>
+    with open(command_file, "w") as f:
+        f.write(f"{Path(lcp_fp)} {input_file.name} . 2\n")
+
+    # --- Run the model
+    result = run_cli(
+        exe_path=fm_exe,
+        command_file=command_file,
+        output_dir=output_directory,
+    )
+
+    # --- Optionally stack outputs
+    if stack_out:
+        stack_rasters(in_dir=output_directory, tag=tag, cleanup=cleanup)
+
+    return result

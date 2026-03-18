@@ -1,0 +1,13 @@
+Treatment,cbd_AF,cbh_AF,cc_AF,ch_AF
+Thin,0.6,1.2,0.7,1.2
+Hand Thin,0.8,1.1,0.75,1.1
+Mech Thin,0.6,1.3,0.6,1.3
+RxFire,0.92,1.09,0.95,1.13
+Complete Hand,0.8,1.1,0.75,1.1
+Complete Mech,0.6,1.3,0.6,1.3
+Masticate,0.8,1.1,0.75,1.1
+Patch,0,0,0,0
+LowSevWF,0.85,1.1,0.85,1.1
+ModSevWF,0.45,1.25,0.45,1.25
+HighSevWF,0.1,1.5,0.1,1.5
+Overstory,0.8,1,0.8,0.5

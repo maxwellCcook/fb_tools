@@ -19,44 +19,13 @@ import requests
 _LFPS_SUBMIT_URL = "https://lfps.usgs.gov/api/job/submit"
 _LFPS_STATUS_URL = "https://lfps.usgs.gov/api/job/status"
 
-# LFPS product codes by LF version.  The canopy/fuel layers in version 200
-# carry a year-update suffix (_19 or _20) that is absent in later versions.
-# EVT has no suffix in any version confirmed so far.
 # Add entries here as new versions are verified against the LFPS products table:
 # https://lfps.usgs.gov/products
-_LAYER_CODES = {
-    "200": {
-        "FBFM40": "200F40_20",
-        "CC":     "200CC_20",
-        "CH":     "200CH_20",
-        "CBH":    "200CBH_20",
-        "CBD":    "200CBD_20",
-        "EVT":    "200EVT",
-    },
-}
-
-def _get_layer_codes(lf_version):
-    """Return band-name → LFPS product code mapping for *lf_version*.
-
-    Falls back to the simple ``{version}{band}`` pattern for versions not yet
-    in the lookup table (e.g., 220, 230).
-    """
-    if lf_version in _LAYER_CODES:
-        return _LAYER_CODES[lf_version]
-    return {
-        "FBFM40": f"{lf_version}FBFM40",
-        "CC":     f"{lf_version}CC",
-        "CH":     f"{lf_version}CH",
-        "CBH":    f"{lf_version}CBH",
-        "CBD":    f"{lf_version}CBD",
-        "EVT":    f"{lf_version}EVT",
-    }
-
 
 def lfps_request(
     region,
     out_dir,
-    lf_version,
+    lf_year,
     layer_list=None,
     edit_rules=None,
     lodgepole_adjust=False,
@@ -78,8 +47,8 @@ def lfps_request(
         Area of interest. The bounding box (in WGS-84) is sent to LFPS.
     out_dir : str or Path
         Directory where extracted files are written.
-    lf_version : str
-        LANDFIRE product vintage prefix, e.g. ``"230"`` for 2023.
+    lf_year : str
+        LANDFIRE year (e.g., 2023).
     layer_list : str, optional
         Semi-colon-delimited LFPS layer string.  Defaults to the standard
         8-layer landscape stack (topo + fuel + EVT) using *lf_version*.
@@ -99,11 +68,18 @@ def lfps_request(
     poll_interval : int
         Seconds to wait between status checks (default ``30``).
     """
+    codes = {
+        "FBFM40": f"LF{lf_year}_FBFM40",
+        "CC":     f"LF{lf_year}_CC",
+        "CH":     f"LF{lf_year}_CH",
+        "CBH":    f"LF{lf_year}_CBH",
+        "CBD":    f"LF{lf_year}_CBD",
+        "EVT":    f"LF{lf_year}_EVT",
+    }
     # --- 1. Build the layer list for the requested vintage
-    codes = _get_layer_codes(lf_version)
     if layer_list is None:
         layer_list = (
-            f"ELEV2020;SLPD2020;ASP2020;"
+            f"LF2020_Elev;LF2020_SlpD;LF2020_Asp;" # default 2020 topography
             f"{codes['FBFM40']};"
             f"{codes['CC']};"
             f"{codes['CH']};"

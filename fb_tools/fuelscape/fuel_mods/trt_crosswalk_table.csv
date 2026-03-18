@@ -1,0 +1,21 @@
+Agency,Treatment,CanEff,SurfEff
+DOI,Biomass Removal,None,Manage
+DOI,Broadcast Burn,Rx fire,Rx fire
+DOI,Hand Pile,None,Manage
+DOI,Hand Pile Burn,None,Manage
+DOI,Machine Pile Burn,None,Manage
+DOI,Mowing,None,Manage
+DOI,Thinning,Thin,None
+USFS,Biomass Removal,None,Manage
+USFS,Broadcast Burn,Rx fire,Rx fire
+USFS,Crushing,None,Masticate
+USFS,Grazing,None,Manage
+USFS,Lop and Scatter,None,Lop and scatter
+USFS,Machine Pile,None,Manage
+USFS,Machine Pile Burn,None,Manage
+USFS,Thinning,Thin,None
+USFS,Chemical,None,None
+USFS,Chipping,None,Masticate
+USFS,Fire Use,Rx fire,Rx fire
+USFS,Jackpot Burn,Rx fire,Rx fire
+USFS,N/A,None,None

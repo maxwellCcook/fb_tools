@@ -15,25 +15,8 @@ import xarray as xr
 
 def _normalize_band_name(name):
     """Normalize an LFPS product code to a short canonical band name.
-
-    Handles codes like ``200CC_20``, ``200F40_20``, ``ELEV2020``,
-    ``US_200CBH_20``, etc.  The canonical names used internally are:
-    ``ELEV``, ``SLP``, ``ASP``, ``FBFM40``, ``CC``, ``CH``, ``CBH``,
-    ``CBD``, ``EVT``.
     """
-    # strip optional region prefix (US_, AK_, HI_)
-    name = re.sub(r'^[A-Z]{2}_', '', name)
-    # strip leading LF version number (3 digits)
-    name = re.sub(r'^\d{3}', '', name)
-    # strip trailing 2-digit year suffix (_19, _20, …)
-    name = re.sub(r'_\d{2}$', '', name)
-    # strip trailing 4-digit year (topo layers: ELEV2020, SLPD2020, ASP2020)
-    name = re.sub(r'\d{4}$', '', name)
-    # normalise abbreviated codes
-    if name == 'F40':
-        name = 'FBFM40'
-    if name == 'SLPD':
-        name = 'SLP'
+    name = name.split("_")[1]
     return name
 
 
@@ -170,17 +153,11 @@ def apply_treatment(lcp, canopy_df, surface_df, scenario, band_map=None, mask=No
     if isinstance(lcp, (str, Path)):
         lcp = rxr.open_rasterio(Path(lcp), masked=True)
 
-    # --- auto-detect band map from long_name attribute
-    if band_map is None:
-        long_names = lcp.attrs.get("long_name", [])
-        if not long_names:
-            raise ValueError(
-                "band_map not provided and no long_name attribute found in lcp."
-            )
-        if isinstance(long_names, str):
-            long_names = [long_names]
-        band_map = {_normalize_band_name(name): int(idx)
-                    for name, idx in zip(long_names, lcp["band"].values)}
+    # --- Create a band map from the input LCP
+    long_names = lcp.attrs.get("long_name", [])
+    band_map = {
+        _normalize_band_name(name): idx for idx, name in enumerate(long_names, start=1)
+    }
 
     out = lcp.copy(deep=True)
 

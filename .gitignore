@@ -4,6 +4,9 @@ archive/
 # ignore data folder
 data/
 
+# ignore FM library
+FM/
+
 # ignore PyCharm-specific files
 *.idea
 

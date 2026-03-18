@@ -1,0 +1,16 @@
+# ignore archive folders
+archive/
+
+# ignore data folder
+data/
+
+# ignore PyCharm-specific files
+*.idea
+
+# ignore Claude-specific files
+*.claude
+
+# ignore Python-specific files
+*.egg-info/
+*.ipynb_checkpoints
+__pycache__/

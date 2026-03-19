@@ -27,6 +27,7 @@ def run_flammap_scenarios(
     tag=None,
     stack_out=False,
     cleanup=False,
+    mask=None,
 ):
     """
     Run a single FlamMap scenario for a given landscape and weather condition.
@@ -66,6 +67,11 @@ def run_flammap_scenarios(
     cleanup : bool
         Delete single-band TIFFs after stacking; only relevant when
         *stack_out* is ``True`` (default ``False``).
+    mask : GeoDataFrame, optional
+        If provided, every output GeoTIFF in *output_directory* is clipped
+        to the union of these geometries before stacking.  Reduces file sizes
+        when the LCP covers a larger extent than the region of interest.
+        Default ``None``.
 
     Returns
     -------
@@ -114,6 +120,14 @@ def run_flammap_scenarios(
         command_file=command_file,
         output_dir=output_directory,
     )
+
+    # --- Optionally clip outputs before stacking (smaller files → faster stack)
+    if mask is not None:
+        from ..utils.geo import clip_raster_inplace
+        tifs = list(output_directory.glob("*.tif"))
+        print(f"Clipping {len(tifs)} output TIFF(s) to mask ...")
+        for tif in tifs:
+            clip_raster_inplace(tif, mask)
 
     # --- Optionally stack outputs
     if stack_out:

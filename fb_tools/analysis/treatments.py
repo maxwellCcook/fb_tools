@@ -20,6 +20,8 @@ and ``'sdi'``, following the output format of the TEALOM reference workflow.
 import gc
 from pathlib import Path
 
+import rioxarray as rxr
+import xarray as xr
 import numpy as np
 import pandas as pd
 
@@ -27,7 +29,7 @@ from ..models.scenarios import build_scenarios, run_batch, stacked_output_path
 from ..fuelscape.adjust import apply_treatment
 from ..suppression.sdi import calculate_sdi
 from ..utils.geo import geom_to_raster_crs
-from .zonal import zonal_categorical, zonal_continuous
+from .zonal import zonal_categorical, zonal_continuous, _make_zone_arr
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +49,7 @@ _CS_CLASSES = {0: "NonBurnable", 1: "Surface", 2: "Passive Crown", 3: "Active Cr
 # Private helpers
 # ---------------------------------------------------------------------------
 
-def _find_flammap_raster(directory, percentile, band_name):
+def _find_fm_tif(directory, percentile, band_name):
     """
     Locate a FlamMap output GeoTIFF for a given percentile and band name.
 
@@ -61,7 +63,7 @@ def _find_flammap_raster(directory, percentile, band_name):
         Root output directory from run_batch for one LCP/treatment type.
         Should contain sub-directories named after each scenario/percentile.
     percentile : str
-        Scenario name (e.g., ``'Pct90'``).
+        Scenario name (e.g., ``'Pct97'``).
     band_name : str
         FlamMap output band name to search for (e.g., ``'FLAMELENGTH'``,
         ``'CROWNSTATE'``).
@@ -121,9 +123,6 @@ def _open_band(raster, band_name):
     xarray.DataArray
         Squeezed single-band DataArray.
     """
-    import rioxarray as rxr
-    import xarray as xr
-
     if isinstance(raster, xr.DataArray):
         da = raster
     else:
@@ -143,7 +142,7 @@ def _open_band(raster, band_name):
     return da.squeeze(drop=True)
 
 
-def _bin_fl_raster(raster, band_name="FLAMELENGTH"):
+def _bin_fl(raster, band_name="FLAMELENGTH"):
     """
     Open a flame-length raster, bin pixel values into 5 FL classes, and
     return the integer bin array with a reference DataArray.
@@ -165,10 +164,8 @@ def _bin_fl_raster(raster, band_name="FLAMELENGTH"):
     """
     da = _open_band(raster, band_name)
     arr = da.values.squeeze().astype(np.float32)
-
-    binned = np.digitize(arr, bins=_FL_BIN_EDGES_M).astype(np.int16)
-    binned = np.where(arr <= 0, -9999, binned)
-
+    binned = np.digitize(arr, bins=_FL_BIN_EDGES_M).astype(np.int8)
+    binned = np.where(arr <= 0, -1, binned) # set NoData explicitly
     return binned, da
 
 
@@ -192,39 +189,72 @@ def _load_cs_raster(raster, band_name="CROWNSTATE"):
         Single-band DataArray for use as the rasterize() reference grid.
     """
     da = _open_band(raster, band_name)
-    arr = da.values.squeeze().astype(np.int16)
-    arr = np.where((arr < 0) | (arr > 3), -9999, arr)
+    arr = da.values.squeeze()
+    arr = np.where(np.isnan(arr) | (arr < 0) | (arr > 3), -1, arr)
+    arr = arr.astype(np.int8)
     return arr, da
 
 
-def _zonal_fl(zones_gdf, id_col, raster, band_name="FLAMELENGTH"):
-    """Run zonal_categorical on a FL raster, returning labelled long DataFrame."""
-    binned, ref_da = _bin_fl_raster(raster, band_name)
-    zones_proj = geom_to_raster_crs(zones_gdf[[id_col, "geometry"]], ref_da)
-    df = zonal_categorical(zones_proj, binned, ref_da, id_col)
+def _zonal_fl(zones_gdf, id_col, raster, band_name="FLAMELENGTH", zone_arr=None):
+    """
+    Zonal categorical statistics on a flame-length raster.
+
+    Parameters
+    ----------
+    zones_gdf : GeoDataFrame or None
+        Treatment polygons. Ignored when *zone_arr* is provided.
+    id_col : str
+        Zone identifier column.
+    raster : str, Path, or xarray.DataArray
+        FlamMap FLAMELENGTH output.
+    band_name : str
+        Band name for stacked files.
+    zone_arr : numpy.ndarray, optional
+        Pre-burned zone grid from :func:`~.zonal._make_zone_arr`. When
+        provided, rasterization is skipped.
+    """
+    binned, ref_da = _bin_fl(raster, band_name)
+    if zone_arr is None:
+        zones = geom_to_raster_crs(zones_gdf[[id_col, "geometry"]], ref_da)
+        df = zonal_categorical(zones, binned, ref_da, id_col)
+    else:
+        df = zonal_categorical(None, binned, ref_da, id_col, zone_arr=zone_arr)
     del binned, ref_da
-    gc.collect()
-    # Map integer bin index → label
     df["FL_class"] = df["class_val"].map(dict(enumerate(_FL_BIN_LABELS)))
     return df.drop(columns="class_val")
 
 
-def _zonal_cs(zones_gdf, id_col, raster, band_name="CROWNSTATE"):
-    """Run zonal_categorical on a crown-state raster, returning labelled long DataFrame."""
+def _zonal_cs(zones_gdf, id_col, raster, band_name="CROWNSTATE", zone_arr=None):
+    """
+    Zonal categorical statistics on a crown-state raster.
+
+    Parameters
+    ----------
+    zones_gdf : GeoDataFrame or None
+        Treatment polygons. Ignored when *zone_arr* is provided.
+    id_col : str
+        Zone identifier column.
+    raster : str, Path, or xarray.DataArray
+        FlamMap CROWNSTATE output.
+    band_name : str
+        Band name for stacked files.
+    zone_arr : numpy.ndarray, optional
+        Pre-burned zone grid from :func:`~.zonal._make_zone_arr`. When
+        provided, rasterization is skipped.
+    """
     cs_arr, ref_da = _load_cs_raster(raster, band_name)
-    zones_proj = geom_to_raster_crs(zones_gdf[[id_col, "geometry"]], ref_da)
-    df = zonal_categorical(zones_proj, cs_arr, ref_da, id_col)
+    if zone_arr is None:
+        zones = geom_to_raster_crs(zones_gdf[[id_col, "geometry"]], ref_da)
+        df = zonal_categorical(zones, cs_arr, ref_da, id_col)
+    else:
+        df = zonal_categorical(None, cs_arr, ref_da, id_col, zone_arr=zone_arr)
     del cs_arr, ref_da
-    gc.collect()
     df["CS_class"] = df["class_val"].map(_CS_CLASSES)
     return df.drop(columns="class_val")
 
 
 def _zonal_sdi(zones_gdf, id_col, sdi_raster):
     """Run zonal_continuous on an SDI raster (int16, SDI × 100)."""
-    import rioxarray as rxr
-    import xarray as xr
-
     if isinstance(sdi_raster, xr.DataArray):
         da = sdi_raster.squeeze(drop=True)
     else:
@@ -328,8 +358,13 @@ def summarize_treatments(
       percentile, then joined to each treatment-type subset.
     - Treated metrics are computed per treatment-type subset (filtered by
       *type_col* == treatment_type) using the corresponding *treated_dirs* entry.
-    - ``rasterize()`` is called once per (percentile × metric × condition); the
-      zone grid is then reused across all zone IDs for that call.
+    - ``rasterize()`` is called once for all treatment polygons combined and
+      once per treatment-type subset. The resulting zone grids are reused
+      across all percentiles and metrics, reducing rasterization from
+      ``N_percentiles × 4 × N_types`` calls to ``N_types + 1`` calls.
+    - The per-zone numpy loops iterate only over pixels inside treatment
+      polygons (valid-pixel masking), skipping the large nodata regions
+      common in full-landscape FlamMap outputs.
     - SDI is not computed per-percentile; the SDI columns are identical across
       all percentile rows for each treatment.
     """
@@ -345,15 +380,35 @@ def summarize_treatments(
     fl_rows = []
     cs_rows = []
 
+    # ------------------------------------------------------------------
+    # Pre-rasterize zone grids — done ONCE per polygon scope, then reused
+    # across all percentiles and metrics to avoid repeated make_geocube calls.
+    # Zone arrays are built from the first available raster's reference grid
+    # (all FlamMap outputs for a given run share the same spatial grid).
+    # ------------------------------------------------------------------
+    all_zone_arr  = None   # zone grid for all treatment polygons (baseline)
+    trt_zone_arrs = {}     # {trt_type: zone_arr} for each treatment subset
+
     for pct in percentiles:
         print(f"  Processing percentile: {pct}")
 
         # --- Baseline FL and CS zonal stats (all polygons) ---
-        bl_fl_raster = _find_flammap_raster(baseline_dir, pct, "FLAMELENGTH")
-        bl_cs_raster = _find_flammap_raster(baseline_dir, pct, "CROWNSTATE")
+        bl_fl_raster = _find_fm_tif(baseline_dir, pct, "FLAMELENGTH")
+        bl_cs_raster = _find_fm_tif(baseline_dir, pct, "CROWNSTATE")
 
-        bl_fl = _zonal_fl(treatments_gdf, id_col, bl_fl_raster)
-        bl_cs = _zonal_cs(treatments_gdf, id_col, bl_cs_raster)
+        # Build the all-polygon zone array exactly once (first percentile).
+        if all_zone_arr is None:
+            print("    Building zone grid for all treatment polygons...")
+            _ref = _open_band(bl_fl_raster, "FLAMELENGTH")
+            _zones_proj = geom_to_raster_crs(
+                treatments_gdf[[id_col, "geometry"]], _ref
+            )
+            all_zone_arr = _make_zone_arr(_zones_proj, _ref, id_col)
+            del _ref, _zones_proj
+            gc.collect()
+
+        bl_fl = _zonal_fl(None, id_col, bl_fl_raster, zone_arr=all_zone_arr)
+        bl_cs = _zonal_cs(None, id_col, bl_cs_raster, zone_arr=all_zone_arr)
 
         # --- Per treatment type: treated FL and CS ---
         for trt_type, trt_dir in treated_dirs.items():
@@ -364,11 +419,24 @@ def summarize_treatments(
             if trt_subset.empty:
                 continue
 
-            tr_fl_raster = _find_flammap_raster(trt_dir, pct, "FLAMELENGTH")
-            tr_cs_raster = _find_flammap_raster(trt_dir, pct, "CROWNSTATE")
+            tr_fl_raster = _find_fm_tif(trt_dir, pct, "FLAMELENGTH")
+            tr_cs_raster = _find_fm_tif(trt_dir, pct, "CROWNSTATE")
 
-            tr_fl = _zonal_fl(trt_subset, id_col, tr_fl_raster)
-            tr_cs = _zonal_cs(trt_subset, id_col, tr_cs_raster)
+            # Build the per-type zone array once (first percentile for this type).
+            if trt_type not in trt_zone_arrs:
+                print(f"    Building zone grid for treatment type: {trt_type!r}...")
+                _ref = _open_band(tr_fl_raster, "FLAMELENGTH")
+                _zones_proj = geom_to_raster_crs(
+                    trt_subset[[id_col, "geometry"]], _ref
+                )
+                trt_zone_arrs[trt_type] = _make_zone_arr(_zones_proj, _ref, id_col)
+                del _ref, _zones_proj
+                gc.collect()
+
+            tr_fl = _zonal_fl(None, id_col, tr_fl_raster,
+                              zone_arr=trt_zone_arrs[trt_type])
+            tr_cs = _zonal_cs(None, id_col, tr_cs_raster,
+                              zone_arr=trt_zone_arrs[trt_type])
 
             # --- Merge and compute deltas: FL ---
             merged_fl = bl_fl[bl_fl[id_col].isin(trt_subset[id_col])].merge(

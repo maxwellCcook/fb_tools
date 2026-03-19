@@ -205,6 +205,7 @@ def run_batch(
     n_process=1,
     stack_out=False,
     cleanup=False,
+    mask=None,
 ):
     """
     Run all scenarios in *scenarios_df* and return a status summary.
@@ -235,6 +236,10 @@ def run_batch(
         Stack per-output TIFFs into a multi-band file after each run.
     cleanup : bool
         Delete single-band TIFFs after stacking.
+    mask : GeoDataFrame, optional
+        Passed through to :func:`run_flammap_scenarios`.  If provided,
+        output TIFFs are clipped to this geometry before stacking after
+        each scenario completes.  Default ``None``.
 
     Returns
     -------
@@ -271,6 +276,7 @@ def run_batch(
                 n_process=n_process,
                 stack_out=stack_out,
                 cleanup=cleanup,
+                mask=mask,
             )
         except Exception as exc:
             status = f"error: {exc}"

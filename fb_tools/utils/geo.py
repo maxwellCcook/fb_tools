@@ -61,11 +61,52 @@ def geom_to_raster_crs(zones_gdf, raster_fp):
     GeoDataFrame
         Reprojected (or unchanged) GeoDataFrame.
     """
-    with rxr.open_rasterio(raster_fp, masked=True) as da:
-        r_crs = da.rio.crs
+    if isinstance(raster_fp, str):
+        with rxr.open_rasterio(raster_fp, masked=True) as da:
+            r_crs = da.rio.crs
+    else:
+        r_crs = raster_fp.rio.crs
     if zones_gdf.crs != r_crs:
         return zones_gdf.to_crs(r_crs)
     return zones_gdf
+
+
+def clip_raster_inplace(path, mask_gdf):
+    """
+    Clip a GeoTIFF to the union of *mask_gdf* geometries, overwriting the
+    file in place.
+
+    Parameters
+    ----------
+    path : str or Path
+        GeoTIFF to clip.  Must be writable.
+    mask_gdf : GeoDataFrame
+        Clip geometry.  Reprojected to the raster CRS automatically.
+
+    Returns
+    -------
+    Path
+        Same path that was passed in.
+    """
+    from pathlib import Path as _Path
+    path = _Path(path)
+    with rio.open(path) as src:
+        shapes = list(mask_gdf.to_crs(src.crs).geometry)
+        clipped, clipped_transform = rio_mask(src, shapes, crop=True)
+        profile = src.profile.copy()
+        descriptions = src.descriptions
+
+    profile.update(
+        width=clipped.shape[2],
+        height=clipped.shape[1],
+        transform=clipped_transform,
+    )
+
+    with rio.open(path, "w", **profile) as dst:
+        dst.write(clipped)
+        dst.descriptions = descriptions
+
+    return path
 
 
 def rasterize(zones, to_img, attr="id", fill_val=-9999):

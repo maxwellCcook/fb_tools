@@ -13,7 +13,11 @@ fb_tools.fuelscape
     adjustments.
 
 fb_tools.models
-    CLI wrappers for FlamMap (and future models: FSPro, FSim, MTT).
+    CLI wrappers for FlamMap, MTT, and FSPro.
+
+fb_tools.spread
+    Probabilistic fire spread analysis — delta burn probability and
+    treatment effect summaries (downwind sector analysis).
 
 fb_tools.utils
     Shared geospatial and file-I/O helpers.
@@ -44,7 +48,23 @@ from .fuelscape import (
     apply_treatment,
     build_surface_lut,
 )
-from .models import run_flammap_scenarios, load_scenarios, build_scenarios, run_batch, stacked_output_path
+from .models import (
+    run_flammap_scenarios,
+    load_scenarios,
+    build_scenarios,
+    run_batch,
+    stacked_output_path,
+    build_mtt_scenarios,
+    run_mtt,
+    run_mtt_batch,
+    run_fspro,
+    run_fspro_batch,
+)
+from .spread import (
+    delta_burn_probability,
+    summarize_bp_treatments,
+    downwind_treatment_effect,
+)
 from .utils import (
     is_valid_geom,
     mask_raster,
@@ -79,6 +99,15 @@ __all__ = [
     "build_scenarios",
     "run_batch",
     "stacked_output_path",
+    "build_mtt_scenarios",
+    "run_mtt",
+    "run_mtt_batch",
+    "run_fspro",
+    "run_fspro_batch",
+    # spread
+    "delta_burn_probability",
+    "summarize_bp_treatments",
+    "downwind_treatment_effect",
     # utils
     "is_valid_geom",
     "mask_raster",

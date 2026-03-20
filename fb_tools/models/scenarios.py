@@ -51,6 +51,15 @@ _DEFAULTS = {
     "FM_NAME":   None,
 }
 
+# MTT-specific defaults applied by build_mtt_scenarios.
+_MTT_DEFAULTS = {
+    "MTT_RESOLUTION":           30,
+    "MTT_SIM_TIME":             400,
+    "MTT_TRAVEL_PATH_INTERVAL": 50,
+    "MTT_SPOT_PROBABILITY":     0.0,
+    "MTT_FILL_BARRIERS":        0,
+}
+
 
 def stacked_output_path(output_root, lcp_path, scenario):
     """
@@ -292,3 +301,50 @@ def run_batch(
         print(f"[{status}] {lcp_stem} / {scenario_name}")
 
     return pd.DataFrame(summary_rows)
+
+
+def build_mtt_scenarios(conditions, lcps, outputs=None, **defaults):
+    """
+    Build an MTT scenarios DataFrame from weather conditions and LCP files.
+
+    Identical to :func:`build_scenarios` but also fills ``_MTT_DEFAULTS``
+    (``MTT_RESOLUTION``, ``MTT_SIM_TIME``, ``MTT_TRAVEL_PATH_INTERVAL``,
+    ``MTT_SPOT_PROBABILITY``, ``MTT_FILL_BARRIERS``) so the resulting
+    DataFrame is accepted by :func:`~fb_tools.models.mtt.run_mtt_batch`.
+
+    Parameters
+    ----------
+    conditions : pd.DataFrame
+        Same as :func:`build_scenarios`.
+    lcps : list of str or Path
+        LCP files to pair with every condition row.
+    outputs : str, optional
+        Comma-separated MTT output flag names (e.g. ``"FLAMELENGTH, CROWNSTATE"``).
+        These are written as flag-style lines (``FLAMELENGTH:`` with no value)
+        in the MTT input file.  Overrides the ``Outputs`` column in *conditions*.
+    **defaults
+        Override any ``_DEFAULTS`` or ``_MTT_DEFAULTS`` key.
+
+    Returns
+    -------
+    pd.DataFrame
+        Same column layout as :func:`build_scenarios`, plus the five MTT
+        columns.
+    """
+    resolved_defaults = {**_DEFAULTS, **_MTT_DEFAULTS, **defaults}
+    if outputs is not None:
+        resolved_defaults["Outputs"] = outputs
+
+    cond = conditions.copy()
+    for col, val in resolved_defaults.items():
+        if col not in cond.columns:
+            cond[col] = val
+
+    rows = []
+    for lcp in lcps:
+        lcp = Path(lcp)
+        block = cond.copy()
+        block.insert(1, "LCP", str(lcp))
+        rows.append(block)
+
+    return pd.concat(rows, ignore_index=True)

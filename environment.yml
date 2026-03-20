@@ -82,5 +82,11 @@ dependencies:
   # ── Dev / quality-of-life ─────────────────────────────────────────────────
   - pip                      # needed for editable install below
 
+  # ── Optional: weather data access ────────────────────────────────────────
+  # herbie-data: HRRR/NOMADS/AWS GRIB access for fire-hour wind climatology.
+  # Not in conda-forge; install separately after environment creation:
+  #   pip install herbie-data
+  # (omitted here to avoid channel conflicts with the geospatial stack)
+
   # ── fb_tools (editable) ───────────────────────────────────────────────────
   # Run `pip install -e .` from the repo root after `conda activate fb_tools`.

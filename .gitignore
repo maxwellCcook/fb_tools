@@ -9,6 +9,9 @@ FM/
 
 cache/
 
+# ignore maps
+*.qgz
+
 # ignore PyCharm-specific files
 *.idea
 

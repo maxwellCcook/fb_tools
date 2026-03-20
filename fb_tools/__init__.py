@@ -75,6 +75,12 @@ from .utils import (
     plot_bands,
 )
 from .suppression import calculate_sdi, calculate_delta_sdi, fetch_osm_roads, fetch_counties
+from .weather import (
+    fetch_hrrr_winds_at_fires,
+    build_wind_cells,
+    build_pyrome_wind_cells,
+    load_pyrome_wind_cells,
+)
 from .analysis import summarize_treatments, run_treatment_pipeline
 from .plotting import (
     plot_fl_stackedbar,
@@ -116,6 +122,11 @@ __all__ = [
     "clip_raster_inplace",
     "list_files",
     "plot_bands",
+    # weather
+    "fetch_hrrr_winds_at_fires",
+    "build_wind_cells",
+    "build_pyrome_wind_cells",
+    "load_pyrome_wind_cells",
     # suppression
     "calculate_sdi",
     "calculate_delta_sdi",

@@ -109,6 +109,47 @@ def clip_raster_inplace(path, mask_gdf):
     return path
 
 
+def lookup_pyrome(container_geom, pyromes_gdf, pyrome_col="Pyrome_ID"):
+    """
+    Return the pyrome ID with the greatest overlap area with *container_geom*.
+
+    Parameters
+    ----------
+    container_geom : shapely geometry
+        The spatial container (e.g. HUC12, fireshed, POD boundary).
+        Must be in the same CRS as *pyromes_gdf*.
+    pyromes_gdf : GeoDataFrame
+        Pyrome polygons with a pyrome ID column.
+    pyrome_col : str
+        Column in *pyromes_gdf* holding the pyrome identifier
+        (default ``"Pyrome_ID"``).
+
+    Returns
+    -------
+    scalar
+        The pyrome ID (type matches *pyrome_col* dtype) of the dominant pyrome.
+
+    Raises
+    ------
+    ValueError
+        If *container_geom* does not intersect any pyrome.
+    """
+    import geopandas as gpd
+
+    container = gpd.GeoDataFrame(geometry=[container_geom], crs=pyromes_gdf.crs)
+    clipped = gpd.overlay(
+        container,
+        pyromes_gdf[[pyrome_col, "geometry"]],
+        how="intersection",
+        keep_geom_type=False,
+    )
+    if clipped.empty:
+        raise ValueError("Container does not intersect any features in pyromes_gdf.")
+
+    clipped["_area"] = clipped.geometry.area
+    return clipped.loc[clipped["_area"].idxmax(), pyrome_col]
+
+
 def rasterize(zones, to_img, attr="id", fill_val=-9999):
     """
     Rasterize polygon features onto the grid of a reference raster.

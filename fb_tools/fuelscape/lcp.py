@@ -107,6 +107,39 @@ def stack_rasters(in_dir, tag=None, out_dir=None, cleanup=True):
                 aux_xml.unlink()
 
 
+def create_container_ignition(container_gdf, out_path):
+    """
+    Save a dissolved container polygon as an FSPro ignition shapefile.
+
+    FSPro accepts polygon or polyline ignitions via the ``IgnitionFile`` field.
+    This function dissolves all features in *container_gdf* to a single polygon
+    (the container boundary) and writes it as a shapefile.
+
+    Parameters
+    ----------
+    container_gdf : GeoDataFrame
+        Spatial container features (HUC12, fireshed, POD, etc.).
+        May have any CRS; it is written as-is.
+    out_path : str or Path
+        Destination shapefile path (e.g. ``"data/ignitions/huc12_ign.shp"``).
+        Parent directory is created if it does not exist.
+
+    Returns
+    -------
+    Path
+        Absolute path to the written shapefile.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    dissolved = container_gdf.dissolve()[["geometry"]].reset_index(drop=True)
+    dissolved.to_file(out_path)
+
+    print(f"  [create_container_ignition] Saved ignition → {out_path.name} "
+          f"({len(dissolved)} feature(s))")
+    return out_path.resolve()
+
+
 def create_ignition_ascii(ign_gdf, ref_img_fp, out_ascii_fp):
     """
     Rasterize ignition points to an ASCII grid (.asc) snapped to a reference raster.

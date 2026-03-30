@@ -7,7 +7,7 @@ from .scenarios import (
     build_mtt_scenarios,
 )
 from .mtt import run_mtt, run_mtt_batch
-from .fspro import run_fspro, run_fspro_batch, build_fspro_inputs
+from .fspro import run_fspro, run_fspro_batch, build_fspro_inputs, build_treatment_pair
 
 __all__ = [
     "run_flammap_scenarios",
@@ -21,4 +21,5 @@ __all__ = [
     "run_fspro",
     "run_fspro_batch",
     "build_fspro_inputs",
+    "build_treatment_pair",
 ]

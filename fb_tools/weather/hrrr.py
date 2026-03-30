@@ -142,6 +142,7 @@ def fetch_hrrr_winds_at_fires(
     date_col: str = "ignition_date",
     pyrome_col: str = "pyrome_id",
     cache_dir: Path | str | None = None,
+    k_neighbors: int = 1,
 ) -> pd.DataFrame:
     """
     Extract HRRR 10m wind at FOD fire locations during fire-hour UTC windows.
@@ -170,12 +171,22 @@ def fetch_hrrr_winds_at_fires(
     cache_dir : Path or str, optional
         Directory for herbie GRIB cache. Strongly recommended to avoid
         re-downloading on repeat runs (~6 GB for ~900 CO fires).
+        Successfully downloaded GRIB files are reused on subsequent runs;
+        files that failed due to network errors are retried; genuine archive
+        gaps (file missing on AWS) will fail again regardless of caching.
+    k_neighbors : int
+        Number of nearest HRRR grid points to sample per fire location.
+        Default 1 (single nearest point). Use 9 (3×3 neighborhood, ~9×9 km
+        at 3 km HRRR resolution) to multiply observations without additional
+        downloads — all neighbors are extracted from the already-downloaded
+        GRIB in one vectorised KD-tree query. Recommended for building
+        well-populated wind frequency tables, especially for smaller pyromes.
 
     Returns
     -------
     pd.DataFrame
         Columns: ``pyrome_id, fire_id, date, utc_hour, lon, lat,
-        ws_mph, wd_deg``. One row per (fire × day × UTC-hour).
+        ws_mph, wd_deg``. One row per (fire × day × UTC-hour × neighbor).
 
     Raises
     ------
@@ -276,24 +287,40 @@ def fetch_hrrr_winds_at_fires(
         query_lats = fire_lats[fire_positions]
         query_lons = fire_lons[fire_positions]
 
-        _, grid_idx = kd_tree.query(np.column_stack([query_lats, query_lons]))
+        # Query k_neighbors nearest HRRR grid points per fire location.
+        # k=1: single nearest point (original behaviour).
+        # k=9: 3×3 neighbourhood (~9×9 km at 3 km HRRR resolution) —
+        #   multiplies observations by k with no additional downloads.
+        _, grid_idx = kd_tree.query(
+            np.column_stack([query_lats, query_lons]), k=k_neighbors
+        )
+        # Ensure shape is always (n_fires, k_neighbors) even when k=1
+        if k_neighbors == 1:
+            grid_idx = grid_idx[:, np.newaxis]
 
-        u_vals = u_flat[grid_idx]
-        v_vals = v_flat[grid_idx]
+        # Flatten for vectorised UV extraction: shape (n_fires × k_neighbors,)
+        grid_idx_flat = grid_idx.ravel()
+        u_vals = u_flat[grid_idx_flat]
+        v_vals = v_flat[grid_idx_flat]
         ws_mph, wd_deg = _uv_to_ws_wd(u_vals, v_vals)
 
         for j, pos in enumerate(fire_positions):
             row = fod.iloc[pos]
-            records.append({
+            base_record = {
                 "pyrome_id": row[pyrome_col],
                 "fire_id": row.get("index", pos),   # original index if preserved
                 "date": target_date.date(),
                 "utc_hour": utc_hour,
                 "lon": float(fire_lons[pos]),
                 "lat": float(fire_lats[pos]),
-                "ws_mph": float(ws_mph[j]),
-                "wd_deg": float(wd_deg[j]),
-            })
+            }
+            for k in range(k_neighbors):
+                flat_idx = j * k_neighbors + k
+                records.append({
+                    **base_record,
+                    "ws_mph": float(ws_mph[flat_idx]),
+                    "wd_deg": float(wd_deg[flat_idx]),
+                })
 
     if n_skip > 0:
         print(f"  Warning: {n_skip} / {len(unique_pairs)} downloads skipped (file not available)")
@@ -412,9 +439,10 @@ def build_pyrome_wind_cells(
     speed_breaks: "list[float] | None" = None,
     dir_breaks: "list[float] | None" = None,
     date_col: str = "ignition_date",
-    pyrome_col: str = "pyrome_id",
+    pyrome_col: str = "PYROME",
     fire_hours_utc: "list[int] | None" = None,
     n_days: int = 5,
+    k_neighbors: int = 9,
     out_dir: "Path | str | None" = None,
     min_obs_warn: int = 100,
 ) -> "dict[str, np.ndarray]":
@@ -455,6 +483,11 @@ def build_pyrome_wind_cells(
         UTC hours to sample. Default: [19, 20, 21, 22].
     n_days : int
         Days per fire to sample starting from ignition date. Default 5.
+    k_neighbors : int
+        Nearest HRRR grid points to sample per fire location per download.
+        Default 9 (3×3 neighbourhood, ~9×9 km). Passed through to
+        :func:`fetch_hrrr_winds_at_fires`. Set to 1 to restore single-point
+        behaviour.
     out_dir : Path or str, optional
         If provided, writes ``pyrome_{id}_wind.json`` per group to this
         directory. Load with ``load_pyrome_wind_cells()``.
@@ -484,6 +517,7 @@ def build_pyrome_wind_cells(
         date_col=date_col,
         pyrome_col=pyrome_col,
         cache_dir=cache_dir,
+        k_neighbors=k_neighbors,
     )
 
     years = pd.to_datetime(wind_df["date"]).dt.year

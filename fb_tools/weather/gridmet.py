@@ -135,10 +135,14 @@ def build_historic_erc_arrays(
     Build per-pyrome historic ERC arrays for FSPro ``HistoricERCValues``.
 
     Each array has shape ``(n_years, 214)`` — one row per year, 214 columns
-    for fire-season DOYs (April 1 – October 31).  Years are sorted
-    chronologically; DOYs are sorted within each year.  Missing DOY/year
-    combinations are filled with the column (DOY) median across available
-    years.
+    representing fire-season days 1–214 (day 1 = April 1, day 214 = Oct 31).
+    Years are sorted chronologically.  Missing day/year combinations are
+    filled with the column (day-of-season) median across available years.
+
+    The pivot uses **day-of-season** (1–214 anchored to April 1 of each
+    calendar year) rather than raw DOY.  This makes the result leap-year-safe:
+    April 1 is always season day 1 regardless of whether the year is a leap
+    year, so all years produce exactly 214 columns.
 
     Parameters
     ----------
@@ -146,7 +150,7 @@ def build_historic_erc_arrays(
         Output of :func:`load_gridmet_csv`.
     pyrome_col : str
         Column name identifying the spatial grouping unit (default
-        ``"pyrome_id"``).
+        ``"pyrome"``).
     n_years : int
         Expected number of years in the record (default 15 for 2008–2022).
         Used only for the warning message; does not truncate data.
@@ -162,27 +166,30 @@ def build_historic_erc_arrays(
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Identify the 214 fire-season DOYs from the data
-    season_doys = sorted(
-        df.loc[df["date"].dt.month.between(_SEASON_START_MONTH, _SEASON_END_MONTH), "doy"].unique()
-    )
-    if len(season_doys) != _N_SEASON_DAYS:
-        print(f"  [build_historic_erc_arrays] WARNING: found {len(season_doys)} unique DOYs "
-              f"(expected {_N_SEASON_DAYS})")
+    # Compute day-of-season (1 = April 1, 214 = Oct 31) anchored per year.
+    # This is leap-year-safe: raw DOY shifts by 1 in leap years, but
+    # (date - April_1_of_that_year).days is always consistent.
+    df2 = df.copy()
+    april_1 = pd.to_datetime(df2["year"].astype(str) + "-04-01")
+    df2["_dos"] = (df2["date"] - april_1).dt.days + 1
+
+    # Keep only the 214-day fire season (April 1 – Oct 31)
+    df2 = df2[(df2["_dos"] >= 1) & (df2["_dos"] <= _N_SEASON_DAYS)]
+
+    season_days = list(range(1, _N_SEASON_DAYS + 1))  # always [1 … 214]
 
     result: dict[str, np.ndarray] = {}
 
-    for pyrome_id, group in df.groupby(pyrome_col):
-        # Pivot: rows = year, columns = doy
+    for pyrome_id, group in df2.groupby(pyrome_col):
+        # Pivot: rows = year, columns = day-of-season (1–214)
         pivot = (
-            group.pivot_table(index="year", columns="doy", values="erc", aggfunc="mean")
-            .reindex(columns=season_doys)
+            group.pivot_table(index="year", columns="_dos", values="erc", aggfunc="mean")
+            .reindex(columns=season_days)
         )
         pivot = pivot.sort_index()
 
-        # Fill missing DOY/year cells with column median
-        col_medians = pivot.median(axis=0)
-        pivot = pivot.fillna(col_medians)
+        # Fill missing day/year cells with column (day-of-season) median
+        pivot = pivot.fillna(pivot.median(axis=0))
 
         arr = pivot.values.astype(float)
 
@@ -196,15 +203,15 @@ def build_historic_erc_arrays(
             cache = {
                 "pyrome_id": str(pyrome_id),
                 "years": list(map(int, pivot.index)),
-                "season_doys": list(map(int, season_doys)),
+                "season_days": season_days,   # 1-based, leap-year-safe
                 "NumERCYears": int(arr.shape[0]),
                 "NumWxPerYear": int(arr.shape[1]),
                 "HistoricERCValues": arr.tolist(),
             }
             _write_json(cache, out_dir / f"pyrome_{pyrome_id}_gridmet.json")
 
-    print(f"  [build_historic_erc_arrays] {len(result)} pyromes → arrays shape "
-          f"({n_years}, {len(season_doys)})")
+    print(f"  [build_historic_erc_arrays] {len(result)} pyromes → "
+          f"arrays shape ({n_years}, {_N_SEASON_DAYS})")
     return result
 
 

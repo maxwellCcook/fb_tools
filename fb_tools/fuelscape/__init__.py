@@ -1,5 +1,5 @@
 from .lfps import lfps_request, lfps_mosaic
-from .lcp import stack_rasters, create_ignition_ascii, get_band_by_longname
+from .lcp import stack_rasters, create_ignition_ascii, create_container_ignition, get_band_by_longname
 from .adjust import adjust_lcp, apply_treatment, build_surface_lut
 
 __all__ = [
@@ -7,6 +7,7 @@ __all__ = [
     "lfps_mosaic",
     "stack_rasters",
     "create_ignition_ascii",
+    "create_container_ignition",
     "get_band_by_longname",
     "adjust_lcp",
     "apply_treatment",

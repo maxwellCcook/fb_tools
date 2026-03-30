@@ -249,6 +249,92 @@ def build_fspro_inputs(
     return output_path.resolve()
 
 
+def build_treatment_pair(
+    out_path: str | Path,
+    ignition_file: str | Path,
+    wind_cells: np.ndarray,
+    calm_value: float,
+    erc_historic: np.ndarray,
+    erc_avg: np.ndarray,
+    erc_std: np.ndarray,
+    erc_classes: np.ndarray,
+    current_erc: np.ndarray,
+    seed: int = 617327,
+    **kwargs,
+) -> Path:
+    """
+    Write a single FSPro input file suitable for paired baseline/treated runs.
+
+    Because ``TestFSPro.exe`` takes the LCP as a run-time positional argument
+    (not embedded in the input file), one input file can serve both the
+    baseline and treated landscape scenarios.  Fixing ``SPOTTING_SEED``
+    guarantees identical weather draws across both runs, giving a clean
+    counterfactual comparison without external scenario management.
+
+    This is a thin wrapper around :func:`build_fspro_inputs` that enforces
+    the ``SPOTTING_SEED`` parameter and documents the pairing intent.
+
+    Parameters
+    ----------
+    out_path : str or Path
+        Destination for the written ``.input`` file.
+    ignition_file : str or Path
+        Ignition polygon/polyline shapefile (same for both runs).
+    wind_cells : np.ndarray
+        Wind frequency table ``(NumWindSpeeds, NumWindDirs)``.
+    calm_value : float
+        Calm percentage for FSPro ``CalmValue`` field.
+    erc_historic : np.ndarray
+        Historic ERC array ``(NumERCYears, 214)``.
+    erc_avg, erc_std : np.ndarray
+        Per-day-of-season ERC mean and std, shape ``(214,)``.
+    erc_classes : np.ndarray
+        ERC class table ``(5, 10)`` — highest ERC first.
+    current_erc : np.ndarray
+        Current-season ERC sequence ``(n_days,)``.
+    seed : int
+        ``SPOTTING_SEED`` shared by both runs (default 617327).
+        **Do not vary between baseline and treated runs.**
+    **kwargs
+        Passed to :func:`build_fspro_inputs` (e.g. ``NumFires=2000``).
+        ``SPOTTING_SEED`` in kwargs is overridden by *seed*.
+
+    Returns
+    -------
+    Path
+        Absolute path to the written input file.
+
+    Examples
+    --------
+    >>> path = build_treatment_pair(
+    ...     "inputs/watershed_42.input",
+    ...     ignition_file="data/watershed_42_ign.shp",
+    ...     wind_cells=wind_arr, calm_value=calm_pct,
+    ...     erc_historic=hist, erc_avg=avg, erc_std=std,
+    ...     erc_classes=classes, current_erc=curr,
+    ...     NumFires=1000,
+    ... )
+    >>> # Run FSPro twice with the same input, different LCPs:
+    >>> run_fspro(exe, lcp_baseline, path, out_dir / "baseline")
+    >>> run_fspro(exe, lcp_treated,  path, out_dir / "treated")
+    """
+    # Enforce shared seed — override any caller-supplied value
+    kwargs["SPOTTING_SEED"] = seed
+
+    return build_fspro_inputs(
+        output_path=out_path,
+        wind_cells=wind_cells,
+        calm_value=calm_value,
+        erc_historic=erc_historic,
+        erc_avg=erc_avg,
+        erc_std=erc_std,
+        erc_classes=erc_classes,
+        current_erc=current_erc,
+        ignition_file=ignition_file,
+        **kwargs,
+    )
+
+
 def run_fspro(
     fspro_exe,
     lcp_fp,

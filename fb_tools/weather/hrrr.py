@@ -1,25 +1,45 @@
 """
 fb_tools/weather/hrrr.py
 ========================
-HRRR fire-hour wind extraction for pyrome-level wind climatology.
+HRRR fire-hour wind extraction for FSPro/FSim wind climatology.
 
 Builds the ``WindCellValues`` frequency table required by FSPro from
 historical HRRR analysis data at fire occurrence locations. Samples
-HRRR 10m wind (U, V) at each FOD point during fire-hour UTC windows,
-groups by pyrome, and builds a NumWindSpeeds × NumWindDirs frequency
-table per pyrome.
+HRRR 10m wind (U, V) at each FOD point during fire-hour UTC windows
+and builds a NumWindSpeeds × NumWindDirs frequency table per group.
 
-HRRR archive coverage: 2014–present (AWS, ``s3://noaa-hrrr-bdp-pds/``).
+**FSPro wind semantics:** ``WindCellValues`` is a stochastic climatology
+distribution — FSPro independently draws a wind speed/direction from this
+table for each simulated fire. It is *not* a schedule of daily wind values.
+``CalmValue`` is the complementary percentage of historically-calm
+observations and is stored separately in the FSPro input file.
+
+**Generality:** The grouping key (``pyrome_col`` parameter) can be any
+categorical column — pyrome ID, watershed ID, a constant string for a
+single-area run, or any other spatial unit. The default naming reflects the
+typical pyrome climatology use case but imposes no restriction.
+
+**Single-event use:** To parameterize a specific historic fire event (e.g.,
+for a deterministic FlamMap/MTT run), call ``fetch_hrrr_winds_at_fires()``
+directly and use the returned raw wind DataFrame. The frequency table is
+most useful for multi-fire probabilistic FSPro/FSim climatology.
+
+**Sample size:** A well-populated 6×8 frequency table typically requires
+200+ non-calm observations per group. With 3–5 test fires (~20–30 obs)
+most bins will be zero — this is expected, not a bug.
+
+HRRR archive coverage: 2016–present (AWS, ``s3://noaa-hrrr-bdp-pds/``).
+Pre-2016 archive has gaps; 2014–2015 data should not be relied upon.
 Access via the ``herbie-data`` library (optional dependency).
 
 Workflow
 --------
-1. Filter FOD to HRRR coverage period (2014+).
+1. Filter FOD to HRRR coverage period (2016+).
 2. Expand each fire to n_days × fire_hours schedule entries.
 3. Deduplicate to unique (date, UTC-hour) pairs → one download per pair.
 4. For each pair: download HRRR U/V 10m with herbie; extract values at
    all active fire point locations in one KD-tree lookup.
-5. Group by pyrome → build wind frequency table.
+5. Group by grouping column → build WindCellValues frequency table + CalmValue.
 
 References
 ----------
@@ -42,7 +62,7 @@ _DEFAULT_SPEED_BREAKS_MPH: list[float] = [5, 10, 15, 20, 25, 30]
 _DEFAULT_DIR_BREAKS_DEG: list[float] = [45, 90, 135, 180, 225, 270, 315, 360]
 _CALM_THRESHOLD_MPH: float = 2.0      # obs below this excluded from wind rose
 _MS_TO_MPH: float = 2.23694
-_HRRR_START_YEAR: int = 2014          # HRRR AWS archive begins mid-2014
+_HRRR_START_YEAR: int = 2016          # HRRR AWS archive begins mid-2014
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
@@ -212,7 +232,7 @@ def fetch_hrrr_winds_at_fires(
     print(f"  {n_raw} raw schedule entries → {len(unique_pairs)} unique (date, hour) downloads")
 
     # ── herbie configuration ───────────────────────────────────────────────────
-    herbie_kwargs: dict = {"model": "hrrr", "fxx": 0, "product": "sfc"}
+    herbie_kwargs: dict = {"model": "hrrr", "fxx": 0, "product": "sfc", "verbose": False}
     if cache_dir is not None:
         herbie_kwargs["save_dir"] = Path(cache_dir)
 
@@ -298,13 +318,14 @@ def build_wind_cells(
     speed_breaks: list[float] | None = None,
     dir_breaks: list[float] | None = None,
     calm_threshold_mph: float = _CALM_THRESHOLD_MPH,
-) -> np.ndarray:
+) -> "tuple[np.ndarray, float]":
     """
     Build a NumWindSpeeds × NumWindDirs frequency table from wind observations.
 
     Each cell contains the percentage of non-calm observations that fell in
     that (speed, direction) bin, matching the ``WindCellValues`` format in
-    FSPro input files.
+    FSPro input files. Calm observations are excluded from the table and
+    reported separately as ``calm_pct``.
 
     Parameters
     ----------
@@ -321,15 +342,19 @@ def build_wind_cells(
         last (360°) bin. Default: ``[45, 90, 135, 180, 225, 270, 315, 360]``
         (8 bins, N at 360°, matches FSPro sample).
     calm_threshold_mph : float
-        Observations with ws_mph < this value are excluded (effectively calm).
-        Default 2.0 mph.
+        Observations with ws_mph below this value are classified as calm and
+        excluded from the frequency table. Default 2.0 mph.
 
     Returns
     -------
-    np.ndarray
-        Shape ``(NumWindSpeeds, NumWindDirs)``. Values are % frequencies
-        (sum ≈ 100). Row order = ascending speed bin; column order =
-        ascending direction azimuth bin.
+    wind_cells : np.ndarray
+        Shape ``(NumWindSpeeds, NumWindDirs)``. Values are % frequencies of
+        non-calm observations (sum ≈ 100). Row order = ascending speed bin;
+        column order = ascending direction azimuth bin.
+    calm_pct : float
+        Percentage of *all* observations (including calm) below
+        ``calm_threshold_mph``. Corresponds to ``CalmValue`` in FSPro input
+        files. ``wind_cells.sum() + calm_pct ≈ 100``.
 
     Raises
     ------
@@ -344,14 +369,18 @@ def build_wind_cells(
     ws = np.asarray(ws_mph, dtype=float)
     wd = np.asarray(wd_deg, dtype=float)
 
-    # Remove calm / near-calm observations
+    n_total = len(ws)
+    # Remove calm / near-calm observations; track count for CalmValue
     active = ws >= calm_threshold_mph
+    n_calm = int((~active).sum())
+    calm_pct = 100.0 * n_calm / n_total if n_total > 0 else 0.0
+
     ws = ws[active]
     wd = wd[active]
 
     if len(ws) == 0:
         raise ValueError(
-            f"All {len(ws_mph)} observations have ws_mph < {calm_threshold_mph}; "
+            f"All {n_total} observations have ws_mph < {calm_threshold_mph}; "
             "cannot build wind cell table."
         )
 
@@ -374,7 +403,7 @@ def build_wind_cells(
     np.add.at(counts, (speed_idx, dir_idx), 1)
 
     freq_pct = counts / counts.sum() * 100.0
-    return freq_pct
+    return freq_pct, calm_pct
 
 
 def build_pyrome_wind_cells(
@@ -385,15 +414,27 @@ def build_pyrome_wind_cells(
     date_col: str = "ignition_date",
     pyrome_col: str = "pyrome_id",
     fire_hours_utc: "list[int] | None" = None,
-    n_days: int = 2,
+    n_days: int = 5,
     out_dir: "Path | str | None" = None,
+    min_obs_warn: int = 100,
 ) -> "dict[str, np.ndarray]":
     """
-    Build per-pyrome wind frequency tables from HRRR data at FOD locations.
+    Build per-area wind frequency tables from HRRR data at fire occurrence locations.
 
-    Fetches HRRR winds for all fires, groups observations by pyrome, and
-    builds a ``WindCellValues`` array for each pyrome. Optionally writes
-    per-pyrome JSON cache files for reuse in FSPro input generation.
+    Fetches HRRR 10m winds for all fires, groups observations by the column
+    named by ``pyrome_col``, and builds a ``WindCellValues`` array for each
+    group. Optionally writes per-group JSON cache files for reuse in FSPro
+    input generation.
+
+    The grouping key (``pyrome_col``) can be any categorical column — pyrome
+    ID, watershed ID, a constant string for a single-area run, etc.  The
+    default name ``"pyrome_id"`` reflects the typical pyrome climatology use
+    case but imposes no restriction on the analysis unit.
+
+    For **single-event** parameterization (e.g., recreate a specific historic
+    fire for an MTT run), call ``fetch_hrrr_winds_at_fires()`` directly and
+    use the raw wind DataFrame; the ``WindCellValues`` table is most useful
+    for multi-fire probabilistic FSPro/FSim climatology.
 
     Parameters
     ----------
@@ -408,19 +449,26 @@ def build_pyrome_wind_cells(
     date_col : str
         Ignition date column in ``fod_gdf``. Default ``"ignition_date"``.
     pyrome_col : str
-        Pyrome ID column in ``fod_gdf``. Default ``"pyrome_id"``.
+        Grouping column in ``fod_gdf`` (pyrome ID, watershed ID, etc.).
+        Default ``"pyrome_id"``.
     fire_hours_utc : list of int, optional
         UTC hours to sample. Default: [19, 20, 21, 22].
     n_days : int
-        Days per fire to sample. Default 2.
+        Days per fire to sample starting from ignition date. Default 5.
     out_dir : Path or str, optional
-        If provided, writes ``pyrome_{id}_wind.json`` per pyrome to this
+        If provided, writes ``pyrome_{id}_wind.json`` per group to this
         directory. Load with ``load_pyrome_wind_cells()``.
+    min_obs_warn : int
+        Print a warning for any group whose non-calm observation count is
+        below this threshold. Default 100. A well-populated 6×8 FSPro table
+        typically requires 200+ non-calm observations; fewer than 100 will
+        produce a sparse distribution unreliable for probabilistic runs.
+        Set to 0 to suppress.
 
     Returns
     -------
     dict[str, np.ndarray]
-        ``{pyrome_id: wind_cells_array}`` where each array has shape
+        ``{group_id: wind_cells_array}`` where each array has shape
         ``(NumWindSpeeds, NumWindDirs)``.
     """
     if speed_breaks is None:
@@ -428,7 +476,7 @@ def build_pyrome_wind_cells(
     if dir_breaks is None:
         dir_breaks = list(_DEFAULT_DIR_BREAKS_DEG)
 
-    print("Building pyrome wind climatology from HRRR ...")
+    print("Building wind climatology from HRRR ...")
     wind_df = fetch_hrrr_winds_at_fires(
         fod_gdf,
         fire_hours_utc=fire_hours_utc,
@@ -442,16 +490,27 @@ def build_pyrome_wind_cells(
     year_range = f"{years.min()}–{years.max()}"
 
     result: dict[str, np.ndarray] = {}
-    for pyrome_id, grp in wind_df.groupby("pyrome_id"):
-        pid = str(pyrome_id)
-        cells = build_wind_cells(
+    for group_id, grp in wind_df.groupby("pyrome_id"):
+        pid = str(group_id)
+        cells, calm_pct = build_wind_cells(
             grp["ws_mph"],
             grp["wd_deg"],
             speed_breaks=speed_breaks,
             dir_breaks=dir_breaks,
         )
+        n_noncalm = int(round(len(grp) * (1.0 - calm_pct / 100.0)))
+        if min_obs_warn > 0 and n_noncalm < min_obs_warn:
+            print(
+                f"  Warning: group '{pid}' has only {n_noncalm} non-calm observations "
+                f"(calm={calm_pct:.1f}%). "
+                f"Recommend ≥{min_obs_warn} for a reliable FSPro climatology table."
+            )
         result[pid] = cells
-        print(f"  Pyrome {pid}: {len(grp):,} obs → {cells.shape} wind cell table")
+        print(
+            f"  Group {pid}: {len(grp):,} obs "
+            f"({n_noncalm} non-calm, calm={calm_pct:.1f}%) "
+            f"→ {cells.shape} wind cell table"
+        )
 
         if out_dir is not None:
             out_path = _write_wind_cells_json(
@@ -459,6 +518,7 @@ def build_pyrome_wind_cells(
                 wind_cells=cells,
                 speed_breaks=speed_breaks,
                 dir_breaks=dir_breaks,
+                calm_pct=calm_pct,
                 n_obs=len(grp),
                 years_covered=year_range,
                 out_dir=Path(out_dir),
@@ -473,11 +533,12 @@ def _write_wind_cells_json(
     wind_cells: np.ndarray,
     speed_breaks: list[float],
     dir_breaks: list[float],
+    calm_pct: float,
     n_obs: int,
     years_covered: str,
     out_dir: Path,
 ) -> Path:
-    """Write per-pyrome wind cells to JSON cache file."""
+    """Write per-area wind cells to JSON cache file."""
     out_dir.mkdir(parents=True, exist_ok=True)
     data = {
         "pyrome_id": pyrome_id,
@@ -486,6 +547,7 @@ def _write_wind_cells_json(
         "WindSpeedBreaks_mph": speed_breaks,
         "WindDirBreaks_deg": dir_breaks,
         "WindCellValues": wind_cells.tolist(),
+        "CalmValue": round(calm_pct, 4),
         "n_observations": n_obs,
         "years_covered": years_covered,
     }
@@ -498,34 +560,46 @@ def _write_wind_cells_json(
 def load_pyrome_wind_cells(
     pyrome_id: "str | int",
     cache_dir: "Path | str",
-) -> np.ndarray:
+    return_meta: bool = False,
+) -> "np.ndarray | dict":
     """
-    Load a cached pyrome wind frequency table from JSON.
+    Load a cached wind frequency table from JSON.
 
     Parameters
     ----------
     pyrome_id : str or int
-        Pyrome identifier matching the JSON filename prefix.
+        Group identifier matching the JSON filename prefix (pyrome ID,
+        watershed ID, etc.).
     cache_dir : Path or str
         Directory containing ``pyrome_{id}_wind.json`` files (written by
         ``build_pyrome_wind_cells()``).
+    return_meta : bool
+        If ``False`` (default), return only the ``(NumWindSpeeds, NumWindDirs)``
+        frequency array — backward-compatible.  If ``True``, return the full
+        metadata dict with keys: ``pyrome_id``, ``NumWindSpeeds``,
+        ``NumWindDirs``, ``WindSpeedBreaks_mph``, ``WindDirBreaks_deg``,
+        ``WindCellValues`` (np.ndarray), ``CalmValue``, ``n_observations``,
+        ``years_covered``.
 
     Returns
     -------
-    np.ndarray
-        Shape ``(NumWindSpeeds, NumWindDirs)`` frequency table.
+    np.ndarray or dict
+        Frequency table array, or full metadata dict when ``return_meta=True``.
 
     Raises
     ------
     FileNotFoundError
-        If no cached file exists for this pyrome.
+        If no cached file exists for this group.
     """
     path = Path(cache_dir) / f"pyrome_{pyrome_id}_wind.json"
     if not path.exists():
         raise FileNotFoundError(
-            f"No wind cells cache for pyrome {pyrome_id!r} in {cache_dir}.\n"
+            f"No wind cells cache for '{pyrome_id}' in {cache_dir}.\n"
             "Run build_pyrome_wind_cells() first to generate the cache."
         )
     with open(path) as f:
         data = json.load(f)
-    return np.array(data["WindCellValues"], dtype=float)
+    if not return_meta:
+        return np.array(data["WindCellValues"], dtype=float)
+    data["WindCellValues"] = np.array(data["WindCellValues"], dtype=float)
+    return data

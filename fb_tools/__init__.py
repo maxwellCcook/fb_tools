@@ -59,6 +59,7 @@ from .models import (
     run_mtt_batch,
     run_fspro,
     run_fspro_batch,
+    build_fspro_inputs,
 )
 from .spread import (
     delta_burn_probability,
@@ -80,6 +81,15 @@ from .weather import (
     build_wind_cells,
     build_pyrome_wind_cells,
     load_pyrome_wind_cells,
+    load_gridmet_csv,
+    build_historic_erc_arrays,
+    build_erc_stats,
+    build_erc_classes,
+    build_current_erc_values,
+    load_gridmet_pyrome_cache,
+    calc_emc,
+    calc_1hr_fm,
+    calc_10hr_fm,
 )
 from .analysis import summarize_treatments, run_treatment_pipeline
 from .plotting import (
@@ -110,6 +120,7 @@ __all__ = [
     "run_mtt_batch",
     "run_fspro",
     "run_fspro_batch",
+    "build_fspro_inputs",
     # spread
     "delta_burn_probability",
     "summarize_bp_treatments",
@@ -122,11 +133,22 @@ __all__ = [
     "clip_raster_inplace",
     "list_files",
     "plot_bands",
-    # weather
+    # weather — hrrr
     "fetch_hrrr_winds_at_fires",
     "build_wind_cells",
     "build_pyrome_wind_cells",
     "load_pyrome_wind_cells",
+    # weather — gridmet
+    "load_gridmet_csv",
+    "build_historic_erc_arrays",
+    "build_erc_stats",
+    "build_erc_classes",
+    "build_current_erc_values",
+    "load_gridmet_pyrome_cache",
+    # weather — nfdrs
+    "calc_emc",
+    "calc_1hr_fm",
+    "calc_10hr_fm",
     # suppression
     "calculate_sdi",
     "calculate_delta_sdi",

@@ -74,7 +74,12 @@ def stack_rasters(in_dir, tag=None, out_dir=None, cleanup=True):
 
     file_prefix = os.path.basename(in_dir) # scenario or file name, needs attention
     print(file_prefix)
-    tifs = sorted(in_dir.glob("*.tif"))
+    # Compute output path first so we can exclude it from the input glob.
+    # Without this, re-runs pick up the previously stacked file and fail
+    # with a band-dimension mismatch (stacked file has N bands; squeeze()
+    # doesn't reduce it; concat sees N+1+1+… bands vs. N+2 names).
+    out_fp = out_dir / f"{file_prefix}_{tag.upper()}.tif"
+    tifs = sorted(t for t in in_dir.glob("*.tif") if t.resolve() != out_fp.resolve())
     if not tifs:
         raise FileNotFoundError(f"No TIFFs found in {in_dir}")
 
@@ -88,7 +93,6 @@ def stack_rasters(in_dir, tag=None, out_dir=None, cleanup=True):
     print(band_names)
     stack = xr.concat(bands, dim=xr.Variable("band", band_names))
     stack.attrs["long_name"] = band_names
-    out_fp = out_dir / f"{file_prefix}_{tag.upper()}.tif"
     print(out_fp)
     stack.rio.to_raster(out_fp, compress="deflate")
     print(f"Stacked {len(tifs)} rasters → {out_fp}")

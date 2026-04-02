@@ -47,6 +47,7 @@ from .fuelscape import (
     adjust_lcp,
     apply_treatment,
     build_surface_lut,
+    create_synthetic_lcp,
 )
 from .models import (
     run_flammap_scenarios,
@@ -109,6 +110,7 @@ __all__ = [
     "adjust_lcp",
     "apply_treatment",
     "build_surface_lut",
+    "create_synthetic_lcp",
     # models
     "run_flammap_scenarios",
     "load_scenarios",

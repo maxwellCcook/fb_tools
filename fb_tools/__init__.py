@@ -43,6 +43,7 @@ from .fuelscape import (
     lfps_mosaic,
     stack_rasters,
     create_ignition_ascii,
+    create_container_ignition,
     get_band_by_longname,
     adjust_lcp,
     apply_treatment,
@@ -61,6 +62,10 @@ from .models import (
     run_fspro,
     run_fspro_batch,
     build_fspro_inputs,
+    build_treatment_pair,
+    prepare_container_fspro,
+    postprocess_fspro_outputs,
+    prepare_counterfactual_fspro,
 )
 from .spread import (
     delta_burn_probability,
@@ -73,6 +78,7 @@ from .utils import (
     geom_to_raster_crs,
     rasterize,
     clip_raster_inplace,
+    lookup_pyrome,
     list_files,
     plot_bands,
 )
@@ -106,6 +112,7 @@ __all__ = [
     "lfps_mosaic",
     "stack_rasters",
     "create_ignition_ascii",
+    "create_container_ignition",
     "get_band_by_longname",
     "adjust_lcp",
     "apply_treatment",
@@ -123,6 +130,10 @@ __all__ = [
     "run_fspro",
     "run_fspro_batch",
     "build_fspro_inputs",
+    "build_treatment_pair",
+    "prepare_container_fspro",
+    "postprocess_fspro_outputs",
+    "prepare_counterfactual_fspro",
     # spread
     "delta_burn_probability",
     "summarize_bp_treatments",
@@ -133,6 +144,7 @@ __all__ = [
     "geom_to_raster_crs",
     "rasterize",
     "clip_raster_inplace",
+    "lookup_pyrome",
     "list_files",
     "plot_bands",
     # weather — hrrr

@@ -35,7 +35,18 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from fb_tools.weather.nfdrs import calc_1hr_fm, calc_10hr_fm, kelvin_to_fahrenheit
+from fb_tools.weather.nfdrs import (
+    calc_1hr_fm,
+    calc_10hr_fm,
+    calc_herb_fm,
+    calc_herb_fm_gsi,
+    calc_woody_fm,
+    calc_woody_fm_gsi,
+    calc_gsi,
+    calc_vpd_pa,
+    calc_daylength,
+    kelvin_to_fahrenheit,
+)
 
 # FSPro fire-season constants (April 1 – October 31)
 _N_SEASON_DAYS: int = 214
@@ -110,6 +121,21 @@ def load_gridmet_csv(csv_path: str | Path) -> pd.DataFrame:
     # Convert tmmx from °K → °F
     df["tmmx_f"] = kelvin_to_fahrenheit(df["tmmx"].values)
     df = df.drop(columns=["tmmx"])
+
+    # Optional columns — add tmmn/rmax/pr/vs/th to GEE export as needed
+    if "tmmn" in df.columns:
+        df["tmmn_f"] = kelvin_to_fahrenheit(df["tmmn"].values)
+        df = df.drop(columns=["tmmn"])
+    for col in ("rmax", "pr"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    # GridMET wind: vs = daily mean wind speed (m/s); th = wind direction (°, met FROM)
+    if "vs" in df.columns:
+        df["ws_mph"] = pd.to_numeric(df["vs"], errors="coerce") * 2.23694
+        df = df.drop(columns=["vs"])
+    if "th" in df.columns:
+        df["wd_deg"] = pd.to_numeric(df["th"], errors="coerce")
+        df = df.drop(columns=["th"])
 
     for col in ["erc", "fm100", "fm1000", "tmmx_f", "rmin"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -261,11 +287,13 @@ def build_erc_classes(
     ``[lower, upper, fm1, fm10, fm100, fm_herb, fm_woody, spot_dist, spot_prob, spot2]``
 
     Fuel moisture derivation:
-    - ``fm1``   : median NFDRS 1-hr FM (from tmmx_f + rmin via :func:`calc_1hr_fm`)
-    - ``fm10``  : median NFDRS 10-hr FM (from tmmx_f + rmin via :func:`calc_10hr_fm`)
-    - ``fm100`` : median GridMET fm100 (direct)
-    - ``fm_herb``: fm100 + 5, clipped to [10, 100]  (NFDRS live herbaceous proxy)
-    - ``fm_woody``: fm_herb + 10  (NFDRS live woody proxy)
+    - ``fm1``    : median NFDRS 1-hr FM (from tmmx_f + rmin via :func:`calc_1hr_fm`)
+    - ``fm10``   : median NFDRS 10-hr FM (from tmmx_f + rmin via :func:`calc_10hr_fm`)
+    - ``fm100``  : median GridMET fm100 (direct)
+    - ``fm_herb``: DOY-based curing model via :func:`calc_herb_fm` — linearly interpolates
+      from 250% (April 1, peak green) to 30% (early September, dormant), per NFDRS PMS 437
+    - ``fm_woody``: seasonal sinusoidal model via :func:`calc_woody_fm` — peaks ~200% in
+      June, troughs ~60% in October; independent of fm_herb per NFDRS
 
     Quintile ERC bins are computed per pyrome from the full fire-season record.
     Classes are ordered highest-to-lowest ERC (class 1 = most extreme).
@@ -325,8 +353,9 @@ def build_erc_classes(
                 calc_10hr_fm(sub[tmmx_col].values, sub[rmin_col].values)
             ))
             fm100 = float(np.nanmedian(sub[fm100_col].values))
-            fm_herb = float(np.clip(fm100 + 5.0, 10.0, 100.0))
-            fm_woody = float(np.clip(fm_herb + 10.0, 10.0, 200.0))
+            median_doy = float(np.nanmedian(sub["doy"].values)) if "doy" in sub.columns else 182.0
+            fm_herb = float(calc_herb_fm(median_doy))
+            fm_woody = float(calc_woody_fm(median_doy))
 
             spot = spotting[n_classes - 1 - i]  # highest ERC → spotting[0]
             rows.append([
@@ -392,6 +421,529 @@ def build_current_erc_values(
         window = arr[:, start_doy - 1 : start_doy - 1 + n_days]
         result[str(pyrome_id)] = np.round(np.nanmedian(window, axis=0)).astype(int)
     return result
+
+
+def build_flammap_fuel_moistures(
+    df: pd.DataFrame,
+    pyrome_id: str | int,
+    scenario_doy: int,
+    erc_percentile: float = 0.90,
+    pyrome_col: str = "pyrome",
+    fm100_col: str = "fm100",
+    tmmx_col: str = "tmmx_f",
+    rmin_col: str = "rmin",
+    doy_window: int = 14,
+    lat_deg: float | None = None,
+) -> dict[str, float]:
+    """
+    Derive a complete FlamMap ``FUEL_MOISTURES_DATA`` row from GridMET.
+
+    Returns a single set of fuel moisture values representative of
+    high-danger conditions (``erc_percentile``) for the given day-of-year,
+    drawn from the full climatological record for the specified pyrome.
+    All five FM values are derived from NFDRS equations consistent with
+    FireFamilyPlus:
+
+    - fm1, fm10  : NFDRS EMC-based dead FM at peak fire-hour conditions
+    - fm100      : directly from GridMET (measured 100-hr dead fuel moisture)
+    - fm_herb    : DOY-based curing (:func:`~fb_tools.weather.nfdrs.calc_herb_fm`)
+    - fm_woody   : seasonal sinusoidal (:func:`~fb_tools.weather.nfdrs.calc_woody_fm`)
+
+    The returned dict is ready to pass directly to
+    :func:`~fb_tools.models.flammap.run_flammap_scenarios` as ``fm_params``.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Output of :func:`load_gridmet_csv`.
+    pyrome_id : str or int
+        Pyrome to subset.
+    scenario_doy : int
+        Target day-of-year (1–366) for the scenario. FM values are derived
+        from a ±``doy_window`` day climatological window around this DOY.
+    erc_percentile : float
+        ERC percentile threshold (0–1) used to filter high-danger days
+        when computing median dead FM. Default 0.90 (90th percentile).
+    pyrome_col : str
+        Column identifying the pyrome. Default ``"pyrome"``.
+    fm100_col, tmmx_col, rmin_col : str
+        Column names in ``df``.
+    doy_window : int
+        Half-width of the DOY window (days) used to subset the record.
+        Default 14 (±2 weeks).
+    lat_deg : float, optional
+        Site latitude in decimal degrees.  When provided and ``tmmn_f`` is
+        present in ``df``, live FM is computed via the NFDRS GSI model
+        (:func:`~fb_tools.weather.nfdrs.calc_gsi`) for higher accuracy.
+        If ``None`` or ``tmmn_f`` is absent, falls back to the DOY proxy.
+
+    Returns
+    -------
+    dict[str, float]
+        Keys: ``FM_1hr``, ``FM_10hr``, ``FM_100hr``, ``FM_herb``, ``FM_woody``.
+
+    Raises
+    ------
+    ValueError
+        If no records are found for the given pyrome / DOY window.
+    """
+    sub = df[df[pyrome_col].astype(str) == str(pyrome_id)].copy()
+    if sub.empty:
+        raise ValueError(f"No GridMET records for pyrome {pyrome_id!r}")
+
+    # Wrap-around DOY window (handles year boundary near Jan 1)
+    lo = scenario_doy - doy_window
+    hi = scenario_doy + doy_window
+    if lo < 1:
+        mask = (sub["doy"] >= lo + 366) | (sub["doy"] <= hi)
+    elif hi > 366:
+        mask = (sub["doy"] >= lo) | (sub["doy"] <= hi - 366)
+    else:
+        mask = (sub["doy"] >= lo) & (sub["doy"] <= hi)
+
+    window = sub[mask]
+    if window.empty:
+        raise ValueError(
+            f"No records in ±{doy_window}-day window around DOY {scenario_doy} "
+            f"for pyrome {pyrome_id!r}"
+        )
+
+    # Filter to high-danger days within the window
+    erc_thresh = window["erc"].quantile(erc_percentile)
+    high_danger = window[window["erc"] >= erc_thresh]
+    if high_danger.empty:
+        high_danger = window
+
+    fm1 = float(np.nanmedian(calc_1hr_fm(high_danger[tmmx_col].values, high_danger[rmin_col].values)))
+    fm10 = float(np.nanmedian(calc_10hr_fm(high_danger[tmmx_col].values, high_danger[rmin_col].values)))
+    fm100 = float(np.nanmedian(high_danger[fm100_col].values))
+
+    # Use GSI-based live FM if tmmn_f is available; fall back to DOY proxy
+    if "tmmn_f" in high_danger.columns and lat_deg is not None:
+        vpd = calc_vpd_pa(high_danger[tmmx_col].values, high_danger[rmin_col].values)
+        dl = calc_daylength(high_danger["doy"].values, lat_deg)
+        gsi = float(np.nanmedian(calc_gsi(high_danger["tmmn_f"].values, vpd, dl)))
+        fm_herb = float(calc_herb_fm_gsi(gsi))
+        fm_woody = float(calc_woody_fm_gsi(gsi))
+    else:
+        fm_herb = float(calc_herb_fm(scenario_doy))
+        fm_woody = float(calc_woody_fm(scenario_doy))
+
+    return {
+        "FM_1hr": round(fm1, 1),
+        "FM_10hr": round(fm10, 1),
+        "FM_100hr": round(fm100, 1),
+        "FM_herb": round(fm_herb, 1),
+        "FM_woody": round(fm_woody, 1),
+    }
+
+
+def build_flammap_weather_data(
+    df: pd.DataFrame,
+    pyrome_id: str | int,
+    start_date: str,
+    end_date: str,
+    elevation_ft: int,
+    pyrome_col: str = "pyrome",
+    precip_start_hour: int = 600,
+    precip_end_hour: int = 1200,
+) -> tuple[list[tuple], int]:
+    """
+    Build a FlamMap ``WEATHER_DATA`` block from GridMET daily records.
+
+    Produces one row per day in [``start_date``, ``end_date``] for the given
+    pyrome, ready to embed in a FlamMap conditioning-period input file.
+    This is the preferred weather input mode when using GridMET (daily data),
+    as it maps directly without requiring diurnal synthesis.
+
+    Row format (12 values per day):
+    ``Mth Day Pcp mTH xTH mT xT mH xH Elv PST PET``
+
+    Where:
+    - ``Pcp``  : precipitation in hundredths of inch (``pr`` mm → hundredths)
+    - ``mTH``  : hour of min temp (default 0500)
+    - ``xTH``  : hour of max temp (default 1400)
+    - ``mT``   : daily min temperature °F (``tmmn_f``)
+    - ``xT``   : daily max temperature °F (``tmmx_f``)
+    - ``mH``   : morning (max) relative humidity % (``rmax``)
+    - ``xH``   : afternoon (min) relative humidity % (``rmin``)
+    - ``Elv``  : station elevation in feet
+    - ``PST``  : precip start time (0 when no precip)
+    - ``PET``  : precip end time (0 when no precip)
+
+    **GEE notebook prerequisite**: ``tmmn``, ``rmax``, and ``pr`` columns must
+    be present in the GridMET CSV export (add to GEE notebook and re-export).
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Output of :func:`load_gridmet_csv` with ``tmmn_f``, ``rmax``, and
+        ``pr`` columns present.
+    pyrome_id : str or int
+        Pyrome to subset.
+    start_date : str
+        Start date inclusive (``"YYYY-MM-DD"``).
+    end_date : str
+        End date inclusive (``"YYYY-MM-DD"``).
+    elevation_ft : int
+        Elevation of the representative weather location in feet.
+    pyrome_col : str
+        Column identifying the pyrome. Default ``"pyrome"``.
+    precip_start_hour, precip_end_hour : int
+        HHMM times assigned as precip start/end when daily precip > 0.
+        Defaults 0600–1200.
+
+    Returns
+    -------
+    tuple[list[tuple], int]
+        ``(rows, n_records)`` where each row is a 12-element tuple and
+        ``n_records`` equals ``len(rows)``.
+
+    Raises
+    ------
+    KeyError
+        If required columns (``tmmn_f``, ``rmax``, ``pr``) are absent — update
+        the GEE GridMET export to include ``tmmn``, ``rmax``, and ``pr``.
+    ValueError
+        If no records are found for the given pyrome / date range.
+    """
+    for col in ("tmmn_f", "rmax", "pr"):
+        if col not in df.columns:
+            raise KeyError(
+                f"Column {col!r} not found. Add tmmn/rmax/pr to the GEE GridMET "
+                "export and re-run load_gridmet_csv()."
+            )
+
+    sub = df[df[pyrome_col].astype(str) == str(pyrome_id)].copy()
+    if sub.empty:
+        raise ValueError(f"No GridMET records for pyrome {pyrome_id!r}")
+
+    start = pd.Timestamp(start_date)
+    end = pd.Timestamp(end_date)
+    sub = sub[(sub["date"] >= start) & (sub["date"] <= end)].sort_values("date")
+
+    if sub.empty:
+        raise ValueError(
+            f"No records for pyrome {pyrome_id!r} in {start_date} – {end_date}"
+        )
+
+    rows: list[tuple] = []
+    for _, row in sub.iterrows():
+        pcp_hundredths = int(round(float(row["pr"]) * 0.03937 * 100))
+        pcp_hundredths = max(0, pcp_hundredths)
+
+        pst = precip_start_hour if pcp_hundredths > 0 else 0
+        pet = precip_end_hour if pcp_hundredths > 0 else 0
+
+        rows.append((
+            int(row["date"].month),
+            int(row["date"].day),
+            pcp_hundredths,
+            500,                             # mTH: min-temp hour default 0500
+            1400,                            # xTH: max-temp hour default 1400
+            int(round(float(row["tmmn_f"]))),
+            int(round(float(row["tmmx_f"]))),
+            int(round(float(row["rmax"]))),  # mH: morning (max) humidity
+            int(round(float(row["rmin"]))),  # xH: afternoon (min) humidity
+            elevation_ft,
+            pst,
+            pet,
+        ))
+
+    return rows, len(rows)
+
+
+def build_gridmet_wind_percentiles(
+    df: pd.DataFrame,
+    pyrome_col: str = "pyrome",
+    percentiles: list[float] | None = None,
+    erc_filter_pct: float | None = None,
+) -> dict[str, dict]:
+    """
+    Compute fire-season wind speed percentiles from GridMET ``vs``/``th``.
+
+    Provides a gridded alternative to HRRR for wind climatology when HRRR
+    records are unavailable or when spatial coverage of the pyrome is
+    preferred over point-based fire-occurrence sampling.  For FSPro, HRRR
+    analysis (``build_pyrome_wind_cells``) remains the primary wind source.
+
+    GridMET variables required (added via GEE export):
+    - ``vs`` → ``ws_mph``  : daily mean wind speed (m/s, converted to mph)
+    - ``th`` → ``wd_deg``  : daily wind direction (degrees, meteorological FROM)
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Output of :func:`load_gridmet_csv` with ``ws_mph`` and ``wd_deg``
+        columns present.
+    pyrome_col : str
+        Column identifying the spatial grouping unit.
+    percentiles : list of float, optional
+        Wind speed percentiles to compute. Default ``[0.25, 0.50, 0.75, 0.90, 0.97]``.
+    erc_filter_pct : float, optional
+        If provided, restrict the wind sample to days at or above this ERC
+        percentile (e.g., ``0.90`` = top-10% ERC days).  Useful for computing
+        wind speed representative of high fire-danger conditions only.
+
+    Returns
+    -------
+    dict[str, dict]
+        ``{pyrome_id: {"ws_mph": {pct_key: value}, "wd_deg_mode": value}}``.
+        ``wd_deg_mode`` is the circular-mean direction on the sampled days.
+
+    Raises
+    ------
+    KeyError
+        If ``ws_mph`` or ``wd_deg`` columns are absent.
+    """
+    for col in ("ws_mph", "wd_deg"):
+        if col not in df.columns:
+            raise KeyError(
+                f"Column {col!r} not found. Add vs/th to the GEE GridMET export."
+            )
+
+    if percentiles is None:
+        percentiles = [0.25, 0.50, 0.75, 0.90, 0.97]
+
+    season = df[(df["doy"] >= 91) & (df["doy"] <= 304)].copy()
+    result: dict[str, dict] = {}
+
+    for pyrome_id, group in season.groupby(pyrome_col):
+        sub = group.dropna(subset=["ws_mph", "wd_deg"])
+
+        if erc_filter_pct is not None and "erc" in sub.columns:
+            thresh = float(sub["erc"].quantile(erc_filter_pct))
+            sub = sub[sub["erc"] >= thresh]
+            if sub.empty:
+                sub = group.dropna(subset=["ws_mph", "wd_deg"])
+
+        ws = sub["ws_mph"].values
+        wd = sub["wd_deg"].values
+
+        ws_pcts = {
+            f"p{int(round(p * 100))}": round(float(np.nanpercentile(ws, p * 100)), 1)
+            for p in percentiles
+        }
+        # Circular mean direction
+        wd_rad = np.radians(wd)
+        wd_mode = float((np.degrees(np.arctan2(np.nanmean(np.sin(wd_rad)), np.nanmean(np.cos(wd_rad)))) + 360) % 360)
+
+        result[str(pyrome_id)] = {
+            "ws_mph": ws_pcts,
+            "wd_deg_mean": round(wd_mode, 1),
+            "n_days": int(len(sub)),
+        }
+
+    return result
+
+
+def build_flammap_scenario_cache(
+    df: pd.DataFrame,
+    pyrome_col: str = "pyrome",
+    percentiles: list[float] | None = None,
+    out_dir: str | Path | None = None,
+    fm100_col: str = "fm100",
+    tmmx_col: str = "tmmx_f",
+    rmin_col: str = "rmin",
+    lat_deg: float | None = None,
+    wind_direction: int = -2,
+    wind_speed_source: str = "gridmet",
+) -> dict[str, dict]:
+    """
+    Build per-pyrome FlamMap scenario caches at multiple ERC percentiles.
+
+    For each pyrome and ERC percentile threshold, derives a complete set of
+    fuel moisture **and wind** values from all fire-season days at or above
+    that ERC level.  Results are written to ``pyrome_{id}_flammap.json`` and
+    are directly usable as ``fm_params`` in
+    :func:`~fb_tools.models.flammap.run_flammap_scenarios`.
+
+    This follows the same JSON-cache pattern used for FSPro inputs so that
+    FlamMap scenario batches can be parameterised from cache without
+    re-running the full GridMET pipeline.
+
+    Cache JSON structure::
+
+        {
+          "pyrome_id": "42",
+          "percentiles": [0.25, 0.50, 0.75, 0.90, 0.97],
+          "wind_direction": -2,
+          "scenarios": {
+            "p25": {
+              "FM_1hr": 3.8, "FM_10hr": 5.4, "FM_100hr": 11.2,
+              "FM_herb": 198.3, "FM_woody": 191.2,
+              "WIND_SPEED": 9, "WIND_DIRECTION": -2,
+              "erc_threshold": 22.1, "scenario_doy": 162
+            },
+            "p97": { ... }
+          }
+        }
+
+    Percentile keys use the format ``p{int(p*100)}`` (e.g., ``"p97"``).
+
+    **Wind speed** (``WIND_SPEED``): derived from the median GridMET ``ws_mph``
+    on high-ERC days when ``wind_speed_source="gridmet"`` and ``ws_mph`` is
+    present.  Falls back to ``None`` (must be supplied at run time) otherwise.
+
+    **Wind direction** (``WIND_DIRECTION``): controlled by ``wind_direction``.
+    FlamMap convention: ``-2`` = downhill (worst-case, default), ``-1`` =
+    uphill, or an explicit azimuth (0–360).  For FSPro, wind is derived
+    separately via HRRR wind cells.
+
+    FM derivation:
+    - ``FM_1hr``, ``FM_10hr`` : NFDRS dead FM at peak-fire-hour conditions
+    - ``FM_100hr``            : median GridMET 100-hr dead FM
+    - ``FM_herb``             : GSI-based if ``tmmn_f`` + ``lat_deg`` available,
+                               otherwise DOY-based curing (NFDRS PMS 437)
+    - ``FM_woody``            : same as FM_herb choice
+
+    Fire season: April 1 – October 31 (DOY 91–304).
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Output of :func:`load_gridmet_csv`.
+    pyrome_col : str
+        Column identifying the spatial grouping unit. Default ``"pyrome"``.
+    percentiles : list of float, optional
+        ERC percentile thresholds in [0, 1].
+        Default ``[0.25, 0.50, 0.75, 0.90, 0.97]``.
+    out_dir : str or Path, optional
+        If provided, write ``pyrome_{id}_flammap.json`` files here.
+    fm100_col, tmmx_col, rmin_col : str
+        Column names in ``df``.
+    lat_deg : float, optional
+        Site latitude (decimal degrees). When provided with ``tmmn_f``
+        present, live FM uses the NFDRS GSI model.
+    wind_direction : int
+        Wind direction written to every scenario entry.  Use ``-2``
+        (downhill, default) or ``-1`` (uphill) for worst-case FlamMap runs,
+        or an explicit azimuth (0–360).
+    wind_speed_source : str
+        ``"gridmet"`` (default): derive ``WIND_SPEED`` from median GridMET
+        ``ws_mph`` on high-ERC days if the column is present.
+        ``"none"``: omit ``WIND_SPEED`` from cache (supply at run time).
+
+    Returns
+    -------
+    dict[str, dict]
+        ``{pyrome_id: {"percentiles": [...], "scenarios": {key: scenario_dict}}}``.
+    """
+    if percentiles is None:
+        percentiles = [0.25, 0.50, 0.75, 0.90, 0.97]
+
+    if out_dir is not None:
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    has_wind = "ws_mph" in df.columns and wind_speed_source == "gridmet"
+
+    # Restrict to fire season (DOY 91–304: April 1 – October 31)
+    season = df[(df["doy"] >= 91) & (df["doy"] <= 304)].copy()
+
+    result: dict[str, dict] = {}
+
+    for pyrome_id, group in season.groupby(pyrome_col):
+        erc = group["erc"].dropna()
+        scenarios: dict[str, dict] = {}
+
+        for p in percentiles:
+            key = f"p{int(round(p * 100))}"
+            threshold = float(erc.quantile(p))
+
+            high = group[group["erc"] >= threshold]
+            if high.empty:
+                high = group
+
+            fm1 = float(np.nanmedian(calc_1hr_fm(high[tmmx_col].values, high[rmin_col].values)))
+            fm10 = float(np.nanmedian(calc_10hr_fm(high[tmmx_col].values, high[rmin_col].values)))
+            fm100 = float(np.nanmedian(high[fm100_col].values))
+            median_doy = float(np.nanmedian(high["doy"].values))
+
+            if "tmmn_f" in high.columns and lat_deg is not None:
+                vpd = calc_vpd_pa(high[tmmx_col].values, high[rmin_col].values)
+                dl = calc_daylength(high["doy"].values, lat_deg)
+                gsi = float(np.nanmedian(calc_gsi(high["tmmn_f"].values, vpd, dl)))
+                fm_herb = float(calc_herb_fm_gsi(gsi))
+                fm_woody = float(calc_woody_fm_gsi(gsi))
+            else:
+                fm_herb = float(calc_herb_fm(median_doy))
+                fm_woody = float(calc_woody_fm(median_doy))
+
+            entry: dict = {
+                "FM_1hr": round(fm1, 1),
+                "FM_10hr": round(fm10, 1),
+                "FM_100hr": round(fm100, 1),
+                "FM_herb": round(fm_herb, 1),
+                "FM_woody": round(fm_woody, 1),
+                "WIND_DIRECTION": wind_direction,
+                "erc_threshold": round(threshold, 1),
+                "scenario_doy": int(round(median_doy)),
+            }
+
+            if has_wind:
+                ws = high["ws_mph"].dropna()
+                entry["WIND_SPEED"] = round(float(np.nanmedian(ws)), 1) if len(ws) > 0 else None
+
+            scenarios[key] = entry
+
+        cache = {
+            "pyrome_id": str(pyrome_id),
+            "percentiles": percentiles,
+            "wind_direction": wind_direction,
+            "wind_speed_source": wind_speed_source if has_wind else "none",
+            "scenarios": scenarios,
+        }
+        result[str(pyrome_id)] = cache
+
+        if out_dir is not None:
+            _write_json(cache, out_dir / f"pyrome_{pyrome_id}_flammap.json")
+
+    print(f"  [build_flammap_scenario_cache] {len(result)} pyromes × {len(percentiles)} scenarios")
+    return result
+
+
+def load_flammap_scenario_cache(
+    pyrome_id: str | int,
+    cache_dir: str | Path,
+) -> dict:
+    """
+    Load a cached FlamMap scenario FM table from JSON.
+
+    Parameters
+    ----------
+    pyrome_id : str or int
+        Pyrome identifier matching the ``pyrome_{id}_flammap.json`` filename.
+    cache_dir : str or Path
+        Directory containing the JSON cache files.
+
+    Returns
+    -------
+    dict
+        Full cache dict with keys ``pyrome_id``, ``percentiles``, and
+        ``scenarios``.  Each scenario entry has keys ``FM_1hr``, ``FM_10hr``,
+        ``FM_100hr``, ``FM_herb``, ``FM_woody``, ``erc_threshold``,
+        ``scenario_doy``.
+
+    Raises
+    ------
+    FileNotFoundError
+        If no cache file exists for this pyrome.
+
+    Examples
+    --------
+    >>> cache = load_flammap_scenario_cache(42, "cache/")
+    >>> fm_params = cache["scenarios"]["p97"]
+    >>> fm_params["FM_herb"]  # live herbaceous FM at 97th percentile ERC
+    """
+    path = Path(cache_dir) / f"pyrome_{pyrome_id}_flammap.json"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"No FlamMap scenario cache for '{pyrome_id}' in {cache_dir}.\n"
+            "Run build_flammap_scenario_cache() first."
+        )
+    with open(path) as f:
+        return json.load(f)
 
 
 def load_gridmet_pyrome_cache(

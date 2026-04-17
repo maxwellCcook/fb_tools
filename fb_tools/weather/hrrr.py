@@ -637,3 +637,103 @@ def load_pyrome_wind_cells(
         return np.array(data["WindCellValues"], dtype=float)
     data["WindCellValues"] = np.array(data["WindCellValues"], dtype=float)
     return data
+
+
+def build_flammap_wind_data(
+    hrrr_df: "pd.DataFrame",
+    start_date: str,
+    end_date: str,
+    fire_hours_local: "list[int] | None" = None,
+    cloud_cover: int = 0,
+) -> "tuple[list[tuple], int]":
+    """
+    Build a FlamMap ``WIND_DATA`` block from HRRR fire-hour wind records.
+
+    Converts a DataFrame of HRRR-extracted winds (output of
+    :func:`fetch_hrrr_winds_at_fires`) into ``WIND_DATA`` rows suitable for
+    embedding in a FlamMap conditioning-period input file alongside a
+    ``WEATHER_DATA`` block.
+
+    Only fire-hour records within the requested date range are written.
+    FlamMap allows small gaps in ``WIND_DATA``, so overnight hours with no
+    HRRR coverage are simply omitted.
+
+    Row format (6 values per record):
+    ``Mth Day Hour Speed(mph) Direction(deg) CloudCover(%)``
+
+    Where ``Hour`` is in HHMM format (e.g., 1300 = 13:00).
+
+    Parameters
+    ----------
+    hrrr_df : pd.DataFrame
+        DataFrame with at minimum columns ``datetime`` (or ``date`` + ``hour``),
+        ``ws_mph``, and ``wd_deg``. Typically the output of
+        :func:`fetch_hrrr_winds_at_fires` or similar.
+    start_date : str
+        Start date inclusive (``"YYYY-MM-DD"``).
+    end_date : str
+        End date inclusive (``"YYYY-MM-DD"``).
+    fire_hours_local : list of int, optional
+        Local hours (0–23) to include. Defaults to ``[13, 14, 15, 16]``
+        (1300–1600 local, the standard fire-behavior window).
+    cloud_cover : int
+        Cloud cover percent (0–100) to assign to all records when not
+        available in ``hrrr_df``. Default 0.
+
+    Returns
+    -------
+    tuple[list[tuple], int]
+        ``(rows, n_records)`` where each row is a 6-element tuple
+        ``(Mth, Day, HHMM, ws_mph_int, wd_deg_int, cc)`` and
+        ``n_records`` equals ``len(rows)``.
+
+    Raises
+    ------
+    ValueError
+        If no records are found for the given date range / fire hours.
+    """
+    import pandas as pd
+
+    if fire_hours_local is None:
+        fire_hours_local = [13, 14, 15, 16]
+
+    df = hrrr_df.copy()
+
+    # Normalise datetime column
+    if "datetime" in df.columns:
+        df["_dt"] = pd.to_datetime(df["datetime"])
+    elif "date" in df.columns and "hour" in df.columns:
+        df["_dt"] = pd.to_datetime(df["date"]) + pd.to_timedelta(df["hour"], unit="h")
+    else:
+        raise KeyError("hrrr_df must have a 'datetime' column or both 'date' and 'hour' columns")
+
+    start = pd.Timestamp(start_date)
+    end = pd.Timestamp(end_date) + pd.Timedelta(hours=23)
+
+    df = df[(df["_dt"] >= start) & (df["_dt"] <= end)].copy()
+    if df.empty:
+        raise ValueError(f"No HRRR records in {start_date} – {end_date}")
+
+    # Filter to fire hours
+    df["_hour"] = df["_dt"].dt.hour
+    df = df[df["_hour"].isin(fire_hours_local)]
+    if df.empty:
+        raise ValueError(
+            f"No records for fire hours {fire_hours_local} in {start_date} – {end_date}"
+        )
+
+    cc_col = "cloud_cover" if "cloud_cover" in df.columns else None
+    rows: list[tuple] = []
+    for _, row in df.sort_values("_dt").iterrows():
+        hhmm = int(row["_hour"]) * 100  # e.g. hour 13 → 1300
+        cc = int(round(float(row[cc_col]))) if cc_col else cloud_cover
+        rows.append((
+            int(row["_dt"].month),
+            int(row["_dt"].day),
+            hhmm,
+            int(round(float(row["ws_mph"]))),
+            int(round(float(row["wd_deg"]))),
+            cc,
+        ))
+
+    return rows, len(rows)

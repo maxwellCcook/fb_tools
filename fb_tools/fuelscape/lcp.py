@@ -144,6 +144,217 @@ def create_container_ignition(container_gdf, out_path):
     return out_path.resolve()
 
 
+def create_random_ignitions(
+    container_gdf,
+    n_points: int,
+    lcp_fp,
+    out_path,
+    seed=None,
+):
+    """
+    Generate spatially-distributed random ignition polygons within a container.
+
+    Samples *n_points* random pixel centers from burnable cells in *lcp_fp*
+    that fall inside *container_gdf*, then buffers each by half a pixel to
+    produce a set of small circle polygons suitable for FSPro's
+    ``IgnitionFile``.  Using many small ignition polygons instead of the full
+    container boundary forces FSPro to start each simulated fire from a
+    realistic, spatially-variable location rather than sampling uniformly from
+    the entire analysis area.
+
+    Non-burnable FBFM40 codes excluded from sampling: 0 (NoData) and
+    91–99 (NB1–NB5).  The FBFM40 band is located by searching raster band
+    descriptions for "FBFM"; band 4 is used as a fallback for standard
+    LANDFIRE LCP band order.
+
+    Parameters
+    ----------
+    container_gdf : GeoDataFrame
+        Spatial container (HUC12, fireshed, POD, etc.).  May be in any CRS;
+        it is reprojected to the LCP CRS internally.
+    n_points : int
+        Target number of ignition points.  If fewer burnable pixels exist
+        inside the container, all burnable pixels are used and a warning is
+        printed.
+    lcp_fp : str or Path
+        Path to the landscape raster.  Used to determine CRS, pixel
+        resolution, and burnable/non-burnable pixel locations.
+    out_path : str or Path
+        Destination shapefile path.  Parent directory is created if needed.
+    seed : int, optional
+        Random seed for reproducibility.
+
+    Returns
+    -------
+    Path
+        Absolute path to the written shapefile.
+
+    Raises
+    ------
+    ValueError
+        If no burnable pixels are found inside the container.
+    """
+    import numpy as np
+    import rasterio
+    from rasterio.transform import xy as rio_xy
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    _NB_CODES = {0, 91, 92, 93, 98, 99}
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    rng = np.random.default_rng(seed)
+
+    with rasterio.open(lcp_fp) as src:
+        crs = src.crs
+        res_x, res_y = src.res
+        buffer_dist = min(res_x, res_y) / 2.0
+
+        # Locate FBFM40 band by description; fall back to band 4
+        fbfm_band = 4
+        for i, desc in enumerate(src.descriptions, start=1):
+            if desc and "FBFM" in desc.upper():
+                fbfm_band = i
+                break
+
+        data = src.read(fbfm_band)
+        nodata = src.nodata
+
+        burnable = ~np.isin(data, list(_NB_CODES))
+        if nodata is not None:
+            burnable &= data != nodata
+
+        rows, cols = np.where(burnable)
+        all_xs, all_ys = rio_xy(src.transform, rows, cols)
+
+    # Vectorised containment check against container in LCP CRS
+    container_proj = container_gdf.to_crs(crs)
+    try:
+        container_union = container_proj.geometry.union_all()
+    except AttributeError:
+        container_union = container_proj.geometry.unary_union
+
+    pts_gdf = gpd.GeoDataFrame(
+        geometry=gpd.points_from_xy(all_xs, all_ys), crs=crs
+    )
+    inside_mask = pts_gdf.within(container_union)
+    inside_pts = pts_gdf[inside_mask].reset_index(drop=True)
+
+    if len(inside_pts) == 0:
+        raise ValueError(
+            "No burnable pixels found within the container boundary. "
+            "Check that the LCP overlaps the container and contains burnable fuels."
+        )
+
+    if len(inside_pts) < n_points:
+        print(
+            f"  [create_random_ignitions] Warning: only {len(inside_pts)} burnable "
+            f"pixels inside container (requested {n_points}); using all of them."
+        )
+        sampled = inside_pts
+    else:
+        idx = rng.choice(len(inside_pts), size=n_points, replace=False)
+        sampled = inside_pts.iloc[idx].reset_index(drop=True)
+
+    sampled = sampled.copy()
+    sampled["geometry"] = sampled.geometry.buffer(buffer_dist)
+    sampled[["geometry"]].to_file(out_path)
+
+    print(
+        f"  [create_random_ignitions] {len(sampled)} ignition circles "
+        f"(buffer={buffer_dist:.1f} m, seed={seed}) → {out_path.name}"
+    )
+    return out_path.resolve()
+
+
+def create_fod_ignitions(
+    container_gdf,
+    fod_gdf,
+    lcp_fp,
+    out_path,
+    buffer_m=None,
+):
+    """
+    Build an FSPro ignition shapefile from historical FPA-FOD point locations.
+
+    Clips *fod_gdf* to *container_gdf*, reprojects to the LCP CRS, and
+    buffers each point by half a pixel (or *buffer_m*) to produce a set of
+    small circle polygons.  Using historical ignition locations grounds the
+    FSPro simulation in where fires have actually started within the analysis
+    unit rather than drawing uniformly from the full container area.
+
+    Parameters
+    ----------
+    container_gdf : GeoDataFrame
+        Spatial container (HUC12, fireshed, POD, etc.).
+    fod_gdf : GeoDataFrame
+        FPA-FOD (or equivalent) point features.  Should be pre-filtered to
+        the relevant years, fire-size classes, and/or cause codes before
+        calling this function.  Any CRS is accepted; it is reprojected
+        internally.
+    lcp_fp : str or Path
+        Path to the landscape raster.  Used to determine CRS and default
+        buffer distance.
+    out_path : str or Path
+        Destination shapefile path.  Parent directory is created if needed.
+    buffer_m : float, optional
+        Buffer radius in the LCP's linear units (usually metres).  Defaults
+        to half the minimum pixel dimension so each circle covers one pixel.
+
+    Returns
+    -------
+    Path
+        Absolute path to the written shapefile.
+
+    Raises
+    ------
+    ValueError
+        If no FPA-FOD points fall inside the container.
+
+    Notes
+    -----
+    Overlapping circles are intentional — densely-ignited areas will receive
+    proportionally more simulated fire starts, reflecting the historical
+    ignition density.
+    """
+    import rasterio
+    import geopandas as gpd
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with rasterio.open(lcp_fp) as src:
+        crs = src.crs
+        res_x, res_y = src.res
+        default_buffer = min(res_x, res_y) / 2.0
+
+    if buffer_m is None:
+        buffer_m = default_buffer
+
+    container_proj = container_gdf.to_crs(crs)
+    fod_proj = fod_gdf.to_crs(crs)
+
+    fod_clipped = gpd.clip(fod_proj, container_proj)
+
+    if len(fod_clipped) == 0:
+        raise ValueError(
+            "No FPA-FOD ignitions found within the container boundary. "
+            "Check that fod_gdf covers the study area and is not over-filtered."
+        )
+
+    result = fod_clipped[["geometry"]].copy().reset_index(drop=True)
+    result["geometry"] = result.geometry.buffer(buffer_m)
+    result.to_file(out_path)
+
+    print(
+        f"  [create_fod_ignitions] {len(result)} historical ignition circles "
+        f"(buffer={buffer_m:.1f} m) → {out_path.name}"
+    )
+    return out_path.resolve()
+
+
 def create_ignition_ascii(ign_gdf, ref_img_fp, out_ascii_fp):
     """
     Rasterize ignition points to an ASCII grid (.asc) snapped to a reference raster.

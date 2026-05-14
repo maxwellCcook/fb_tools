@@ -639,6 +639,162 @@ def load_pyrome_wind_cells(
     return data
 
 
+def build_hrrr_wind_percentiles(
+    hrrr_df: "pd.DataFrame",
+    percentiles: "list[float] | None" = None,
+    pyrome_col: str = "pyrome_id",
+    ws_col: str = "ws_mph",
+    wd_col: str = "wd_deg",
+    drop_calm: bool = True,
+) -> "dict[str, dict]":
+    """
+    Per-pyrome wind speed percentiles from raw HRRR fire-hour observations.
+
+    Intended to supply ``WIND_SPEED`` values to
+    :func:`fb_tools.weather.gridmet.build_flammap_scenario_cache` via its
+    ``wind_percentiles`` argument.  Sampling HRRR at 10m during the fire-hour
+    UTC window (19–22Z) at FOD points yields a distribution that retains the
+    peak-hour extremes a RAWS station would record — avoiding the smoothing
+    imposed by GridMET daily-mean ``vs``.
+
+    Parameters
+    ----------
+    hrrr_df : pd.DataFrame
+        Output of :func:`fetch_hrrr_winds_at_fires`. Required columns:
+        ``pyrome_col``, ``ws_col``, ``wd_col``.
+    percentiles : list of float, optional
+        Percentiles in [0, 1].  Default ``[0.25, 0.50, 0.75, 0.90, 0.97]``.
+    pyrome_col, ws_col, wd_col : str
+        Column names in ``hrrr_df``.
+    drop_calm : bool
+        If True (default), exclude observations below ``_CALM_THRESHOLD_MPH``
+        (2 mph) from the speed distribution.  Calm hours rarely drive fire
+        spread and inflate the low end of the percentile curve.
+
+    Returns
+    -------
+    dict[str, dict]
+        ``{pyrome_id: {"ws_mph": {"p25": v, "p50": v, ...},
+                        "wd_deg_mean": v, "n_obs": n}}``.
+        The shape matches :func:`~fb_tools.weather.gridmet.build_gridmet_wind_percentiles`
+        so the two are interchangeable in downstream callers.
+
+    Examples
+    --------
+    >>> wind_df = fetch_hrrr_winds_at_fires(fod_gdf, k_neighbors=9)
+    >>> wind_pcts = build_hrrr_wind_percentiles(wind_df)
+    >>> build_flammap_scenario_cache(df, wind_percentiles=wind_pcts, ...)
+    """
+    if percentiles is None:
+        percentiles = [0.25, 0.50, 0.75, 0.90, 0.97]
+
+    result: dict[str, dict] = {}
+    for pid, grp in hrrr_df.groupby(pyrome_col):
+        sub = grp.dropna(subset=[ws_col, wd_col])
+        if drop_calm:
+            sub = sub[sub[ws_col] >= _CALM_THRESHOLD_MPH]
+        if sub.empty:
+            continue
+
+        ws = sub[ws_col].values
+        wd_rad = np.radians(sub[wd_col].values)
+        wd_mean = float(
+            (np.degrees(np.arctan2(np.nanmean(np.sin(wd_rad)),
+                                    np.nanmean(np.cos(wd_rad)))) + 360) % 360
+        )
+
+        ws_pcts = {
+            f"p{int(round(p * 100))}": round(float(np.nanpercentile(ws, p * 100)), 1)
+            for p in percentiles
+        }
+
+        result[str(pid)] = {
+            "ws_mph": ws_pcts,
+            "wd_deg_mean": round(wd_mean, 1),
+            "n_obs": int(len(sub)),
+        }
+
+    print(f"  [build_hrrr_wind_percentiles] {len(result)} pyromes × {len(percentiles)} percentiles")
+    return result
+
+
+def wind_percentiles_from_cell_cache(
+    cache_dir: "Path | str",
+    percentiles: "list[float] | None" = None,
+    include_calm: bool = False,
+) -> "dict[str, dict]":
+    """
+    Approximate per-pyrome wind percentiles from cached ``WindCellValues``.
+
+    Useful when the raw HRRR observations (output of
+    :func:`fetch_hrrr_winds_at_fires`) are no longer available but the
+    binned wind-cell cache files from :func:`build_pyrome_wind_cells` exist.
+    Each speed bin is treated as a mass centered at its upper break; the
+    cumulative mass vs. speed curve is linearly interpolated to the target
+    percentile.  Accuracy is limited by the bin resolution (default 5 mph).
+
+    Parameters
+    ----------
+    cache_dir : Path or str
+        Directory containing ``pyrome_{id}_wind.json`` files.
+    percentiles : list of float, optional
+        Percentiles in [0, 1].  Default ``[0.25, 0.50, 0.75, 0.90, 0.97]``.
+    include_calm : bool
+        If True, prepend the ``CalmValue`` as zero-speed mass before
+        interpolation.  Default False — matches
+        :func:`build_hrrr_wind_percentiles`, which drops calm obs.
+
+    Returns
+    -------
+    dict[str, dict]
+        ``{pyrome_id: {"ws_mph": {"p25": v, ...}, "wd_deg_mean": v, "n_obs": n}}``.
+        ``wd_deg_mean`` is None (cell-table loses the raw direction distribution).
+    """
+    if percentiles is None:
+        percentiles = [0.25, 0.50, 0.75, 0.90, 0.97]
+
+    cache_dir = Path(cache_dir)
+    files = sorted(cache_dir.glob("pyrome_*_wind.json"))
+    result: dict[str, dict] = {}
+
+    for path in files:
+        with open(path) as f:
+            data = json.load(f)
+
+        pid = str(data["pyrome_id"])
+        cells = np.asarray(data["WindCellValues"], dtype=float)
+        speed_breaks = np.asarray(data["WindSpeedBreaks_mph"], dtype=float)
+        calm_pct = float(data.get("CalmValue", 0.0))
+
+        # Sum across direction → fractional mass per speed bin
+        row_mass = cells.sum(axis=1)
+        total = row_mass.sum() + (calm_pct if include_calm else 0.0)
+        if total <= 0:
+            continue
+
+        if include_calm:
+            speeds = np.concatenate(([0.0], speed_breaks))
+            masses = np.concatenate(([calm_pct], row_mass)) / total
+        else:
+            speeds = speed_breaks
+            masses = row_mass / total
+
+        cdf = np.cumsum(masses)
+        ws_pcts = {
+            f"p{int(round(p * 100))}": round(float(np.interp(p, cdf, speeds)), 1)
+            for p in percentiles
+        }
+
+        result[pid] = {
+            "ws_mph": ws_pcts,
+            "wd_deg_mean": None,
+            "n_obs": int(data.get("n_observations", 0)),
+        }
+
+    print(f"  [wind_percentiles_from_cell_cache] {len(result)} pyromes × {len(percentiles)} percentiles")
+    return result
+
+
 def build_flammap_wind_data(
     hrrr_df: "pd.DataFrame",
     start_date: str,

@@ -26,7 +26,9 @@ platform restriction and can be used on any OS for input preparation.
 """
 
 import platform
+import re
 import subprocess
+import time
 from pathlib import Path
 
 import numpy as np
@@ -335,6 +337,112 @@ def build_treatment_pair(
     )
 
 
+def _run_fspro_verbose(cmd, log_path, num_fires_total, output_directory):
+    """Stream FSPro output, parse progress, and print periodic updates.
+
+    Drives a ``subprocess.Popen`` loop that tees every line to the log file
+    while parsing the two progress phases FSPro emits:
+
+    Phase 1 — FlamMap conditioning:
+        ``Finished FlamMap run N of M``
+    Phase 2 — Fire simulations:
+        ``Completed fire N``  (fires run in parallel, out of order)
+
+    Progress is printed at each 10 % milestone and on phase transitions.
+    """
+    # Regexes matching FSPro log lines
+    _RE_FLAMMAP = re.compile(r"Finished FlamMap run (\d+) of (\d+)", re.IGNORECASE)
+    _RE_COMPLETE = re.compile(r"Completed fire (\d+)", re.IGNORECASE)
+    _RE_LAUNCHING_FIRES = re.compile(r"Launching fire 0\b", re.IGNORECASE)
+    _RE_FINALIZING = re.compile(r"Finalizing results", re.IGNORECASE)
+    _RE_WRITING = re.compile(r"Writing outputs", re.IGNORECASE)
+
+    flammap_total = None
+    flammap_done  = 0
+    fires_done    = 0
+    phase         = "init"          # "conditioning" | "fires" | "finalizing"
+    last_pct      = {"conditioning": -1, "fires": -1}
+
+    def _pct_str(done, total):
+        pct = int(100 * done / total) if total else 0
+        bar_len = 20
+        filled = int(bar_len * done / total) if total else 0
+        bar = "█" * filled + "░" * (bar_len - filled)
+        return f"[{bar}] {done}/{total} ({pct}%)"
+
+    t0 = time.time()
+
+    with open(log_path, "w") as log_fh:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            cwd=str(output_directory),
+        )
+        for raw_line in proc.stdout:
+            line = raw_line.rstrip("\n")
+            log_fh.write(raw_line)
+
+            # ── Phase 1: FlamMap conditioning ─────────────────────────────
+            m = _RE_FLAMMAP.search(line)
+            if m:
+                flammap_done  = int(m.group(1))
+                flammap_total = int(m.group(2))
+                if phase != "conditioning":
+                    phase = "conditioning"
+                    print(f"  [FSPro] Conditioning weather "
+                          f"({flammap_total} FlamMap runs) …")
+                pct = int(100 * flammap_done / flammap_total)
+                milestone = (pct // 10) * 10
+                if milestone > last_pct["conditioning"]:
+                    last_pct["conditioning"] = milestone
+                    elapsed = time.time() - t0
+                    print(f"    Conditioning  {_pct_str(flammap_done, flammap_total)}"
+                          f"  {elapsed:.0f}s elapsed")
+                continue
+
+            # ── Phase transition: fires about to start ────────────────────
+            if _RE_LAUNCHING_FIRES.search(line) and phase == "conditioning":
+                elapsed = time.time() - t0
+                print(f"    Conditioning  {_pct_str(flammap_done or 0, flammap_total or 0)}"
+                      f"  {elapsed:.0f}s elapsed")
+                print(f"  [FSPro] Simulating {num_fires_total} fires …")
+                phase = "fires"
+                continue
+
+            # ── Phase 2: fire simulations ─────────────────────────────────
+            if _RE_COMPLETE.search(line) and phase == "fires":
+                fires_done += 1
+                pct = int(100 * fires_done / num_fires_total)
+                milestone = (pct // 10) * 10
+                if milestone > last_pct["fires"]:
+                    last_pct["fires"] = milestone
+                    elapsed = time.time() - t0
+                    print(f"    Fires         {_pct_str(fires_done, num_fires_total)}"
+                          f"  {elapsed:.0f}s elapsed")
+                continue
+
+            # ── Phase 3: finalizing ───────────────────────────────────────
+            if _RE_FINALIZING.search(line):
+                elapsed = time.time() - t0
+                print(f"    Fires         {_pct_str(fires_done, num_fires_total)}"
+                      f"  {elapsed:.0f}s elapsed")
+                print(f"  [FSPro] Finalizing results …")
+                phase = "finalizing"
+                continue
+
+            if _RE_WRITING.search(line):
+                print(f"  [FSPro] Writing outputs …")
+                continue
+
+        proc.wait()
+
+    elapsed_total = time.time() - t0
+    print(f"  [FSPro] Done in {elapsed_total:.0f}s  (return code {proc.returncode})")
+    return proc
+
+
 def run_fspro(
     fspro_exe,
     lcp_fp,
@@ -342,6 +450,7 @@ def run_fspro(
     output_directory,
     output_basename=None,
     num_fires_warn=1000,
+    verbose=True,
 ):
     """
     Run a single FSPro scenario.
@@ -369,10 +478,18 @@ def run_fspro(
         If the ``NumFires`` value found in *input_file* is below this
         threshold, a warning is printed.  Default is ``1000``; production
         runs typically require 1000–3000+ fires.  Set to ``0`` to suppress.
+    verbose : bool
+        If ``True`` (default), stream live progress to stdout as FSPro runs,
+        showing two progress bars — one for the FlamMap conditioning phase
+        and one for the fire simulations — with elapsed time at each 10 %
+        milestone.  Output is also written to the log file regardless.
+        Set to ``False`` for silent execution (original behaviour).
 
     Returns
     -------
-    subprocess.CompletedProcess
+    subprocess.CompletedProcess or subprocess.Popen
+        The completed process object.  Check ``.returncode`` for success
+        (``0`` = clean exit).
 
     Raises
     ------
@@ -407,21 +524,21 @@ def run_fspro(
     if not input_file.exists():
         raise FileNotFoundError(f"FSPro input file not found: {input_file}")
 
-    # Warn if NumFires is low
-    if num_fires_warn > 0:
-        try:
-            text = input_file.read_text()
-            for line in text.splitlines():
-                if line.strip().lower().startswith("numfires"):
-                    val = int(line.split(":")[-1].strip())
-                    if val < num_fires_warn:
-                        print(
-                            f"Warning: NumFires={val} in {input_file.name}. "
-                            f"Production runs typically need {num_fires_warn}+ fires."
-                        )
-                    break
-        except Exception:
-            pass  # non-critical; proceed regardless
+    # Parse NumFires from input file for progress tracking and low-fire warning
+    num_fires_total = 1000  # fallback if parsing fails
+    try:
+        for line in input_file.read_text().splitlines():
+            if line.strip().lower().startswith("numfires"):
+                num_fires_total = int(line.split(":")[-1].strip())
+                break
+    except Exception:
+        pass
+
+    if num_fires_warn > 0 and num_fires_total < num_fires_warn:
+        print(
+            f"Warning: NumFires={num_fires_total} in {input_file.name}. "
+            f"Production runs typically need {num_fires_warn}+ fires."
+        )
 
     output_directory.mkdir(parents=True, exist_ok=True)
 
@@ -429,20 +546,22 @@ def run_fspro(
         output_basename = "fspro_out"
 
     output_base = output_directory / output_basename
+    log_path    = output_directory / f"{fspro_exe.stem}_run.log"
+    cmd         = [str(fspro_exe), str(lcp_fp), str(input_file), str(output_base)]
 
-    log_path = output_directory / f"{fspro_exe.stem}_run.log"
-    cmd = [str(fspro_exe), str(lcp_fp), str(input_file), str(output_base)]
-
-    with open(log_path, "w") as log:
-        result = subprocess.run(
-            cmd,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            text=True,
-            cwd=str(output_directory),
-        )
-
-    return result
+    if verbose:
+        print(f"[FSPro] Starting: {lcp_fp.name}  →  {output_directory.name}/")
+        return _run_fspro_verbose(cmd, log_path, num_fires_total, output_directory)
+    else:
+        with open(log_path, "w") as log:
+            result = subprocess.run(
+                cmd,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+                cwd=str(output_directory),
+            )
+        return result
 
 
 def run_fspro_batch(

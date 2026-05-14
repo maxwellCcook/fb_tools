@@ -131,16 +131,42 @@ def _load_weather_for_pyrome(
     pyrome_id = str(pyrome_id)
     weather_dir = Path(weather_dir)
 
+    # ── Validate weather_dir ──────────────────────────────────────────────────
+    if weather_dir.is_file():
+        raise ValueError(
+            f"weather_dir={weather_dir!r} is a file, not a directory.\n"
+            "Pass the root weather cache directory (e.g. 'data/weather/'), not "
+            "the GridMET CSV path.  The CSV goes in the gridmet_csv= parameter."
+        )
+    wind_dir = weather_dir / "pyrome_wind"
+    erc_dir  = weather_dir / "pyrome_erc"
+    if not wind_dir.exists():
+        raise FileNotFoundError(
+            f"Wind cache directory not found: {wind_dir}\n"
+            "Expected layout:\n"
+            "  weather_dir/\n"
+            "    pyrome_wind/   ← pyrome_{id}_wind.json  (build_pyrome_wind_cells)\n"
+            "    pyrome_erc/    ← pyrome_{id}_gridmet.json  (build_historic_erc_arrays)\n"
+            "Run build_pyrome_wind_cells(fod_gdf, out_dir=weather_dir/'pyrome_wind') "
+            "to generate the wind cache for this pyrome."
+        )
+    if not erc_dir.exists():
+        raise FileNotFoundError(
+            f"ERC cache directory not found: {erc_dir}\n"
+            "Run build_historic_erc_arrays(df, out_dir=weather_dir/'pyrome_erc') "
+            "to generate the ERC cache."
+        )
+
     # Wind
     wind_meta = load_pyrome_wind_cells(
-        pyrome_id, weather_dir / "pyrome_wind", return_meta=True
+        pyrome_id, wind_dir, return_meta=True
     )
     wind_cells = wind_meta["WindCellValues"]   # already np.ndarray
     calm_value = float(wind_meta["CalmValue"])
 
     # Historic ERC
     erc_meta = load_gridmet_pyrome_cache(
-        pyrome_id, weather_dir / "pyrome_erc", return_meta=True
+        pyrome_id, erc_dir, return_meta=True
     )
     erc_historic = np.array(erc_meta["HistoricERCValues"], dtype=float)
 
@@ -156,12 +182,16 @@ def _load_weather_for_pyrome(
         n_days=current_erc_n_days,
     )[pyrome_id]
 
-    # ERC classes — require CSV or precomputed array
+    # ERC classes — priority: explicit array > cache JSON > on-the-fly from CSV
     if erc_classes is not None:
+        # 1. Caller supplied a precomputed array — use directly
         erc_classes = np.asarray(erc_classes, dtype=float)
+    elif "ERCClasses" in erc_meta:
+        # 2. Cache JSON was enriched by save_erc_classes_to_cache() — use it
+        erc_classes = np.array(erc_meta["ERCClasses"], dtype=float)
     elif gridmet_csv is not None:
+        # 3. Raw CSV provided — build on the fly
         df = load_gridmet_csv(gridmet_csv)
-        # Filter to this pyrome only before passing to build_erc_classes
         df_p = df[df["pyrome"].astype(str) == pyrome_id]
         if df_p.empty:
             raise ValueError(
@@ -172,9 +202,13 @@ def _load_weather_for_pyrome(
         erc_classes = erc_classes_dict[pyrome_id]
     else:
         raise ValueError(
-            "Provide either 'erc_classes' (precomputed ndarray, shape (5,10)) "
-            "or 'gridmet_csv' (path to GEE-exported GridMET CSV). "
-            "The pyrome cache JSON does not store the ERC class table."
+            f"ERC class table not found for pyrome '{pyrome_id}'.\n"
+            "Fix with one of:\n"
+            "  (a) Run once to enrich all cache files:\n"
+            "        from fb_tools import save_erc_classes_to_cache\n"
+            f"        save_erc_classes_to_cache(gridmet_csv, '{erc_dir}')\n"
+            "  (b) Pass gridmet_csv= to this call each time.\n"
+            "  (c) Pass erc_classes= as a precomputed (5,10) array."
         )
 
     return {
@@ -197,10 +231,18 @@ def prepare_container_fspro(
     pyromes_gdf,
     lf_year: "str | int",
     lcp_path: "str | Path | None" = None,
+    lcp_name: "str | None" = None,
+    num_fires: int = 1000,
+    duration: int = 7,
+    resolution: float = 90.0,
     erc_classes: "np.ndarray | None" = None,
     gridmet_csv: "str | Path | None" = None,
     current_erc_start_doy: int = 91,
     current_erc_n_days: int = 79,
+    ignition_mode: str = "container",
+    n_ignitions: int = 200,
+    fod_gdf=None,
+    ignition_seed=None,
     **fspro_kwargs,
 ) -> dict:
     """Prepare a complete FSPro simulation directory for a spatial container.
@@ -231,30 +273,73 @@ def prepare_container_fspro(
               pyrome_erc/   ← pyrome_{id}_gridmet.json
               pyrome_wind/  ← pyrome_{id}_wind.json
 
-    pyromes_gdf : geopandas.GeoDataFrame
-        NIFC pyrome polygons.  Must contain a ``Pyrome_ID`` column (or pass
-        ``pyrome_col`` via ``fspro_kwargs`` — note: ``pyrome_col`` is consumed
-        here and not forwarded to ``build_fspro_inputs``).
+    pyromes_gdf : geopandas.GeoDataFrame or str or Path
+        NIFC pyrome polygons.  Accepts either an already-loaded GeoDataFrame
+        or a file path (shapefile, GeoPackage, etc.) that will be read with
+        ``geopandas.read_file()``.  Must contain a ``Pyrome_ID`` column (or
+        pass ``pyrome_col`` via ``fspro_kwargs`` — note: ``pyrome_col`` is
+        consumed here and not forwarded to ``build_fspro_inputs``).
     lf_year : str or int
         LANDFIRE year for ``lfps_request`` (e.g. ``"2023"``).  Ignored when
         ``lcp_path`` is provided.
     lcp_path : str or Path, optional
-        Pre-existing LCP GeoTIFF.  When provided, the LFPS download is skipped.
-        The LCP CRS is used to reproject the container for ignition creation.
+        Pre-existing LCP GeoTIFF.  When provided, the LFPS download and the
+        existence check are both skipped entirely.  The LCP CRS is used to
+        reproject the container for ignition creation.
+    lcp_name : str, optional
+        Base filename (no extension) for the downloaded LCP GeoTIFF, passed
+        as ``rename`` to ``lfps_request``.  When provided, the function
+        checks for ``out_dir/lcp/{lcp_name}.tif`` before submitting an LFPS
+        job — if the file already exists it is reused and the download is
+        skipped.  When omitted (default), any existing ``*.tif`` in
+        ``out_dir/lcp/`` is reused if exactly one is found; otherwise LFPS
+        is called and the file keeps its default name.
     erc_classes : np.ndarray, optional
         Pre-computed ERC class table, shape ``(5, 10)``.  Provide this *or*
         ``gridmet_csv`` — the pyrome cache JSON does not store ERC classes.
     gridmet_csv : str or Path, optional
         Path to GEE-exported GridMET CSV.  Used to build ERC classes on the
         fly when ``erc_classes`` is not provided.
+    num_fires : int
+        Number of fire simulations (``NumFires``).  More fires produce
+        smoother burn-probability surfaces.  Default 1000; production runs
+        typically use 1000–3000.
+    duration : int
+        Maximum burn period per fire in days (``Duration``).  Default 7.
+    resolution : float
+        Output grid cell size in metres (``Resolution``).  Default 90.0.
+        Must be a multiple of the LCP cell size.
     current_erc_start_doy : int
         1-based fire-season DOY (1 = April 1) at which ``CurrentERCValues``
         begins.  Default 91 (≈ July 1).
     current_erc_n_days : int
         Length of the current-season ERC sequence.  Default 79.
+    ignition_mode : {"container", "random", "fod"}
+        Controls how the ``IgnitionFile`` is built.
+
+        ``"container"`` (default)
+            Dissolves the full container polygon.  Uniform sampling across
+            the entire analysis area.
+        ``"random"``
+            Samples *n_ignitions* burnable pixels at random from within the
+            container and buffers each to a small circle.  Requires
+            ``lcp_path`` to be known (i.e. the LCP is available before
+            calling this function, or will be downloaded by it).
+        ``"fod"``
+            Uses historical FPA-FOD (or equivalent) point locations clipped
+            to the container.  Requires *fod_gdf*.
+    n_ignitions : int
+        Number of random ignition points for ``ignition_mode="random"``.
+        Default 200.
+    fod_gdf : GeoDataFrame, optional
+        FPA-FOD (or equivalent) point GeoDataFrame, pre-filtered to the
+        desired years/classes.  Required when ``ignition_mode="fod"``.
+    ignition_seed : int, optional
+        Random seed for ``ignition_mode="random"``.
     **fspro_kwargs
-        Passed to ``build_fspro_inputs`` (e.g. ``NumFires=2000``,
-        ``Duration=14``).  ``pyrome_col`` is intercepted here if present.
+        Additional overrides for any key in ``_FSPRO_DEFAULTS``, e.g.
+        ``CROWN_FIRE_METHOD="Scott/Reinhardt"``, ``SavePerimeters=0``.
+        ``pyrome_col`` is also intercepted here if present.
 
     Returns
     -------
@@ -264,7 +349,8 @@ def prepare_container_fspro(
         ``"lcp_path"`` : Path
             Landscape GeoTIFF used for this run.
         ``"ignition_path"`` : Path
-            Dissolved container ignition shapefile (.shp).
+            Ignition shapefile (.shp) — container polygon, random circles,
+            or FOD circles depending on *ignition_mode*.
         ``"fspro_input_path"`` : Path
             Written FSPro input file (FSPRO-Inputs-File-Version-4).
         ``"pyrome_id"`` : str
@@ -292,10 +378,19 @@ def prepare_container_fspro(
     with the corresponding Windows drive letter).
     """
     import rasterio
+    import geopandas as gpd
     from fb_tools.fuelscape.lfps import lfps_request
-    from fb_tools.fuelscape.lcp import create_container_ignition
+    from fb_tools.fuelscape.lcp import (
+        create_container_ignition,
+        create_random_ignitions,
+        create_fod_ignitions,
+    )
     from fb_tools.models.fspro import build_fspro_inputs
     from fb_tools.utils.geo import lookup_pyrome
+
+    # Accept a file path for pyromes_gdf
+    if isinstance(pyromes_gdf, (str, Path)):
+        pyromes_gdf = gpd.read_file(pyromes_gdf)
 
     out_dir = Path(out_dir).resolve()
     lcp_dir     = out_dir / "lcp"
@@ -306,15 +401,28 @@ def prepare_container_fspro(
         d.mkdir(parents=True, exist_ok=True)
 
     # ── 1. LCP ────────────────────────────────────────────────────────────────
-    if lcp_path is None:
-        print("[prepare_container_fspro] Downloading LANDFIRE landscape …")
-        lcp_path = lfps_request(
-            container_gdf, lcp_dir, str(lf_year), clip=True
-        )
-    else:
+    if lcp_path is not None:
+        # Caller supplied an explicit path — use it directly, no checks.
         lcp_path = Path(lcp_path)
         if not lcp_path.exists():
             raise FileNotFoundError(f"lcp_path not found: {lcp_path}")
+    else:
+        # Check whether the LCP was already downloaded to lcp_dir.
+        if lcp_name is not None:
+            candidate = lcp_dir / f"{lcp_name}.tif"
+        else:
+            existing = sorted(lcp_dir.glob("*.tif"))
+            candidate = existing[0] if len(existing) == 1 else None
+
+        if candidate is not None and candidate.exists():
+            print(f"[prepare_container_fspro] Reusing existing LCP: {candidate.name}")
+            lcp_path = candidate
+        else:
+            print("[prepare_container_fspro] Downloading LANDFIRE landscape …")
+            lcp_path = lfps_request(
+                container_gdf, lcp_dir, str(lf_year),
+                rename=lcp_name, clip=True,
+            )
 
     # Report domain pixel count
     with rasterio.open(lcp_path) as src:
@@ -325,15 +433,21 @@ def prepare_container_fspro(
 
     # ── 2. Dominant pyrome ────────────────────────────────────────────────────
     pyrome_col = fspro_kwargs.pop("pyrome_col", "Pyrome_ID")
-    container_proj = container_gdf.to_crs(lcp_crs)
-    # unary_union is deprecated in newer geopandas; prefer union_all if available
+    # Reproject container to pyromes CRS for the overlap query.
+    # lookup_pyrome assigns pyromes_gdf.crs to the geometry it receives, so we
+    # must NOT pass coordinates already in LCP CRS (often UTM) — they would be
+    # mis-labelled as WGS84 and the overlay would find nothing.
+    container_pyromes_crs = container_gdf.to_crs(pyromes_gdf.crs)
     try:
-        container_union = container_proj.geometry.union_all()
+        container_union = container_pyromes_crs.geometry.union_all()
     except AttributeError:
-        container_union = container_proj.geometry.unary_union
+        container_union = container_pyromes_crs.geometry.unary_union
 
     pyrome_id = str(lookup_pyrome(container_union, pyromes_gdf, pyrome_col=pyrome_col))
     print(f"[prepare_container_fspro] Dominant pyrome: {pyrome_id}")
+
+    # Separate reproject to LCP CRS — used for ignition file creation below.
+    container_proj = container_gdf.to_crs(lcp_crs)
 
     # ── 3. Weather ────────────────────────────────────────────────────────────
     print("[prepare_container_fspro] Loading pyrome weather …")
@@ -346,13 +460,31 @@ def prepare_container_fspro(
         gridmet_csv=gridmet_csv,
     )
 
-    # ── 4. Ignition file (container boundary → polygon shapefile) ─────────────
-    ign_path = create_container_ignition(
-        container_proj, ign_dir / "container_ignition.shp"
-    )
-    print(f"[prepare_container_fspro] Ignition: {ign_path.name}")
+    # ── 4. Ignition file ──────────────────────────────────────────────────────
+    if ignition_mode == "random":
+        ign_path = create_random_ignitions(
+            container_proj, n_ignitions, lcp_path,
+            ign_dir / "random_ignitions.shp", seed=ignition_seed,
+        )
+    elif ignition_mode == "fod":
+        if fod_gdf is None:
+            raise ValueError("ignition_mode='fod' requires fod_gdf to be provided.")
+        ign_path = create_fod_ignitions(
+            container_proj, fod_gdf, lcp_path,
+            ign_dir / "fod_ignitions.shp",
+        )
+    else:
+        ign_path = create_container_ignition(
+            container_proj, ign_dir / "container_ignition.shp"
+        )
+    print(f"[prepare_container_fspro] Ignition ({ignition_mode}): {ign_path.name}")
 
     # ── 5. FSPro input file ───────────────────────────────────────────────────
+    # Merge explicit sim params — caller kwargs take precedence over the
+    # named parameters so advanced users can still override via **fspro_kwargs.
+    sim_params = {"NumFires": num_fires, "Duration": duration, "Resolution": resolution}
+    sim_params.update(fspro_kwargs)
+
     fspro_input_path = build_fspro_inputs(
         output_path   = inputs_dir / "fspro.input",
         wind_cells    = wx["wind_cells"],
@@ -363,9 +495,10 @@ def prepare_container_fspro(
         erc_classes   = wx["erc_classes"],
         current_erc   = wx["current_erc"],
         ignition_file = ign_path,
-        **fspro_kwargs,
+        **sim_params,
     )
-    print(f"[prepare_container_fspro] FSPro input: {fspro_input_path.name}")
+    print(f"[prepare_container_fspro] FSPro input: {fspro_input_path.name} "
+          f"(NumFires={num_fires}, Duration={duration}, Resolution={resolution}m)")
 
     # ── 6. Manifest ───────────────────────────────────────────────────────────
     manifest = {
@@ -557,72 +690,107 @@ def prepare_counterfactual_fspro(
     out_dir: "str | Path",
     weather_dir: "str | Path",
     pyromes_gdf,
-    lf_year: "str | int",
-    baseline_lcp_path: "str | Path | None" = None,
-    treated_lcp_path: "str | Path | None" = None,
-    treatment_gdf=None,
-    canopy_df=None,
-    surface_df=None,
-    treatment_scenario: "dict | None" = None,
+    baseline_lcp_path: "str | Path",
+    treated_lcp_path: "str | Path",
+    num_fires: int = 1000,
+    duration: int = 7,
+    resolution: float = 90.0,
     erc_classes: "np.ndarray | None" = None,
     gridmet_csv: "str | Path | None" = None,
+    current_erc_start_doy: int = 91,
+    current_erc_n_days: int = 79,
     seed: int = 617327,
+    ignition_mode: str = "container",
+    n_ignitions: int = 200,
+    fod_gdf=None,
+    ignition_seed=None,
     **fspro_kwargs,
 ) -> dict:
     """Prepare paired baseline and treated FSPro runs for counterfactual analysis.
 
-    Builds a single FSPro input file with a fixed ``SPOTTING_SEED`` shared by
-    both the baseline and treated landscape runs.  Because TestFSPro.exe takes
-    the LCP as a runtime positional argument, one input file can serve both
-    runs — ensuring identical weather draws and a clean delta comparison via
-    ``delta_burn_probability()``.
+    Assembles the shared experimental design — ignition file, pyrome weather,
+    and a single FSPro input file with a fixed ``SPOTTING_SEED`` — for two
+    pre-built landscape files.  Because TestFSPro.exe takes the LCP as a
+    runtime positional argument, one input file serves both the baseline and
+    treated runs, guaranteeing identical weather draws for a clean
+    counterfactual comparison via ``delta_burn_probability()``.
+
+    LCP preparation (LFPS download, ``apply_treatment``) is intentionally kept
+    separate from this function.  Pass finished GeoTIFFs for both landscapes.
 
     Parameters
     ----------
     container_gdf : geopandas.GeoDataFrame
         Spatial container defining the simulation domain.  Any CRS.
     out_dir : str or Path
-        Root output directory.  Structure::
+        Root output directory.  Sub-directories are created automatically::
 
             out_dir/
-              baseline/lcp/        ← baseline landscape
-              baseline/outputs/    ← empty; populated on Windows
-              treated/lcp/         ← treated landscape
-              treated/outputs/     ← empty; populated on Windows
               ignitions/           ← shared container ignition shapefile
               fspro_inputs/        ← single shared FSPro input file
+              baseline/outputs/    ← empty; populated by run_fspro on Windows
+              treated/outputs/     ← empty; populated by run_fspro on Windows
               run_manifest.json
 
     weather_dir : str or Path
-        Root weather cache directory (same layout as ``prepare_container_fspro``).
-    pyromes_gdf : geopandas.GeoDataFrame
-        NIFC pyrome polygons with a ``Pyrome_ID`` column.
-    lf_year : str or int
-        LANDFIRE year for LFPS download if ``baseline_lcp_path`` is None.
-    baseline_lcp_path : str or Path, optional
-        Pre-existing baseline LCP GeoTIFF.  If None, downloaded via LFPS.
-    treated_lcp_path : str or Path, optional
-        Pre-existing treated LCP GeoTIFF.  If None and all treatment
-        parameters are provided, the treated LCP is derived from the baseline
-        by applying ``apply_treatment()``.
-    treatment_gdf : geopandas.GeoDataFrame, optional
-        Treatment polygons.  Required when ``treated_lcp_path`` is None.
-    canopy_df, surface_df : pd.DataFrame, optional
-        Canopy and surface effects tables for ``apply_treatment()``.  Required
-        when ``treated_lcp_path`` is None.
-    treatment_scenario : dict, optional
-        Scenario descriptor passed to ``apply_treatment()`` as the
-        ``scenario`` argument.  Example: ``{"canopy": "PCT25", "surface": "PCT25"}``.
-        Required when ``treated_lcp_path`` is None.
+        Root weather cache directory::
+
+            weather_dir/
+              pyrome_erc/   ← pyrome_{id}_gridmet.json
+              pyrome_wind/  ← pyrome_{id}_wind.json
+
+    pyromes_gdf : geopandas.GeoDataFrame or str or Path
+        NIFC pyrome polygons.  Accepts either an already-loaded GeoDataFrame
+        or a file path (shapefile, GeoPackage, etc.) read with
+        ``geopandas.read_file()``.
+    baseline_lcp_path : str or Path
+        Baseline landscape GeoTIFF.  Must already exist — use
+        ``prepare_container_fspro`` or ``lfps_request`` to download it first.
+    treated_lcp_path : str or Path
+        Treated landscape GeoTIFF.  Must already exist — use
+        ``apply_treatment`` to build it from the baseline first.
+    num_fires : int
+        Number of fire simulations (``NumFires``).  Default 1000.
+    duration : int
+        Maximum burn period per fire in days (``Duration``).  Default 7.
+    resolution : float
+        Output grid cell size in metres (``Resolution``).  Default 90.0.
     erc_classes : np.ndarray, optional
         Pre-computed ERC class table, shape ``(5, 10)``.
     gridmet_csv : str or Path, optional
         GEE-exported GridMET CSV, used when ``erc_classes`` is not provided.
+    current_erc_start_doy : int
+        1-based fire-season DOY (1 = April 1) at which ``CurrentERCValues``
+        begins.  Default 91 (≈ July 1).
+    current_erc_n_days : int
+        Length of the current-season ERC sequence.  Default 79.
     seed : int
         ``SPOTTING_SEED`` shared by both runs.  **Do not vary between
         baseline and treated.**  Default 617327.
+    ignition_mode : {"container", "random", "fod"}
+        Controls how the shared ``IgnitionFile`` is built (same for both
+        baseline and treated runs).
+
+        ``"container"`` (default)
+            Dissolves the full container polygon.
+        ``"random"``
+            Samples *n_ignitions* burnable pixels at random from the
+            baseline LCP and buffers each to a small circle.
+        ``"fod"``
+            Uses historical FPA-FOD point locations clipped to the
+            container.  Requires *fod_gdf*.
+    n_ignitions : int
+        Number of random ignition points for ``ignition_mode="random"``.
+        Default 200.
+    fod_gdf : GeoDataFrame, optional
+        FPA-FOD (or equivalent) points, pre-filtered.  Required when
+        ``ignition_mode="fod"``.
+    ignition_seed : int, optional
+        Random seed for ``ignition_mode="random"``.
     **fspro_kwargs
-        Passed to ``build_treatment_pair`` (e.g. ``NumFires=2000``).
+        Additional overrides for any key in ``_FSPRO_DEFAULTS``, e.g.
+        ``CROWN_FIRE_METHOD="Scott/Reinhardt"``, ``SavePerimeters=0``.
+        ``pyrome_col`` is also intercepted here if present.
 
     Returns
     -------
@@ -642,30 +810,29 @@ def prepare_counterfactual_fspro(
 
     Raises
     ------
-    ValueError
-        If ``treated_lcp_path`` is None and any required treatment parameters
-        are missing (``treatment_gdf``, ``canopy_df``, ``surface_df``,
-        ``treatment_scenario``).
     FileNotFoundError
-        If a provided LCP path does not exist.
+        If either LCP path does not exist.
 
     Examples
     --------
     On Mac (data prep):
 
     >>> manifest = prepare_counterfactual_fspro(
-    ...     container_gdf=huc12_gdf,
-    ...     out_dir="runs/huc12_042",
-    ...     weather_dir="data/weather",
-    ...     pyromes_gdf=pyromes,
-    ...     lf_year="2023",
-    ...     baseline_lcp_path="data/lcp/baseline.tif",
-    ...     treatment_gdf=treatment_polygons,
-    ...     canopy_df=canopy_effects,
-    ...     surface_df=surface_effects,
-    ...     treatment_scenario={"canopy": "PCT25", "surface": "PCT25"},
-    ...     gridmet_csv="data/weather/gridmet_clima_co_pyromes.csv",
-    ...     NumFires=1000,
+    ...     container_gdf=huc12,
+    ...     out_dir=OUT_DIR,
+    ...     weather_dir=WEATHER_DIR,
+    ...     pyromes_gdf=PYROMES_GDF,
+    ...     pyrome_col="PYROME",
+    ...     baseline_lcp_path=OUT_DIR / "lcp" / "baseline_lcp.tif",
+    ...     treated_lcp_path=OUT_DIR / "lcp" / "treated_lcp.tif",
+    ...     num_fires=1000,
+    ...     duration=7,
+    ...     resolution=90,
+    ... )
+    >>> patch_fspro_input_paths(
+    ...     manifest["fspro_input_path"],
+    ...     mac_prefix="/Users/mcc/Library/CloudStorage/Box-Box",
+    ...     win_prefix="Z:\\\\",
     ... )
 
     On Windows (run both scenarios using the shared input file):
@@ -683,108 +850,92 @@ def prepare_counterfactual_fspro(
     ...                                ref_lcp=manifest["treated_lcp_path"])
     >>> delta_bp = delta_burn_probability(bl["burn_prob_tif"], tr["burn_prob_tif"])
     """
+    import geopandas as gpd
     import rasterio
-    from fb_tools.fuelscape.lfps import lfps_request
-    from fb_tools.fuelscape.lcp import create_container_ignition
+    from fb_tools.fuelscape.lcp import (
+        create_container_ignition,
+        create_random_ignitions,
+        create_fod_ignitions,
+    )
     from fb_tools.models.fspro import build_treatment_pair
     from fb_tools.utils.geo import lookup_pyrome
 
-    out_dir = Path(out_dir).resolve()
-    bl_dir  = out_dir / "baseline"
-    tr_dir  = out_dir / "treated"
-    ign_dir     = out_dir / "ignitions"
-    inputs_dir  = out_dir / "fspro_inputs"
-    bl_lcp_dir  = bl_dir / "lcp"
-    tr_lcp_dir  = tr_dir / "lcp"
-    bl_out_dir  = bl_dir / "outputs"
-    tr_out_dir  = tr_dir / "outputs"
-    for d in (bl_lcp_dir, tr_lcp_dir, ign_dir, inputs_dir, bl_out_dir, tr_out_dir):
+    # Accept a file path for pyromes_gdf
+    if isinstance(pyromes_gdf, (str, Path)):
+        pyromes_gdf = gpd.read_file(pyromes_gdf)
+
+    # ── Validate LCP paths ────────────────────────────────────────────────────
+    baseline_lcp_path = Path(baseline_lcp_path)
+    treated_lcp_path  = Path(treated_lcp_path)
+    if not baseline_lcp_path.exists():
+        raise FileNotFoundError(f"baseline_lcp_path not found: {baseline_lcp_path}")
+    if not treated_lcp_path.exists():
+        raise FileNotFoundError(f"treated_lcp_path not found: {treated_lcp_path}")
+
+    # ── Output directories ────────────────────────────────────────────────────
+    out_dir    = Path(out_dir).resolve()
+    ign_dir    = out_dir / "ignitions"
+    inputs_dir = out_dir / "fspro_inputs"
+    bl_out_dir = out_dir / "baseline" / "outputs"
+    tr_out_dir = out_dir / "treated"  / "outputs"
+    for d in (ign_dir, inputs_dir, bl_out_dir, tr_out_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    # ── 1. Baseline LCP ───────────────────────────────────────────────────────
-    if baseline_lcp_path is None:
-        print("[prepare_counterfactual_fspro] Downloading baseline LANDFIRE landscape …")
-        baseline_lcp_path = lfps_request(
-            container_gdf, bl_lcp_dir, str(lf_year), clip=True
-        )
-    else:
-        baseline_lcp_path = Path(baseline_lcp_path)
-        if not baseline_lcp_path.exists():
-            raise FileNotFoundError(f"baseline_lcp_path not found: {baseline_lcp_path}")
-
+    # ── 1. LCP metadata (CRS from baseline) ──────────────────────────────────
     with rasterio.open(baseline_lcp_path) as src:
         lcp_crs     = src.crs
         pixel_count = src.width * src.height
-    print(f"[prepare_counterfactual_fspro] Baseline LCP: {baseline_lcp_path.name} "
-          f"({pixel_count:,} pixels)")
+    print(f"[prepare_counterfactual_fspro] Baseline LCP : {baseline_lcp_path.name} "
+          f"({pixel_count:,} pixels, CRS: {lcp_crs.to_epsg() or lcp_crs.to_string()})")
+    print(f"[prepare_counterfactual_fspro] Treated LCP  : {treated_lcp_path.name}")
 
     # ── 2. Dominant pyrome ────────────────────────────────────────────────────
     pyrome_col = fspro_kwargs.pop("pyrome_col", "Pyrome_ID")
-    container_proj = container_gdf.to_crs(lcp_crs)
+    # Reproject container to pyromes CRS for the overlap query — NOT LCP CRS.
+    container_pyromes_crs = container_gdf.to_crs(pyromes_gdf.crs)
     try:
-        container_union = container_proj.geometry.union_all()
+        container_union = container_pyromes_crs.geometry.union_all()
     except AttributeError:
-        container_union = container_proj.geometry.unary_union
+        container_union = container_pyromes_crs.geometry.unary_union
 
     pyrome_id = str(lookup_pyrome(container_union, pyromes_gdf, pyrome_col=pyrome_col))
     print(f"[prepare_counterfactual_fspro] Dominant pyrome: {pyrome_id}")
 
-    # ── 3. Treated LCP ────────────────────────────────────────────────────────
-    if treated_lcp_path is None:
-        missing = [
-            n for n, v in [
-                ("treatment_gdf",      treatment_gdf),
-                ("canopy_df",          canopy_df),
-                ("surface_df",         surface_df),
-                ("treatment_scenario", treatment_scenario),
-            ]
-            if v is None
-        ]
-        if missing:
-            raise ValueError(
-                f"treated_lcp_path is None — must also provide: {missing}"
-            )
-        print("[prepare_counterfactual_fspro] Applying treatment to baseline LCP …")
-
-        import rioxarray as rxr
-        from fb_tools.fuelscape.adjust import apply_treatment
-        from fb_tools.utils.geo import rasterize
-
-        lcp_da = rxr.open_rasterio(baseline_lcp_path, masked=True)
-        ref_da = lcp_da.isel(band=0)
-        treatment_reproj = treatment_gdf.to_crs(lcp_crs)
-        mask = rasterize(treatment_reproj, ref_da) > 0
-
-        treated_da = apply_treatment(
-            lcp_da, canopy_df, surface_df, treatment_scenario, mask=mask
-        )
-        treated_lcp_out = tr_lcp_dir / "treated.tif"
-        treated_da.rio.to_raster(treated_lcp_out, compress="deflate")
-        treated_lcp_path = treated_lcp_out
-        print(f"[prepare_counterfactual_fspro] Treated LCP: {treated_lcp_path.name}")
-    else:
-        treated_lcp_path = Path(treated_lcp_path)
-        if not treated_lcp_path.exists():
-            raise FileNotFoundError(f"treated_lcp_path not found: {treated_lcp_path}")
-
-    # ── 4. Weather (once, shared) ─────────────────────────────────────────────
+    # ── 3. Weather (once, shared by both runs) ────────────────────────────────
     print("[prepare_counterfactual_fspro] Loading pyrome weather …")
     wx = _load_weather_for_pyrome(
         pyrome_id,
         weather_dir,
-        current_erc_start_doy=fspro_kwargs.pop("current_erc_start_doy", 91),
-        current_erc_n_days=fspro_kwargs.pop("current_erc_n_days", 79),
+        current_erc_start_doy=current_erc_start_doy,
+        current_erc_n_days=current_erc_n_days,
         erc_classes=erc_classes,
         gridmet_csv=gridmet_csv,
     )
 
-    # ── 5. Ignition file (shared, container boundary) ─────────────────────────
-    ign_path = create_container_ignition(
-        container_proj, ign_dir / "container_ignition.shp"
-    )
-    print(f"[prepare_counterfactual_fspro] Ignition: {ign_path.name}")
+    # ── 4. Ignition file (shared by baseline and treated runs) ───────────────
+    container_proj = container_gdf.to_crs(lcp_crs)
+    if ignition_mode == "random":
+        ign_path = create_random_ignitions(
+            container_proj, n_ignitions, baseline_lcp_path,
+            ign_dir / "random_ignitions.shp", seed=ignition_seed,
+        )
+    elif ignition_mode == "fod":
+        if fod_gdf is None:
+            raise ValueError("ignition_mode='fod' requires fod_gdf to be provided.")
+        ign_path = create_fod_ignitions(
+            container_proj, fod_gdf, baseline_lcp_path,
+            ign_dir / "fod_ignitions.shp",
+        )
+    else:
+        ign_path = create_container_ignition(
+            container_proj, ign_dir / "container_ignition.shp"
+        )
+    print(f"[prepare_counterfactual_fspro] Ignition ({ignition_mode}): {ign_path.name}")
 
-    # ── 6. Shared FSPro input file with fixed SPOTTING_SEED ───────────────────
+    # ── 5. Shared FSPro input file with fixed SPOTTING_SEED ───────────────────
+    sim_params = {"NumFires": num_fires, "Duration": duration, "Resolution": resolution}
+    sim_params.update(fspro_kwargs)
+
     fspro_input_path = build_treatment_pair(
         out_path      = inputs_dir / "fspro.input",
         ignition_file = ign_path,
@@ -796,11 +947,13 @@ def prepare_counterfactual_fspro(
         erc_classes   = wx["erc_classes"],
         current_erc   = wx["current_erc"],
         seed          = seed,
-        **fspro_kwargs,
+        **sim_params,
     )
-    print(f"[prepare_counterfactual_fspro] FSPro input (shared): {fspro_input_path.name}")
+    print(f"[prepare_counterfactual_fspro] FSPro input (shared): {fspro_input_path.name} "
+          f"(NumFires={num_fires}, Duration={duration}, Resolution={resolution}m, "
+          f"seed={seed})")
 
-    # ── 7. Manifest ───────────────────────────────────────────────────────────
+    # ── 6. Manifest ───────────────────────────────────────────────────────────
     manifest = {
         "baseline_lcp_path":    baseline_lcp_path,
         "treated_lcp_path":     treated_lcp_path,
@@ -811,8 +964,6 @@ def prepare_counterfactual_fspro(
         "pyrome_id":            pyrome_id,
         "seed":                 seed,
         "out_dir":              out_dir,
-        "lf_year":              str(lf_year),
-        "fspro_kwargs":         fspro_kwargs,
     }
     manifest_path = out_dir / "run_manifest.json"
     _write_manifest(manifest, manifest_path)
@@ -820,3 +971,96 @@ def prepare_counterfactual_fspro(
 
     print(f"[prepare_counterfactual_fspro] Done. Manifest → {manifest_path}")
     return manifest
+
+
+def patch_fspro_input_paths(
+    input_file: "str | Path",
+    mac_prefix: str,
+    win_prefix: str,
+    inplace: bool = True,
+) -> Path:
+    """
+    Translate Mac absolute paths to Windows paths in an FSPro input file.
+
+    ``prepare_container_fspro`` writes ``IgnitionFile`` (and any other path
+    fields) as Mac absolute paths.  Before executing on Windows, call this
+    function once to replace the Mac filesystem prefix with its Windows
+    equivalent so that TestFSPro.exe can locate the ignition shapefile.
+
+    Parameters
+    ----------
+    input_file : str or Path
+        Path to the FSPro ``.input`` file to patch (on Mac, via Box).
+    mac_prefix : str
+        The Mac path prefix to replace (e.g.
+        ``"/Users/mcc/Library/CloudStorage/Box-Box"``).
+        All occurrences in the file are replaced, so partial prefixes work too.
+    win_prefix : str
+        The Windows replacement prefix (e.g. ``"Z:\\\\"``, or the UNC path
+        ``"\\\\\\\\Mac\\\\Home\\\\Library\\\\CloudStorage\\\\Box-Box"``).
+        Forward slashes are converted to backslashes automatically after
+        substitution.
+    inplace : bool
+        If ``True`` (default), overwrite the existing file.  If ``False``,
+        write a sibling file with ``_win`` appended before the extension and
+        leave the original unchanged.
+
+    Returns
+    -------
+    Path
+        Absolute path to the patched file (same as *input_file* when
+        ``inplace=True``).
+
+    Examples
+    --------
+    On Mac, before copying / syncing to Windows for execution:
+
+    >>> from fb_tools import patch_fspro_input_paths
+    >>> patch_fspro_input_paths(
+    ...     fb_inputs["fspro_input_path"],
+    ...     mac_prefix="/Users/mcc/Library/CloudStorage/Box-Box",
+    ...     win_prefix="Z:\\\\",
+    ... )
+
+    Parallels shared-folder UNC variant (no Box native install on Windows):
+
+    >>> patch_fspro_input_paths(
+    ...     fb_inputs["fspro_input_path"],
+    ...     mac_prefix="/Users/mcc",
+    ...     win_prefix="\\\\\\\\Mac\\\\Home",
+    ... )
+    """
+    input_file = Path(input_file).resolve()
+    text = input_file.read_text()
+
+    # Replace prefix and normalise to Windows backslashes
+    patched = text.replace(mac_prefix, win_prefix)
+    # Convert any remaining forward slashes in path lines to backslashes.
+    # Only touch lines that look like path fields (contain the prefix or :\).
+    lines = []
+    for line in patched.splitlines(keepends=True):
+        stripped = line.lstrip()
+        is_path_line = (
+            ":" in line
+            and any(
+                stripped.lower().startswith(k)
+                for k in ("ignitionfile", "barrierfile", "outputfile")
+            )
+        )
+        if is_path_line:
+            # Replace forward slashes only in the value portion (after the colon)
+            key, _, val = line.partition(":")
+            val_win = val.replace("/", "\\")
+            lines.append(f"{key}:{val_win}")
+        else:
+            lines.append(line)
+    patched = "".join(lines)
+
+    if inplace:
+        out_path = input_file
+    else:
+        out_path = input_file.with_stem(input_file.stem + "_win")
+
+    out_path.write_text(patched)
+    print(f"[patch_fspro_input_paths] Patched → {out_path.name}")
+    return out_path

@@ -9,9 +9,9 @@ to download one tile per feature and merge into a single GeoTIFF.
 Reference: https://lfps.usgs.gov/LFProductsServiceUserGuide.pdf
 """
 
-import io
 import json
 import shutil
+import tempfile
 import time
 import zipfile
 from pathlib import Path
@@ -24,6 +24,33 @@ _LFPS_STATUS_URL = "https://lfps.usgs.gov/api/job/status"
 
 # Add entries here as new versions are verified against the LFPS products table:
 # https://lfps.usgs.gov/products
+
+
+def _stream_download(url, dest, max_retries=3, retry_delay=15, chunk_size=1 << 20):
+    """Stream *url* to *dest* (Path), retrying on connection errors."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            with requests.Session() as sess:
+                resp = sess.get(url, stream=True, timeout=60)
+                resp.raise_for_status()
+                expected = int(resp.headers.get("Content-Length", 0)) or None
+                written = 0
+                with open(dest, "wb") as fh:
+                    for chunk in resp.iter_content(chunk_size=chunk_size):
+                        fh.write(chunk)
+                        written += len(chunk)
+            if expected and written < expected:
+                raise requests.exceptions.ChunkedEncodingError(
+                    f"Truncated: got {written} of {expected} bytes"
+                )
+            return
+        except (requests.exceptions.ChunkedEncodingError,
+                requests.exceptions.ConnectionError) as exc:
+            print(f"[lfps] Download attempt {attempt}/{max_retries} failed: {exc}")
+            dest.write_bytes(b"")
+            if attempt < max_retries:
+                time.sleep(retry_delay)
+    raise RuntimeError(f"Download failed after {max_retries} attempt(s): {url}")
 
 
 def _read_band_names(src):
@@ -55,6 +82,7 @@ def lfps_request(
     poll_interval=30,
     clip=False,
     max_retries=3,
+    max_download_retries=3,
 ):
     """
     Submit and download a LANDFIRE Products Service (LFPS) job.
@@ -98,6 +126,11 @@ def lfps_request(
         ``"Failed"`` or ``"Cancelled"`` status.  The LFPS API occasionally
         throws a transient server-side error (e.g. ``'GPEnvironment' object
         has no attribute 'pyramid'``) that resolves on retry.  Default ``3``.
+    max_download_retries : int
+        Number of times to retry the ZIP download on connection errors
+        (``ChunkedEncodingError``, ``ConnectionError``).  The job URL stays
+        valid after the job succeeds, so retrying the download does not
+        require resubmitting the job.  Default ``3``.
     """
     codes = {
         "FBFM40": f"LF{lf_year}_FBFM40",
@@ -213,15 +246,19 @@ def lfps_request(
     # --- 7. Download and extract ZIP
     download_url = data["outputFile"]
     print(f"Downloading: {download_url}")
-    r = requests.get(download_url)
-    r.raise_for_status()
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-        z.extractall(out_dir)
-    print(f"Extracted to: {out_dir}")
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        _stream_download(download_url, tmp_path, max_retries=max_download_retries)
+        with zipfile.ZipFile(tmp_path) as z:
+            z.extractall(out_dir)
+        print(f"Extracted to: {out_dir}")
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
     # --- 8. Optional rename
     if rename:

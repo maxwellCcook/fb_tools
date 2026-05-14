@@ -67,41 +67,93 @@ _DEFAULT_SPOTTING: list[list[float]] = [
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
-def load_gridmet_csv(csv_path: str | Path) -> pd.DataFrame:
+# Variable classification for percentile selection.  "Hot" variables are
+# fire-dangerous at the HIGH end of the cell distribution (select p75/p90 to
+# capture the hottest cells within the fire mask).  "Wet" variables are
+# fire-dangerous at the LOW end (select p10/p25 for driest fuels / lowest
+# humidity).  "Neutral" variables use the median regardless of tail choice.
+_HOT_VARS = ("tmmx", "tmmn", "vpd", "erc", "vs")
+_WET_VARS = ("fm100", "fm1000", "rmin", "rmax")
+_NEUTRAL_VARS = ("pr", "th")
+
+
+def load_gridmet_csv(
+    csv_path: str | Path,
+    tail_percentile: int = 50,
+) -> pd.DataFrame:
     """
     Load and normalize the GEE-exported GridMET fire-season CSV.
 
-    Parses the ``date`` column, adds ``year`` and ``doy`` integer columns if
-    missing, and converts ``tmmx`` from Kelvin to Fahrenheit (stored as
-    ``tmmx_f``).
+    Accepts two export formats:
+
+    1. **Legacy flat format** — one column per variable (``erc``, ``fm100``,
+       ``tmmx``, ``rmin``, …).  ``tail_percentile`` is ignored.
+    2. **Percentile-suffix format** (new; exported by
+       ``00a_gridMET-Climatology.ipynb`` after the fire-mask + multi-percentile
+       refactor) — five columns per variable, e.g., ``erc_p10, erc_p25,
+       erc_p50, erc_p75, erc_p90``.  The function selects a single column per
+       variable based on ``tail_percentile`` and aliases it to the flat name
+       for downstream compatibility.
 
     Parameters
     ----------
     csv_path : str or Path
-        Path to the exported CSV file (``gridmet_erc_pyromes.csv``).
+        Path to the exported CSV file.
+    tail_percentile : int
+        Only used for percentile-suffix CSVs.  Selects the fire-dangerous tail
+        of the cell distribution per variable:
+
+        - ``50`` (default) — cell median, matches the old single-reducer
+          export behaviour.
+        - ``75`` — ``p75`` of hot/dry variables (tmmx, erc, vs, vpd) paired
+          with ``p25`` of moisture variables (fm100, rmin, rmax).  Approximates
+          the driest quartile of cells within the fire mask.
+        - ``90`` — ``p90`` / ``p10``.  Driest decile; most fire-extreme.
+        - Neutral variables (pr, th) always use ``p50``.
+
+        Must be one of ``{10, 25, 50, 75, 90}`` (the set exported by the
+        GEE reducer).  Legacy flat CSVs ignore this parameter.
 
     Returns
     -------
     pd.DataFrame
-        Columns: ``pyrome_id``, ``date``, ``year``, ``doy``, ``erc``,
-        ``fm100``, ``fm1000``, ``tmmx_f``, ``rmin``.
-        All numeric columns cast to float.
+        Flat-column DataFrame with ``pyrome``, ``date``, ``year``, ``doy``,
+        ``erc``, ``fm100``, ``fm1000``, ``tmmx_f`` (°F), ``rmin``, and any
+        optional variables present in the CSV (``tmmn_f``, ``rmax``, ``pr``,
+        ``vpd_pa``, ``ws_mph``, ``wd_deg``).
 
     Raises
     ------
     FileNotFoundError
         If ``csv_path`` does not exist.
     KeyError
-        If any required columns are missing from the CSV.
+        If required columns are missing from the CSV.
+    ValueError
+        If ``tail_percentile`` is not in ``{10, 25, 50, 75, 90}``.
     """
     csv_path = Path(csv_path)
     if not csv_path.exists():
         raise FileNotFoundError(f"GridMET CSV not found: {csv_path}")
 
-    df = pd.read_csv(csv_path)
+    allowed_pctiles = {10, 25, 50, 75, 90}
+    if tail_percentile not in allowed_pctiles:
+        raise ValueError(
+            f"tail_percentile must be one of {sorted(allowed_pctiles)}; got {tail_percentile}"
+        )
 
-    # Normalize column names to lowercase
+    df = pd.read_csv(csv_path)
     df.columns = [c.strip().lower() for c in df.columns]
+
+    # Detect format by looking for percentile-suffix columns.
+    is_percentile_format = any(
+        f"{v}_p{tail_percentile}" in df.columns for v in _HOT_VARS + _WET_VARS
+    ) or any(f"erc_p{p}" in df.columns for p in allowed_pctiles)
+
+    if is_percentile_format:
+        df = _select_percentile_columns(df, tail_percentile)
+        fmt_label = f"percentile-suffix (tail={tail_percentile})"
+    else:
+        fmt_label = "legacy flat"
 
     required = {"pyrome", "date", "erc", "fm100", "fm1000", "tmmx", "rmin"}
     missing = required - set(df.columns)
@@ -129,6 +181,9 @@ def load_gridmet_csv(csv_path: str | Path) -> pd.DataFrame:
     for col in ("rmax", "pr"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+    # vpd exported from GEE in kPa — store as Pa for direct use in calc_gsi()
+    if "vpd" in df.columns:
+        df["vpd_pa"] = pd.to_numeric(df["vpd"], errors="coerce") * 1000.0
     # GridMET wind: vs = daily mean wind speed (m/s); th = wind direction (°, met FROM)
     if "vs" in df.columns:
         df["ws_mph"] = pd.to_numeric(df["vs"], errors="coerce") * 2.23694
@@ -140,15 +195,49 @@ def load_gridmet_csv(csv_path: str | Path) -> pd.DataFrame:
     for col in ["erc", "fm100", "fm1000", "tmmx_f", "rmin"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Drop rows with missing key values
     n_before = len(df)
     df = df.dropna(subset=["erc", "pyrome"]).reset_index(drop=True)
     if len(df) < n_before:
         print(f"  [load_gridmet_csv] Dropped {n_before - len(df)} rows with missing erc/PYROME")
 
     print(f"  [load_gridmet_csv] {len(df):,} rows, {df['pyrome'].nunique()} pyromes, "
-          f"years {df['year'].min()}–{df['year'].max()}")
+          f"years {df['year'].min()}–{df['year'].max()}  [{fmt_label}]")
     return df
+
+
+def _select_percentile_columns(df: pd.DataFrame, tail_percentile: int) -> pd.DataFrame:
+    """
+    Collapse a multi-percentile GridMET DataFrame to flat columns.
+
+    For each fire-danger-relevant variable, select the column matching the
+    fire-dangerous tail of the cell distribution (high end for hot/dry vars,
+    low end for moisture vars) and rename to the flat variable name.  All
+    unused ``_pXX`` columns are dropped so downstream code sees the same
+    schema as the legacy flat format.
+    """
+    hot_suffix = f"_p{tail_percentile}"
+    wet_suffix = f"_p{100 - tail_percentile}"
+    neutral_suffix = "_p50"
+
+    renames: dict[str, str] = {}
+    for v in _HOT_VARS:
+        src = f"{v}{hot_suffix}"
+        if src in df.columns:
+            renames[src] = v
+    for v in _WET_VARS:
+        src = f"{v}{wet_suffix}"
+        if src in df.columns:
+            renames[src] = v
+    for v in _NEUTRAL_VARS:
+        src = f"{v}{neutral_suffix}"
+        if src in df.columns:
+            renames[src] = v
+
+    # Start with meta columns + renamed tail selections; drop everything else.
+    keep_meta = [c for c in ("pyrome", "date", "year", "doy", "system:index") if c in df.columns]
+    keep = keep_meta + list(renames.keys())
+    out = df[keep].rename(columns=renames).copy()
+    return out
 
 
 def build_historic_erc_arrays(
@@ -514,9 +603,13 @@ def build_flammap_fuel_moistures(
     if high_danger.empty:
         high_danger = window
 
-    fm1 = float(np.nanmedian(calc_1hr_fm(high_danger[tmmx_col].values, high_danger[rmin_col].values)))
-    fm10 = float(np.nanmedian(calc_10hr_fm(high_danger[tmmx_col].values, high_danger[rmin_col].values)))
-    fm100 = float(np.nanmedian(high_danger[fm100_col].values))
+    # FlamMap enforces 2–300% for all dead FM timelag classes; clamp before
+    # writing to cache so extreme p97 conditions (EMC can drop to ~1.6%) don't
+    # produce invalid input files.
+    _FM_MIN, _FM_MAX = 2.0, 300.0
+    fm1 = float(np.clip(np.nanmedian(calc_1hr_fm(high_danger[tmmx_col].values, high_danger[rmin_col].values)), _FM_MIN, _FM_MAX))
+    fm10 = float(np.clip(np.nanmedian(calc_10hr_fm(high_danger[tmmx_col].values, high_danger[rmin_col].values)), _FM_MIN, _FM_MAX))
+    fm100 = float(np.clip(np.nanmedian(high_danger[fm100_col].values), _FM_MIN, _FM_MAX))
 
     # Use GSI-based live FM if tmmn_f is available; fall back to DOY proxy
     if "tmmn_f" in high_danger.columns and lat_deg is not None:
@@ -748,19 +841,27 @@ def build_flammap_scenario_cache(
     lat_deg: float | None = None,
     wind_direction: int = -2,
     wind_speed_source: str = "gridmet",
+    wind_percentiles: dict[str, dict] | None = None,
+    erc_band: float = 0.025,
 ) -> dict[str, dict]:
     """
     Build per-pyrome FlamMap scenario caches at multiple ERC percentiles.
 
-    For each pyrome and ERC percentile threshold, derives a complete set of
-    fuel moisture **and wind** values from all fire-season days at or above
-    that ERC level.  Results are written to ``pyrome_{id}_flammap.json`` and
-    are directly usable as ``fm_params`` in
-    :func:`~fb_tools.models.flammap.run_flammap_scenarios`.
+    **Percentile semantics (RAWS / FireFamilyPlus convention):** for each
+    percentile ``p`` the scenario represents conditions on days *near* the
+    p-th ERC quantile — not "days at or above".  Sampling is a narrow band
+    ``p ± erc_band`` of the ERC distribution.  This preserves the spread
+    between low-danger (pct25) and extreme (pct97) scenarios instead of
+    compressing every scenario toward the dry tail.
 
-    This follows the same JSON-cache pattern used for FSPro inputs so that
-    FlamMap scenario batches can be parameterised from cache without
-    re-running the full GridMET pipeline.
+    For each pyrome and percentile, fuel moistures are derived from the
+    median of the sampled days, and wind speed is attached either from a
+    pre-computed ``wind_percentiles`` dict (preferred, e.g., from HRRR) or
+    from the same day-band of GridMET ``ws_mph``.
+
+    Results are written to ``pyrome_{id}_flammap.json`` and are directly
+    usable as ``fm_params`` in
+    :func:`~fb_tools.models.flammap.run_flammap_scenarios`.
 
     Cache JSON structure::
 
@@ -770,10 +871,11 @@ def build_flammap_scenario_cache(
           "wind_direction": -2,
           "scenarios": {
             "p25": {
-              "FM_1hr": 3.8, "FM_10hr": 5.4, "FM_100hr": 11.2,
+              "FM_1hr": 12.3, "FM_10hr": 13.1, "FM_100hr": 11.2,
               "FM_herb": 198.3, "FM_woody": 191.2,
-              "WIND_SPEED": 9, "WIND_DIRECTION": -2,
-              "erc_threshold": 22.1, "scenario_doy": 162
+              "WIND_SPEED": 8, "WIND_DIRECTION": -2,
+              "erc_quantile_band": [0.225, 0.275],
+              "erc_center": 22.1, "scenario_doy": 162
             },
             "p97": { ... }
           }
@@ -781,14 +883,19 @@ def build_flammap_scenario_cache(
 
     Percentile keys use the format ``p{int(p*100)}`` (e.g., ``"p97"``).
 
-    **Wind speed** (``WIND_SPEED``): derived from the median GridMET ``ws_mph``
-    on high-ERC days when ``wind_speed_source="gridmet"`` and ``ws_mph`` is
-    present.  Falls back to ``None`` (must be supplied at run time) otherwise.
+    **Wind speed** (``WIND_SPEED``):
+    - If ``wind_percentiles`` is provided, the per-percentile value is taken
+      from ``wind_percentiles[pyrome_id]["ws_mph"][key]`` (preferred; use HRRR
+      via :func:`fb_tools.weather.hrrr.build_hrrr_wind_percentiles` to capture
+      peak-hour extremes the GridMET daily mean smooths away).
+    - Else if ``wind_speed_source="gridmet"`` and ``ws_mph`` is present,
+      the median GridMET wind on the sampled band days is used.
+    - Else ``WIND_SPEED`` is omitted (supply at run time).
 
     **Wind direction** (``WIND_DIRECTION``): controlled by ``wind_direction``.
-    FlamMap convention: ``-2`` = downhill (worst-case, default), ``-1`` =
-    uphill, or an explicit azimuth (0–360).  For FSPro, wind is derived
-    separately via HRRR wind cells.
+    FlamMap convention: ``-2`` = downhill (default), ``-1`` = uphill, or an
+    explicit azimuth (0–360).  For FSPro, wind is derived separately via HRRR
+    wind cells.
 
     FM derivation:
     - ``FM_1hr``, ``FM_10hr`` : NFDRS dead FM at peak-fire-hour conditions
@@ -806,8 +913,8 @@ def build_flammap_scenario_cache(
     pyrome_col : str
         Column identifying the spatial grouping unit. Default ``"pyrome"``.
     percentiles : list of float, optional
-        ERC percentile thresholds in [0, 1].
-        Default ``[0.25, 0.50, 0.75, 0.90, 0.97]``.
+        ERC percentiles in [0, 1].  Default ``[0.25, 0.50, 0.75, 0.90, 0.97]``.
+        Each is the *center* of the sample band (see ``erc_band``).
     out_dir : str or Path, optional
         If provided, write ``pyrome_{id}_flammap.json`` files here.
     fm100_col, tmmx_col, rmin_col : str
@@ -816,13 +923,24 @@ def build_flammap_scenario_cache(
         Site latitude (decimal degrees). When provided with ``tmmn_f``
         present, live FM uses the NFDRS GSI model.
     wind_direction : int
-        Wind direction written to every scenario entry.  Use ``-2``
-        (downhill, default) or ``-1`` (uphill) for worst-case FlamMap runs,
-        or an explicit azimuth (0–360).
+        Wind direction written to every scenario entry.
     wind_speed_source : str
-        ``"gridmet"`` (default): derive ``WIND_SPEED`` from median GridMET
-        ``ws_mph`` on high-ERC days if the column is present.
-        ``"none"``: omit ``WIND_SPEED`` from cache (supply at run time).
+        ``"gridmet"`` (default): median GridMET ``ws_mph`` on the sampled band.
+        ``"none"``: omit ``WIND_SPEED`` from cache.
+        Ignored when ``wind_percentiles`` is supplied.
+    wind_percentiles : dict, optional
+        Pre-computed per-pyrome wind speed percentiles with shape
+        ``{pyrome_id: {"ws_mph": {"p25": v, ..., "p97": v}, ...}}``.  Output
+        of :func:`fb_tools.weather.hrrr.build_hrrr_wind_percentiles` or
+        :func:`build_gridmet_wind_percentiles`.  Keys must match the
+        ``p{int(p*100)}`` form of ``percentiles``.  When present, overrides
+        ``wind_speed_source``.
+    erc_band : float
+        Half-width of the ERC quantile band used to sample representative
+        days for each percentile.  Default 0.025 (±2.5%, i.e. ~5% of the
+        fire-season record per scenario).  For the top percentile the band
+        is clipped to the upper tail (``[p - 2*band, 1.0]``) to avoid an
+        empty sample on the extreme end; same trick at the low end.
 
     Returns
     -------
@@ -836,7 +954,12 @@ def build_flammap_scenario_cache(
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
-    has_wind = "ws_mph" in df.columns and wind_speed_source == "gridmet"
+    use_external_wind = wind_percentiles is not None
+    has_gridmet_wind = (
+        "ws_mph" in df.columns
+        and wind_speed_source == "gridmet"
+        and not use_external_wind
+    )
 
     # Restrict to fire season (DOY 91–304: April 1 – October 31)
     season = df[(df["doy"] >= 91) & (df["doy"] <= 304)].copy()
@@ -846,24 +969,42 @@ def build_flammap_scenario_cache(
     for pyrome_id, group in season.groupby(pyrome_col):
         erc = group["erc"].dropna()
         scenarios: dict[str, dict] = {}
+        pid_str = str(pyrome_id)
 
         for p in percentiles:
             key = f"p{int(round(p * 100))}"
-            threshold = float(erc.quantile(p))
 
-            high = group[group["erc"] >= threshold]
-            if high.empty:
-                high = group
+            # Quantile band around p, clipped at the tails so extreme
+            # percentiles still have a non-empty sample.
+            lo_q = p - erc_band
+            hi_q = p + erc_band
+            if lo_q < 0.0:
+                lo_q, hi_q = 0.0, min(1.0, 2 * erc_band)
+            elif hi_q > 1.0:
+                lo_q, hi_q = max(0.0, 1.0 - 2 * erc_band), 1.0
 
-            fm1 = float(np.nanmedian(calc_1hr_fm(high[tmmx_col].values, high[rmin_col].values)))
-            fm10 = float(np.nanmedian(calc_10hr_fm(high[tmmx_col].values, high[rmin_col].values)))
-            fm100 = float(np.nanmedian(high[fm100_col].values))
-            median_doy = float(np.nanmedian(high["doy"].values))
+            lo_erc = float(erc.quantile(lo_q))
+            hi_erc = float(erc.quantile(hi_q))
 
-            if "tmmn_f" in high.columns and lat_deg is not None:
-                vpd = calc_vpd_pa(high[tmmx_col].values, high[rmin_col].values)
-                dl = calc_daylength(high["doy"].values, lat_deg)
-                gsi = float(np.nanmedian(calc_gsi(high["tmmn_f"].values, vpd, dl)))
+            sample = group[(group["erc"] >= lo_erc) & (group["erc"] <= hi_erc)]
+            if sample.empty:
+                # Fallback: single nearest-neighbor day at the target quantile
+                target = float(erc.quantile(p))
+                sample = group.iloc[[(group["erc"] - target).abs().idxmin()]]
+
+            fm1 = float(np.nanmedian(calc_1hr_fm(sample[tmmx_col].values, sample[rmin_col].values)))
+            fm10 = float(np.nanmedian(calc_10hr_fm(sample[tmmx_col].values, sample[rmin_col].values)))
+            fm100 = float(np.nanmedian(sample[fm100_col].values))
+            erc_center = float(np.nanmedian(sample["erc"].values))
+            median_doy = float(np.nanmedian(sample["doy"].values))
+
+            if "tmmn_f" in sample.columns and lat_deg is not None:
+                if "vpd_pa" in sample.columns:
+                    vpd = sample["vpd_pa"].values
+                else:
+                    vpd = calc_vpd_pa(sample[tmmx_col].values, sample[rmin_col].values)
+                dl = calc_daylength(sample["doy"].values, lat_deg)
+                gsi = float(np.nanmedian(calc_gsi(sample["tmmn_f"].values, vpd, dl)))
                 fm_herb = float(calc_herb_fm_gsi(gsi))
                 fm_woody = float(calc_woody_fm_gsi(gsi))
             else:
@@ -877,29 +1018,47 @@ def build_flammap_scenario_cache(
                 "FM_herb": round(fm_herb, 1),
                 "FM_woody": round(fm_woody, 1),
                 "WIND_DIRECTION": wind_direction,
-                "erc_threshold": round(threshold, 1),
+                "erc_quantile_band": [round(lo_q, 3), round(hi_q, 3)],
+                "erc_center": round(erc_center, 1),
                 "scenario_doy": int(round(median_doy)),
+                "n_sample_days": int(len(sample)),
             }
 
-            if has_wind:
-                ws = high["ws_mph"].dropna()
+            if use_external_wind:
+                ws_lookup = (
+                    wind_percentiles.get(pid_str, {})
+                    .get("ws_mph", {})
+                    .get(key)
+                )
+                entry["WIND_SPEED"] = round(float(ws_lookup), 1) if ws_lookup is not None else None
+            elif has_gridmet_wind:
+                ws = sample["ws_mph"].dropna()
                 entry["WIND_SPEED"] = round(float(np.nanmedian(ws)), 1) if len(ws) > 0 else None
 
             scenarios[key] = entry
 
+        if use_external_wind:
+            ws_source_label = "external"
+        elif has_gridmet_wind:
+            ws_source_label = "gridmet"
+        else:
+            ws_source_label = "none"
+
         cache = {
-            "pyrome_id": str(pyrome_id),
+            "pyrome_id": pid_str,
             "percentiles": percentiles,
+            "erc_band": erc_band,
             "wind_direction": wind_direction,
-            "wind_speed_source": wind_speed_source if has_wind else "none",
+            "wind_speed_source": ws_source_label,
             "scenarios": scenarios,
         }
-        result[str(pyrome_id)] = cache
+        result[pid_str] = cache
 
         if out_dir is not None:
             _write_json(cache, out_dir / f"pyrome_{pyrome_id}_flammap.json")
 
-    print(f"  [build_flammap_scenario_cache] {len(result)} pyromes × {len(percentiles)} scenarios")
+    print(f"  [build_flammap_scenario_cache] {len(result)} pyromes × {len(percentiles)} scenarios "
+          f"(±{erc_band:.3f} ERC band, wind={ws_source_label})")
     return result
 
 
@@ -982,6 +1141,73 @@ def load_gridmet_pyrome_cache(
     if return_meta:
         return meta
     return np.array(meta["HistoricERCValues"])
+
+
+def save_erc_classes_to_cache(
+    gridmet_csv: str | Path,
+    cache_dir: str | Path,
+    pyrome_col: str = "pyrome",
+    n_classes: int = 5,
+) -> list[str]:
+    """
+    Enrich existing ``pyrome_{id}_gridmet.json`` cache files with ERC classes.
+
+    Reads the GEE-exported GridMET CSV, builds the 5-row ERC class table for
+    each pyrome via :func:`build_erc_classes`, and writes the result into the
+    ``"ERCClasses"`` key of each matching cache file in *cache_dir*.  Only
+    cache files that already exist (written by :func:`build_historic_erc_arrays`)
+    are updated; no new files are created.
+
+    Call this once after running ``build_historic_erc_arrays()`` to make ERC
+    classes available to :func:`~fb_tools.models.container.prepare_container_fspro`
+    without needing to pass the raw CSV on every run.
+
+    Parameters
+    ----------
+    gridmet_csv : str or Path
+        Path to the GEE-exported GridMET fire-season CSV
+        (input to :func:`load_gridmet_csv`).
+    cache_dir : str or Path
+        Directory containing ``pyrome_{id}_gridmet.json`` files to update.
+    pyrome_col : str
+        Column in the CSV identifying the pyrome (default ``"pyrome"``).
+    n_classes : int
+        Number of ERC quantile classes (default 5).
+
+    Returns
+    -------
+    list[str]
+        Pyrome IDs whose cache files were successfully updated.
+
+    Examples
+    --------
+    >>> from fb_tools import save_erc_classes_to_cache
+    >>> save_erc_classes_to_cache(
+    ...     "data/weather/gridmet_clima_co_pyromes.csv",
+    ...     "data/weather/pyrome_erc/",
+    ... )
+    """
+    cache_dir = Path(cache_dir)
+    df = load_gridmet_csv(gridmet_csv)
+    classes_dict = build_erc_classes(df, pyrome_col=pyrome_col, n_classes=n_classes)
+
+    updated: list[str] = []
+    for pid, classes_arr in classes_dict.items():
+        cache_path = cache_dir / f"pyrome_{pid}_gridmet.json"
+        if not cache_path.exists():
+            print(f"  [save_erc_classes_to_cache] Skipping pyrome {pid} — "
+                  f"cache file not found: {cache_path.name}")
+            continue
+        with open(cache_path) as f:
+            meta = json.load(f)
+        meta["ERCClasses"] = classes_arr.tolist()
+        with open(cache_path, "w") as f:
+            json.dump(meta, f, indent=2)
+        print(f"  [save_erc_classes_to_cache] Updated {cache_path.name}")
+        updated.append(pid)
+
+    print(f"  [save_erc_classes_to_cache] Done — {len(updated)} cache files updated.")
+    return updated
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────

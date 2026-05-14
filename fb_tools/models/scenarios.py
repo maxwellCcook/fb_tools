@@ -200,6 +200,7 @@ def build_scenarios(conditions, lcps, outputs=None, **defaults):
         lcp = Path(lcp)
         block = cond.copy()
         block.insert(1, "LCP", str(lcp))
+        block["FM_NAME"] = block["FM_NAME"].fillna(lcp.stem)
         rows.append(block)
 
     df = pd.concat(rows, ignore_index=True)
@@ -345,6 +346,7 @@ def build_mtt_scenarios(conditions, lcps, outputs=None, **defaults):
         lcp = Path(lcp)
         block = cond.copy()
         block.insert(1, "LCP", str(lcp))
+        block["FM_NAME"] = block["FM_NAME"].fillna(lcp.stem)
         rows.append(block)
 
     return pd.concat(rows, ignore_index=True)

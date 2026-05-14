@@ -104,7 +104,7 @@ def build_surface_lut(surface_df, scenario_col, fm_col="FBFM40"):
     return lut
 
 
-def apply_treatment(lcp, canopy_df, surface_df, scenario, band_map=None, mask=None):
+def apply_treatment(lcp, canopy_df, surface_df, scenario, band_map=None, mask=None, fill_val=-999):
     """
     Apply a fuel treatment scenario to an LCP DataArray.
 
@@ -135,6 +135,7 @@ def apply_treatment(lcp, canopy_df, surface_df, scenario, band_map=None, mask=No
         Boolean DataArray aligned to *lcp*.  Where ``True`` the treatment
         is applied; elsewhere the original values are kept.  Pass ``None``
         (default) to apply the treatment to every pixel (landscape-scale).
+    fill_val : int, optional
 
     Returns
     -------
@@ -188,7 +189,8 @@ def apply_treatment(lcp, canopy_df, surface_df, scenario, band_map=None, mask=No
         idx = band_map[band_name]
         arr = np.floor(
             lcp.sel(band=idx).astype(np.float32) * float(r[af_col])
-        ).astype(np.int16)
+        )
+        arr = arr.fillna(fill_val)
         arr = xr.where(is_forest, arr, 0)              # zero out non-forest post-treatment
         if mask is not None:
             arr = xr.where(mask, arr, lcp.sel(band=idx))  # in-situ: only treated pixels
@@ -197,13 +199,15 @@ def apply_treatment(lcp, canopy_df, surface_df, scenario, band_map=None, mask=No
     # --- 2. Surface fuel remapping
     if surface_nm not in surface_df.columns:
         raise ValueError(f"Surface scenario '{surface_nm}' not a column in surface_df.")
-    lut  = build_surface_lut(surface_df, surface_nm)
-    fidx = band_map["FBFM40"]
-    fm   = out.sel(band=fidx).values.astype(np.int32)
+    lut    = build_surface_lut(surface_df, surface_nm)
+    fidx   = band_map["FBFM40"]
+    fm_raw = out.sel(band=fidx).values           # float; may contain NaN (masked nodata)
+    nodata = np.isnan(fm_raw)
+    fm     = np.where(nodata, 0, fm_raw).astype(np.int32)  # safe cast; 0 is placeholder
 
-    # clip to LUT bounds before indexing
     fm_clipped = np.clip(fm, 0, len(lut) - 1)
-    fm_new = lut[fm_clipped].astype(np.int16)
+    fm_new     = lut[fm_clipped].astype(np.int16)
+    fm_new     = np.where(nodata, fm_raw, fm_new)           # restore nodata pixels
 
     if mask is not None:
         fm_new = np.where(mask.values, fm_new, out.sel(band=fidx).values)

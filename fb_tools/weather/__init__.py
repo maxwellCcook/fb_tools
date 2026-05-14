@@ -11,6 +11,8 @@ from .hrrr import (
     build_wind_cells,
     build_pyrome_wind_cells,
     load_pyrome_wind_cells,
+    build_hrrr_wind_percentiles,
+    wind_percentiles_from_cell_cache,
     build_flammap_wind_data,
 )
 from .gridmet import (
@@ -20,6 +22,7 @@ from .gridmet import (
     build_erc_classes,
     build_current_erc_values,
     load_gridmet_pyrome_cache,
+    save_erc_classes_to_cache,
     build_flammap_fuel_moistures,
     build_flammap_weather_data,
     build_flammap_scenario_cache,
@@ -46,6 +49,8 @@ __all__ = [
     "build_wind_cells",
     "build_pyrome_wind_cells",
     "load_pyrome_wind_cells",
+    "build_hrrr_wind_percentiles",
+    "wind_percentiles_from_cell_cache",
     "build_flammap_wind_data",
     # gridmet
     "load_gridmet_csv",
@@ -54,6 +59,7 @@ __all__ = [
     "build_erc_classes",
     "build_current_erc_values",
     "load_gridmet_pyrome_cache",
+    "save_erc_classes_to_cache",
     "build_flammap_fuel_moistures",
     "build_flammap_weather_data",
     "build_flammap_scenario_cache",

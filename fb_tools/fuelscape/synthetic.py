@@ -41,67 +41,6 @@ import xarray as xr
 # Band names in FlamMap/LANDFIRE order (used as long_name attribute)
 _BAND_ORDER = ["ELEV", "SLP", "ASP", "FBFM40", "CC", "CH", "CBH", "CBD", "EVT"]
 
-#: Ready-made fuel and topo parameters for the S. Fork wetland fire behavior analysis.
-#: Derived from modal LANDFIRE values and field topo metrics (email, 2025).
-#:
-#: FBFM40 codes: GR1=101, GR2=102, GS2=122, SH1=141, TU1=161, TU5=165, TL3=183, TL5=185
-#:
-#: Lodgepole adjustment (_adj): CFRI standard rule applied to EVT 7050 lodgepole stands.
-#:   CBH × 0.70 (reduces crown base height by 30 %) and FBFM40 → 185 (TL5).
-SYNTHETIC_FUEL_PRESETS = {
-    # --- Ponderosa pine
-    "ponderosa_2019": {
-        "fuel_params": {"fbfm40": 165, "cc_pct": 45, "cbd_kg_m3": 0.06, "cbh_m": 0.3,  "ch_m": 15},
-        "topo_params": {"elev_m": 2468, "slope_pct": 17, "aspect_deg": -1},
-    },
-    "ponderosa_2024": {
-        "fuel_params": {"fbfm40": 122, "cc_pct": 25, "cbd_kg_m3": 0.06, "cbh_m": 0.3,  "ch_m": 15},
-        "topo_params": {"elev_m": 2468, "slope_pct": 17, "aspect_deg": -1},
-    },
-    # --- Lodgepole pine (unadjusted 2019 LANDFIRE)
-    "lodgepole_2019": {
-        "fuel_params": {"fbfm40": 183, "cc_pct": 55, "cbd_kg_m3": 0.11, "cbh_m": 0.8,  "ch_m": 15},
-        "topo_params": {"elev_m": 2568, "slope_pct": 22, "aspect_deg": -1},
-    },
-    # --- Lodgepole pine (CFRI-adjusted: CBH × 0.70, FBFM40 → TL5)
-    "lodgepole_2019_adj": {
-        "fuel_params": {"fbfm40": 185, "cc_pct": 55, "cbd_kg_m3": 0.11, "cbh_m": 0.56, "ch_m": 15},
-        "topo_params": {"elev_m": 2568, "slope_pct": 22, "aspect_deg": -1},
-    },
-    "lodgepole_2024": {
-        "fuel_params": {"fbfm40": 161, "cc_pct": 15, "cbd_kg_m3": 0.03, "cbh_m": 3.0,  "ch_m": 15},
-        "topo_params": {"elev_m": 2568, "slope_pct": 22, "aspect_deg": -1},
-    },
-    # --- Wetland (LANDFIRE-based)
-    "wetland_2019": {
-        "fuel_params": {"fbfm40": 161, "cc_pct": 35, "cbd_kg_m3": 0.01, "cbh_m": 10.0, "ch_m": 15},
-        "topo_params": {"elev_m": 2391, "slope_pct": 2,  "aspect_deg": -1},
-    },
-    "wetland_2024": {
-        "fuel_params": {"fbfm40": 183, "cc_pct": 45, "cbd_kg_m3": 0.01, "cbh_m": 10.0, "ch_m": 15},
-        "topo_params": {"elev_m": 2391, "slope_pct": 2,  "aspect_deg": -1},
-    },
-    # --- Wetland custom / field-based (main analysis)
-    "wetland_custom": {
-        "fuel_params": {"fbfm40": 102, "cc_pct": 0,  "cbd_kg_m3": 0.0,  "cbh_m": 0.0,  "ch_m": 0},
-        "topo_params": {"elev_m": 2391, "slope_pct": 2,  "aspect_deg": -1},
-    },
-    # --- Optional wetland add-ons
-    "wetland_gr1": {
-        "fuel_params": {"fbfm40": 101, "cc_pct": 0,  "cbd_kg_m3": 0.0,  "cbh_m": 0.0,  "ch_m": 0},
-        "topo_params": {"elev_m": 2391, "slope_pct": 2,  "aspect_deg": -1},
-    },
-    "wetland_sh1": {
-        "fuel_params": {"fbfm40": 141, "cc_pct": 0,  "cbd_kg_m3": 0.0,  "cbh_m": 0.0,  "ch_m": 0},
-        "topo_params": {"elev_m": 2391, "slope_pct": 2,  "aspect_deg": -1},
-    },
-    "wetland_tu1_opt": {
-        "fuel_params": {"fbfm40": 161, "cc_pct": 25, "cbd_kg_m3": 0.01, "cbh_m": 10.0, "ch_m": 15},
-        "topo_params": {"elev_m": 2391, "slope_pct": 2,  "aspect_deg": -1},
-    },
-}
-
-
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------

@@ -30,6 +30,8 @@ Nelson, R.M. (1984). A method for describing equilibrium moisture content of
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 
 
@@ -129,30 +131,227 @@ def calc_1hr_fm(
     return 1.03 * calc_emc(temp_f, rh_pct)
 
 
+def calc_10hr_fm_instantaneous(
+    temp_f: float | np.ndarray,
+    rh_pct: float | np.ndarray,
+) -> np.ndarray:
+    """
+    Fosberg (1977) burning-period 10-hr fuel moisture (% dry weight).
+
+    Applies the 1.28 × EMC scalar from Fosberg (1977) — a single-snapshot
+    estimator valid only for *peak burning-period* conditions (afternoon
+    max-temp / min-RH). It is **not** the NFDRS time-lag model: it carries
+    no antecedent memory, so it cannot reproduce the integrated moisture
+    history that produces ``FM_100hr > FM_10hr`` in humid or seasonally
+    buffered systems.
+
+    For time-series 10-hr FM use :func:`calc_lagged_fm` with
+    ``timelag_hr=10`` instead. This function remains useful for one-off
+    peak-hour estimates from a single (temp_f, rh_pct) pair.
+
+    Parameters
+    ----------
+    temp_f : float or array-like
+        Dry-bulb temperature in Fahrenheit (peak burning-period value).
+    rh_pct : float or array-like
+        Relative humidity in percent (peak burning-period value).
+
+    Returns
+    -------
+    np.ndarray
+        Instantaneous 10-hr fuel moisture (%).
+    """
+    return 1.28 * calc_emc(temp_f, rh_pct)
+
+
 def calc_10hr_fm(
     temp_f: float | np.ndarray,
     rh_pct: float | np.ndarray,
 ) -> np.ndarray:
     """
-    Estimate 10-hour timelag fuel moisture (% dry weight).
+    Deprecated alias for :func:`calc_10hr_fm_instantaneous`.
 
-    Applies an approximate medium-fuel lag correction (1.28 × EMC) to the
-    NFDRS equilibrium moisture content. Represents dead fuels in the 0.64–2.54 cm
-    diameter class that respond more slowly to atmospheric changes.
+    Renamed to make the snapshot semantics explicit. Will be removed in a
+    future release. For time-series use, switch to :func:`calc_lagged_fm`.
+    """
+    warnings.warn(
+        "calc_10hr_fm is deprecated; use calc_10hr_fm_instantaneous for "
+        "peak-hour snapshots or calc_lagged_fm(timelag_hr=10) for time series.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return calc_10hr_fm_instantaneous(temp_f, rh_pct)
+
+
+def calc_lagged_fm(
+    emc_series: np.ndarray,
+    timelag_hr: float,
+    fm_init: float | None = None,
+    precip_mm: np.ndarray | None = None,
+    precip_mode: str = "flat",
+    precip_fm_boost: float = 5.0,
+    precip_threshold_mm: float = 1.0,
+    saturation_emc_pct: float | None = None,
+    fm_cap: float = 40.0,
+    dt_hr: float = 24.0,
+) -> np.ndarray:
+    """
+    Discrete exponential time-lag fuel moisture (NFDRS78).
+
+    Implements the standard NFDRS78 dead-fuel-moisture response equation
+    (Bradshaw et al. 1984, GTR INT-169 §3.4; Cohen & Deeming 1985, PSW-GTR-82),
+    unchanged in NFDRS2016:
+
+        FM_t = FM_{t-1} + alpha * (EMC_t − FM_{t-1})       (+ precip handling)
+        alpha = 1 − exp(−dt_hr / timelag_hr)
+
+    With the published stick time constants (Anderson 1990, INT-RP-429;
+    Nelson 1969) — ``timelag_hr=10`` for 1/2-inch fuels and ``timelag_hr=100``
+    for 1-inch fuels — and a daily timestep this gives:
+
+        alpha_10  = 1 − exp(−24/10)  ≈ 0.909   (fast: ~91 %/day toward EMC)
+        alpha_100 = 1 − exp(−24/100) ≈ 0.213   (slow: ~21 %/day toward EMC)
+
+    so 100-hr FM carries weeks of antecedent moisture memory that 10-hr FM
+    does not. With ``dt_hr=1`` against an hourly substrate (e.g. RTMA),
+    alpha_10 ≈ 0.0952 and alpha_100 ≈ 0.00995, and the recursion tracks
+    the diurnal EMC sine wave directly — equivalent to FireFamilyPlus
+    BNDRYT integration against RAWS hourly observations.
+
+    Precip handling modes (``precip_mode``):
+
+    - ``"flat"`` (default, daily-GridMET compatible): adds ``precip_fm_boost``
+      once on any step with ``precip_mm > precip_threshold_mm``. Empirical
+      placeholder, acceptable as a coarse driver of post-storm rebound.
+    - ``"stall"`` (NFDRS78 saturation-stall; Bradshaw 1984): during wet
+      steps, replaces ``emc[i]`` with ``saturation_emc_pct`` so the lag
+      recursion drives FM toward the saturated boundary-layer value. When
+      ``saturation_emc_pct`` is None, the ceiling is inferred from
+      ``timelag_hr``: 35 % for 10-hr fuels, 50 % for 100-hr fuels, no
+      stall (ambient EMC) for 1-hr fuels which equilibrate within a
+      single hourly step anyway. Recommended path for hourly RTMA
+      (``dt_hr=1``).
+    - ``"none"``: ignore ``precip_mm`` entirely; pure EMC-driven recursion.
+
+    Other simplifications vs. full NFDRS78:
+
+    - **Single daily EMC input.** Full NFDRS78 BNDRYT is a 24-hr weighted
+      average of daytime (max-T/min-RH) and nighttime (min-T/max-RH) EMC.
+      Driving the lag with peak-burning-period EMC alone over-dries the
+      100-hr because nighttime EMC (typically near saturation) is excluded.
+      This simplification is forced by daily-resolution forcing (e.g.
+      GridMET) and is lifted by an hourly substrate (e.g. RTMA) where the
+      same function can be called with ``dt_hr=1`` against an hourly EMC
+      series.
+    - ``fm_cap`` (default 40 %) and ``precip_threshold_mm`` (default 1 mm)
+      are pragmatic safeguards, not NFDRS literature values. For hourly
+      ``"stall"`` use, a lower threshold (e.g. 0.25 mm/hr) better matches
+      sub-daily wetting events.
 
     Parameters
     ----------
-    temp_f : float or array-like
-        Dry-bulb temperature in Fahrenheit.
-    rh_pct : float or array-like
-        Relative humidity in percent (0–100).
+    emc_series : np.ndarray
+        Daily (or sub-daily) EMC values (%) computed by :func:`calc_emc`.
+        Length = ``n_steps``. Order must be chronological.
+    timelag_hr : float
+        Fuel-moisture time-lag constant (hours). Use ``10`` for 10-hr fuels,
+        ``100`` for 100-hr fuels.
+    fm_init : float, optional
+        Initial FM (%) at ``t = 0``. Defaults to ``emc_series[0]`` if None.
+        Largely irrelevant after sufficient spin-up.
+    precip_mm : np.ndarray, optional
+        Precipitation series (mm), same length as ``emc_series``. When None,
+        no precip rebound is applied regardless of ``precip_mode``.
+    precip_mode : {"flat", "stall", "none"}
+        Precipitation response model. See above. Default ``"flat"``
+        preserves legacy daily-GridMET behavior.
+    precip_fm_boost : float
+        FM added on wet steps when ``precip_mode="flat"``.
+    precip_threshold_mm : float
+        Precip amount above which a step is treated as wet.
+    saturation_emc_pct : float, optional
+        Saturation EMC ceiling (%) used in ``precip_mode="stall"``. When
+        None, inferred from ``timelag_hr`` (35 % for 10-hr, 50 % for
+        100-hr, no stall for ≤ 1-hr).
+    fm_cap : float
+        Upper clip on output FM (%).
+    dt_hr : float
+        Time step in hours. Default 24 (daily). Use 1 with an hourly EMC
+        series for the RTMA path.
 
     Returns
     -------
     np.ndarray
-        10-hr timelag fuel moisture (%).
+        Time-lagged FM series (%) with the same length as ``emc_series``.
+
+    Raises
+    ------
+    ValueError
+        If ``precip_mm`` is provided with a different length than
+        ``emc_series``; if ``timelag_hr <= 0`` or ``dt_hr <= 0``; or if
+        ``precip_mode`` is not one of ``{"flat", "stall", "none"}``.
+
+    References
+    ----------
+    Bradshaw, L.S., Deeming, J.E., Burgan, R.E., Cohen, J.D. (1984).
+      The 1978 National Fire-Danger Rating System: Technical Documentation.
+      USDA FS GTR INT-169.
+    Cohen, J.D., Deeming, J.E. (1985). The National Fire-Danger Rating
+      System: Basic Equations. USDA FS PSW-GTR-82.
+    Anderson, H.E. (1990). Moisture Diffusivity and Response Time in Fine
+      Forest Fuels. USDA FS Res. Pap. INT-RP-429.
+    Nelson, R.M. (1969). Some factors affecting the moisture timelags of
+      woody materials. USDA FS Res. Pap. SE-44.
     """
-    return 1.28 * calc_emc(temp_f, rh_pct)
+    if timelag_hr <= 0:
+        raise ValueError(f"timelag_hr must be > 0, got {timelag_hr}")
+    if dt_hr <= 0:
+        raise ValueError(f"dt_hr must be > 0, got {dt_hr}")
+    if precip_mode not in ("flat", "stall", "none"):
+        raise ValueError(
+            f"precip_mode must be 'flat', 'stall', or 'none', got {precip_mode!r}"
+        )
+
+    emc = np.asarray(emc_series, dtype=float)
+    n = emc.size
+
+    alpha = 1.0 - np.exp(-dt_hr / timelag_hr)
+
+    if fm_init is None:
+        fm_init = float(emc[0]) if n > 0 else 0.0
+
+    if precip_mm is not None and precip_mode != "none":
+        precip = np.asarray(precip_mm, dtype=float)
+        if precip.size != n:
+            raise ValueError(
+                f"precip_mm length ({precip.size}) must match emc_series ({n})"
+            )
+        wet = precip > precip_threshold_mm
+    else:
+        wet = np.zeros(n, dtype=bool)
+
+    if precip_mode == "stall" and saturation_emc_pct is None:
+        if timelag_hr <= 1.5:
+            saturation_emc_pct = None
+        elif timelag_hr <= 50.0:
+            saturation_emc_pct = 35.0
+        else:
+            saturation_emc_pct = 50.0
+
+    fm = np.empty(n)
+    fm_prev = float(fm_init)
+    for i in range(n):
+        if wet[i] and precip_mode == "stall" and saturation_emc_pct is not None:
+            emc_eff = max(emc[i], saturation_emc_pct)
+            fm_t = fm_prev + alpha * (emc_eff - fm_prev)
+        else:
+            fm_t = fm_prev + alpha * (emc[i] - fm_prev)
+            if wet[i] and precip_mode == "flat":
+                fm_t = min(fm_t + precip_fm_boost, fm_cap)
+        fm[i] = fm_t
+        fm_prev = fm_t
+
+    return fm
 
 
 # ── Live fuel moisture — GSI-based (NFDRS 2016) ────────────────────────────────
@@ -489,3 +688,52 @@ def calc_woody_fm_gsi(
     gsi = np.asarray(gsi, dtype=float)
     frac = np.clip((gsi - 0.5) / 0.5, 0.0, 1.0)
     return np.clip(dormant_fm + frac * (green_fm - dormant_fm), 50.0, 200.0)
+
+
+def calc_live_fm_from_dead(
+    fm100: float | np.ndarray,
+    herb_scale: float = 1.5,
+    woody_scale: float = 2.0,
+    herb_floor: float = 30.0,
+    woody_floor: float = 60.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Derive live herbaceous and woody fuel moisture from 100-hr dead FM.
+
+    Proportional to dead FM with NFDRS floor clamping:
+
+        fm_herb  = max(herb_floor,  fm100 * herb_scale)
+        fm_woody = max(woody_floor, fm100 * woody_scale)
+
+    Use this when dead FM conditions are known (custom FlamMap scenarios,
+    ERC-class derivation) and phenology-based estimates are too high.
+    Drought-stressed vegetation tracks dead FM more closely than DOY alone.
+
+    Parameters
+    ----------
+    fm100 : float or array-like
+        100-hr dead fuel moisture (%).
+    herb_scale : float
+        Multiplier applied to fm100 for herbaceous FM. Default 1.5.
+    woody_scale : float
+        Multiplier applied to fm100 for woody FM. Default 2.0.
+    herb_floor : float
+        Minimum FM_herb (%). NFDRS dormant minimum = 30%.
+    woody_floor : float
+        Minimum FM_woody (%). NFDRS climate-class midpoint = 60%.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        (fm_herb, fm_woody), clipped to [herb_floor, 250] and [woody_floor, 200].
+
+    Examples
+    --------
+    >>> calc_live_fm_from_dead(8)    # dry fire conditions → floors (30, 60)
+    >>> calc_live_fm_from_dead(30)   # moderate → (45, 60)
+    >>> calc_live_fm_from_dead(50)   # moist → (75, 100)
+    """
+    fm100 = np.asarray(fm100, dtype=float)
+    fm_herb  = np.maximum(herb_floor,  fm100 * herb_scale)
+    fm_woody = np.maximum(woody_floor, fm100 * woody_scale)
+    return np.clip(fm_herb, herb_floor, 250.0), np.clip(fm_woody, woody_floor, 200.0)

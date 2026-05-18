@@ -91,8 +91,11 @@ Band normalization (`adjust.py`, `plot.py`): strip region prefix + LF version/ye
 
 ## GridMET ERC climatology
 - Source: GEE-exported CSV, pyrome mean per day, April 1–Oct 31, 2008–2022
-- CSV columns: `pyrome, date, year, doy, erc, fm100, fm1000, tmmx` (K→°F on load), `rmin`
+- CSV columns: `pyrome, date, year, doy, erc, fm100, fm1000, tmmx, tmmn` (K→°F on load), `rmin, vpd` (kPa→Pa)
 - Day-of-season pivot anchored to April 1 (1–214), leap-year-safe
 - ERC class row: `[lower, upper, fm1, fm10, fm100, fm_herb, fm_woody, spot_dist, spot_prob, spot2]`
-  - `fm_herb = fm100 + 5`, `fm_woody = fm_herb + 10`
+  - `fm_herb` / `fm_woody`: DOY-based seasonal curing (`calc_herb_fm`, `calc_woody_fm`) for FlamMap scenarios;
+    GSI-based (`calc_herb_fm_gsi` via `calc_gsi`) for FSPro ERC classes when `tmmn_f`, `vpd_pa`, `lat_deg` available
+  - NOTE: GSI with pyrome-mean GridMET VPD does not work for semi-arid western US fire season —
+    Jolly et al. (2005) thresholds calibrated for temperate/boreal, not CO conditions
   - fm1/fm10 from NFDRS equations (`tmmx_f + rmin`)

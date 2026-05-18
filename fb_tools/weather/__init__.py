@@ -3,8 +3,10 @@
 # Modules:
 #   hrrr.py     — HRRR fire-hour wind extraction; pyrome wind climatology; FlamMap WIND_DATA
 #   gridmet.py  — GEE GridMET CSV processing; ERC arrays, classes, stats; FlamMap WEATHER_DATA
-#   nfdrs.py    — NFDRS fuel moisture equations (EMC, 1-hr/10-hr/live FM)
-#   raws.py     — RAWS station data access (planned)
+#   rtma.py     — NWS RTMA hourly NFDRS78/FireFamilyPlus FM (FlamMap percentile scenarios)
+#   nfdrs.py        — NFDRS fuel moisture equations (EMC, 1-hr/10-hr/live FM)
+#   fm_scenario.py  — NFDRS78 exponential lag → FM1/FM10/FM100 time series
+#   raws.py         — RAWS station data access (planned)
 
 from .hrrr import (
     fetch_hrrr_winds_at_fires,
@@ -33,6 +35,8 @@ from .nfdrs import (
     calc_emc,
     calc_1hr_fm,
     calc_10hr_fm,
+    calc_10hr_fm_instantaneous,
+    calc_lagged_fm,
     calc_vpd_pa,
     calc_daylength,
     calc_gsi,
@@ -40,7 +44,19 @@ from .nfdrs import (
     calc_herb_fm_gsi,
     calc_woody_fm,
     calc_woody_fm_gsi,
+    calc_live_fm_from_dead,
     kelvin_to_fahrenheit,
+)
+from .fm_scenario import (
+    build_fm_timeseries,
+    extract_scenario_fm,
+)
+from .rtma import (
+    load_rtma_csv,
+    build_rtma_dead_fm,
+    build_rtma_live_fm,
+    collapse_to_peak_hour,
+    build_rtma_scenario_fm,
 )
 
 __all__ = [
@@ -69,6 +85,8 @@ __all__ = [
     "calc_emc",
     "calc_1hr_fm",
     "calc_10hr_fm",
+    "calc_10hr_fm_instantaneous",
+    "calc_lagged_fm",
     "calc_vpd_pa",
     "calc_daylength",
     "calc_gsi",
@@ -76,5 +94,15 @@ __all__ = [
     "calc_herb_fm_gsi",
     "calc_woody_fm",
     "calc_woody_fm_gsi",
+    "calc_live_fm_from_dead",
     "kelvin_to_fahrenheit",
+    # fm_scenario
+    "build_fm_timeseries",
+    "extract_scenario_fm",
+    # rtma
+    "load_rtma_csv",
+    "build_rtma_dead_fm",
+    "build_rtma_live_fm",
+    "collapse_to_peak_hour",
+    "build_rtma_scenario_fm",
 ]

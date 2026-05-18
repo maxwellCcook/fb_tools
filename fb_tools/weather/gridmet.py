@@ -37,7 +37,7 @@ import pandas as pd
 
 from fb_tools.weather.nfdrs import (
     calc_1hr_fm,
-    calc_10hr_fm,
+    calc_10hr_fm_instantaneous,
     calc_herb_fm,
     calc_herb_fm_gsi,
     calc_woody_fm,
@@ -45,8 +45,10 @@ from fb_tools.weather.nfdrs import (
     calc_gsi,
     calc_vpd_pa,
     calc_daylength,
+    calc_live_fm_from_dead,
     kelvin_to_fahrenheit,
 )
+from fb_tools.weather.fm_scenario import build_fm_timeseries
 
 # FSPro fire-season constants (April 1 – October 31)
 _N_SEASON_DAYS: int = 214
@@ -63,6 +65,14 @@ _DEFAULT_SPOTTING: list[list[float]] = [
     [180, 0.01, 0],
     [120, 0.00, 0],
 ]
+
+# Scale factors: NFDRS78-lag 100-hr FM (fire-season range ~5–25%) → live FM.
+# Chosen so that p25-danger fm100 (~20%) maps to actively-green herb (~130%),
+# and p97-danger fm100 (~7%) maps near the dormant floor (30% herb, 60% woody).
+# DOY-based phenology is unsuitable as a fallback because all ERC percentile
+# bands tend to cluster at the same calendar date within a fire season.
+_LIVE_FM_HERB_SCALE: float = 6.5
+_LIVE_FM_WOODY_SCALE: float = 9.0
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -89,7 +99,7 @@ def load_gridmet_csv(
     1. **Legacy flat format** — one column per variable (``erc``, ``fm100``,
        ``tmmx``, ``rmin``, …).  ``tail_percentile`` is ignored.
     2. **Percentile-suffix format** (new; exported by
-       ``00a_gridMET-Climatology.ipynb`` after the fire-mask + multi-percentile
+       ``00a_gridMET-ERC.ipynb`` after the fire-mask + multi-percentile
        refactor) — five columns per variable, e.g., ``erc_p10, erc_p25,
        erc_p50, erc_p75, erc_p90``.  The function selects a single column per
        variable based on ``tail_percentile`` and aliases it to the flat name
@@ -365,6 +375,7 @@ def build_erc_classes(
     tmmx_col: str = "tmmx_f",
     rmin_col: str = "rmin",
     spotting: list[list[float]] | None = None,
+    lat_deg: float | None = None,
 ) -> dict[str, np.ndarray]:
     """
     Build the 5-row ERC class table for FSPro ``NumERCClasses`` block.
@@ -379,10 +390,10 @@ def build_erc_classes(
     - ``fm1``    : median NFDRS 1-hr FM (from tmmx_f + rmin via :func:`calc_1hr_fm`)
     - ``fm10``   : median NFDRS 10-hr FM (from tmmx_f + rmin via :func:`calc_10hr_fm`)
     - ``fm100``  : median GridMET fm100 (direct)
-    - ``fm_herb``: DOY-based curing model via :func:`calc_herb_fm` — linearly interpolates
-      from 250% (April 1, peak green) to 30% (early September, dormant), per NFDRS PMS 437
-    - ``fm_woody``: seasonal sinusoidal model via :func:`calc_woody_fm` — peaks ~200% in
-      June, troughs ~60% in October; independent of fm_herb per NFDRS
+    - ``fm_herb``: GSI-based live FM via :func:`calc_herb_fm_gsi` when ``tmmn_f``,
+      ``vpd_pa``, and ``lat_deg`` are available — replicates the NFDRS 2016 /
+      FireFamilyPlus method; otherwise falls back to DOY-based :func:`calc_herb_fm`
+    - ``fm_woody``: same GSI path via :func:`calc_woody_fm_gsi`, or DOY fallback
 
     Quintile ERC bins are computed per pyrome from the full fire-season record.
     Classes are ordered highest-to-lowest ERC (class 1 = most extreme).
@@ -401,6 +412,10 @@ def build_erc_classes(
         Override default spotting parameters. Must be ``n_classes`` rows of
         ``[spot_dist_ft, spot_prob, spot2]``. Ordered highest-to-lowest ERC.
         Defaults to :data:`_DEFAULT_SPOTTING`.
+    lat_deg : float, optional
+        Site latitude in decimal degrees. Required for GSI-based live FM
+        (enables :func:`calc_daylength`). When None, live FM falls back to
+        DOY-based phenology.
 
     Returns
     -------
@@ -421,6 +436,19 @@ def build_erc_classes(
         quantiles = np.linspace(0, 100, n_classes + 1)
         edges = np.percentile(erc, quantiles)
 
+        # Run the NFDRS78 lag once over this pyrome's full record so
+        # per-bin medians draw from time-integrated FM10/FM100 rather than
+        # from independent Fosberg/GridMET snapshots (which produced the
+        # non-monotonic ordering documented in plan
+        # `a-couple-things-first-synthetic-grove.md`).
+        precip_col = "pr" if "pr" in group.columns else None
+        ts = build_fm_timeseries(
+            group,
+            tmax_col=tmmx_col,
+            rmin_col=rmin_col,
+            precip_col=precip_col,
+        )
+
         # Build one row per class (highest ERC class first)
         rows = []
         for i in range(n_classes - 1, -1, -1):
@@ -428,23 +456,26 @@ def build_erc_classes(
             upper = edges[i + 1]
 
             # Mask observations in this ERC bin
-            mask = (group[erc_col] >= lower) & (group[erc_col] <= upper)
-            sub = group[mask]
+            mask = (ts[erc_col] >= lower) & (ts[erc_col] <= upper)
+            sub = ts[mask]
 
             if len(sub) == 0:
                 # Fall back to all observations if bin is empty
-                sub = group
+                sub = ts
 
-            fm1 = float(np.nanmedian(
-                calc_1hr_fm(sub[tmmx_col].values, sub[rmin_col].values)
-            ))
-            fm10 = float(np.nanmedian(
-                calc_10hr_fm(sub[tmmx_col].values, sub[rmin_col].values)
-            ))
-            fm100 = float(np.nanmedian(sub[fm100_col].values))
-            median_doy = float(np.nanmedian(sub["doy"].values)) if "doy" in sub.columns else 182.0
-            fm_herb = float(calc_herb_fm(median_doy))
-            fm_woody = float(calc_woody_fm(median_doy))
+            fm1 = float(np.nanmedian(sub["FM1"].values))
+            fm10 = float(np.nanmedian(sub["FM10"].values))
+            fm100 = float(np.nanmedian(sub["FM100"].values))
+            if "tmmn_f" in sub.columns and lat_deg is not None:
+                vpd = calc_vpd_pa(sub[tmmx_col].values, sub[rmin_col].values)
+                dl  = calc_daylength(sub["doy"].values, lat_deg)
+                gsi = float(np.nanmedian(calc_gsi(sub["tmmn_f"].values, vpd, dl)))
+                fm_herb  = float(calc_herb_fm_gsi(gsi))
+                fm_woody = float(calc_woody_fm_gsi(gsi))
+            else:
+                median_doy = float(np.nanmedian(sub["doy"].values)) if "doy" in sub.columns else 182.0
+                fm_herb  = float(calc_herb_fm(median_doy))
+                fm_woody = float(calc_woody_fm(median_doy))
 
             spot = spotting[n_classes - 1 - i]  # highest ERC → spotting[0]
             rows.append([
@@ -607,11 +638,29 @@ def build_flammap_fuel_moistures(
     # writing to cache so extreme p97 conditions (EMC can drop to ~1.6%) don't
     # produce invalid input files.
     _FM_MIN, _FM_MAX = 2.0, 300.0
-    fm1 = float(np.clip(np.nanmedian(calc_1hr_fm(high_danger[tmmx_col].values, high_danger[rmin_col].values)), _FM_MIN, _FM_MAX))
-    fm10 = float(np.clip(np.nanmedian(calc_10hr_fm(high_danger[tmmx_col].values, high_danger[rmin_col].values)), _FM_MIN, _FM_MAX))
-    fm100 = float(np.clip(np.nanmedian(high_danger[fm100_col].values), _FM_MIN, _FM_MAX))
 
-    # Use GSI-based live FM if tmmn_f is available; fall back to DOY proxy
+    # Build lag-derived FM time series for the whole pyrome record so the
+    # high-danger-day medians draw from NFDRS78 time-integrated FM10/FM100
+    # (Bradshaw 1984) rather than independent snapshots.
+    precip_col = "pr" if "pr" in sub.columns else None
+    ts_full = build_fm_timeseries(
+        sub,
+        tmax_col=tmmx_col,
+        rmin_col=rmin_col,
+        precip_col=precip_col,
+    )
+    high_danger_dates = pd.Index(high_danger["date"])
+    ts_hd = ts_full[ts_full["date"].isin(high_danger_dates)]
+    if ts_hd.empty:
+        ts_hd = ts_full
+
+    fm1 = float(np.clip(np.nanmedian(ts_hd["FM1"].values), _FM_MIN, _FM_MAX))
+    fm10 = float(np.clip(np.nanmedian(ts_hd["FM10"].values), _FM_MIN, _FM_MAX))
+    fm100 = float(np.clip(np.nanmedian(ts_hd["FM100"].values), _FM_MIN, _FM_MAX))
+    # Cross-check: GridMET's own NFDRS-lag 100-hr product on the same days.
+    fm100_gridmet = float(np.clip(np.nanmedian(high_danger[fm100_col].values), _FM_MIN, _FM_MAX))
+
+    # Use GSI-based live FM if tmmn_f is available; fall back to dead-FM proxy.
     if "tmmn_f" in high_danger.columns and lat_deg is not None:
         vpd = calc_vpd_pa(high_danger[tmmx_col].values, high_danger[rmin_col].values)
         dl = calc_daylength(high_danger["doy"].values, lat_deg)
@@ -619,13 +668,23 @@ def build_flammap_fuel_moistures(
         fm_herb = float(calc_herb_fm_gsi(gsi))
         fm_woody = float(calc_woody_fm_gsi(gsi))
     else:
-        fm_herb = float(calc_herb_fm(scenario_doy))
-        fm_woody = float(calc_woody_fm(scenario_doy))
+        # Dead-FM proxy scales monotonically with drought stress.
+        # DOY alone can't differentiate ERC percentile conditions at the same date.
+        _herb_arr, _woody_arr = calc_live_fm_from_dead(
+            fm100,
+            herb_scale=_LIVE_FM_HERB_SCALE,
+            woody_scale=_LIVE_FM_WOODY_SCALE,
+            herb_floor=30.0,
+            woody_floor=60.0,
+        )
+        fm_herb = float(_herb_arr)
+        fm_woody = float(_woody_arr)
 
     return {
         "FM_1hr": round(fm1, 1),
         "FM_10hr": round(fm10, 1),
         "FM_100hr": round(fm100, 1),
+        "FM_100hr_gridmet": round(fm100_gridmet, 1),
         "FM_herb": round(fm_herb, 1),
         "FM_woody": round(fm_woody, 1),
     }
@@ -843,6 +902,11 @@ def build_flammap_scenario_cache(
     wind_speed_source: str = "gridmet",
     wind_percentiles: dict[str, dict] | None = None,
     erc_band: float = 0.025,
+    dead_fm_source: str = "gridmet",
+    live_fm_source: str = "gridmet",
+    rtma_daily_df: pd.DataFrame | None = None,
+    rtma_pyrome_col: str = "pyrome_id",
+    rtma_date_col: str = "date",
 ) -> dict[str, dict]:
     """
     Build per-pyrome FlamMap scenario caches at multiple ERC percentiles.
@@ -941,12 +1005,59 @@ def build_flammap_scenario_cache(
         fire-season record per scenario).  For the top percentile the band
         is clipped to the upper tail (``[p - 2*band, 1.0]``) to avoid an
         empty sample on the extreme end; same trick at the low end.
+    dead_fm_source : {"gridmet", "rtma"}
+        Source for ``FM_1hr``, ``FM_10hr``, ``FM_100hr``.  Default
+        ``"gridmet"`` (NFDRS78 lag against daily peak-hour EMC from
+        :func:`build_fm_timeseries`).  ``"rtma"`` overrides dead FM with
+        the median of RTMA daily-peak-hour FM rows on the same
+        ERC-band days — produced via :func:`~fb_tools.weather.rtma.build_rtma_dead_fm`
+        + :func:`~fb_tools.weather.rtma.collapse_to_peak_hour`.  ERC
+        membership and scenario-day selection always remain GridMET-driven.
+    live_fm_source : {"gridmet", "rtma"}
+        Source for ``FM_herb`` and ``FM_woody``.  Default ``"gridmet"``
+        — derives live FM from dead FM via
+        :func:`~fb_tools.weather.nfdrs.calc_live_fm_from_dead` (preserves
+        monotonic ordering with ERC percentile).  ``"rtma"`` uses median
+        GSI-based herb/woody FM from RTMA daily rows on the same
+        ERC-band days — see
+        :func:`~fb_tools.weather.rtma.build_rtma_live_fm`.  Note: GSI
+        threshold calibration (Jolly 2005) is the dominant limitation for
+        semi-arid pyromes, not the input data; the RTMA path is unlikely
+        to differ materially from GridMET-derived dead-FM scaling.
+    rtma_daily_df : pd.DataFrame, optional
+        Daily peak-hour RTMA frame required when either ``dead_fm_source``
+        or ``live_fm_source`` is ``"rtma"``.  Expected to contain
+        ``rtma_pyrome_col``, ``rtma_date_col``, plus the FM columns
+        referenced by the chosen sources (``FM1, FM10, FM100`` for dead;
+        ``FM_herb, FM_woody`` for live).
+    rtma_pyrome_col, rtma_date_col : str
+        Column names in ``rtma_daily_df``.
 
     Returns
     -------
     dict[str, dict]
         ``{pyrome_id: {"percentiles": [...], "scenarios": {key: scenario_dict}}}``.
     """
+    if dead_fm_source not in ("gridmet", "rtma"):
+        raise ValueError(f"dead_fm_source must be 'gridmet' or 'rtma', got {dead_fm_source!r}")
+    if live_fm_source not in ("gridmet", "rtma"):
+        raise ValueError(f"live_fm_source must be 'gridmet' or 'rtma', got {live_fm_source!r}")
+
+    use_rtma = dead_fm_source == "rtma" or live_fm_source == "rtma"
+    if use_rtma and rtma_daily_df is None:
+        raise ValueError(
+            "rtma_daily_df is required when dead_fm_source or live_fm_source is 'rtma'"
+        )
+
+    if use_rtma:
+        rtma_idx = rtma_daily_df.copy()
+        rtma_idx[rtma_date_col] = pd.to_datetime(rtma_idx[rtma_date_col]).dt.normalize()
+        rtma_by_pyrome = {
+            str(pid): grp.set_index(rtma_date_col)
+            for pid, grp in rtma_idx.groupby(rtma_pyrome_col)
+        }
+    else:
+        rtma_by_pyrome = {}
     if percentiles is None:
         percentiles = [0.25, 0.50, 0.75, 0.90, 0.97]
 
@@ -971,6 +1082,20 @@ def build_flammap_scenario_cache(
         scenarios: dict[str, dict] = {}
         pid_str = str(pyrome_id)
 
+        # NFDRS78 lag once over this pyrome's full fire-season record. Day
+        # selection per percentile (ERC quantile band) is unchanged; only
+        # the FM derivation switches from Fosberg snapshots / native GridMET
+        # fm100 to time-integrated lag values.
+        precip_col = "pr" if "pr" in group.columns else None
+        ts = build_fm_timeseries(
+            group,
+            tmax_col=tmmx_col,
+            rmin_col=rmin_col,
+            precip_col=precip_col,
+        )
+
+        running_max_doy: float = 0.0
+
         for p in percentiles:
             key = f"p{int(round(p * 100))}"
 
@@ -986,41 +1111,78 @@ def build_flammap_scenario_cache(
             lo_erc = float(erc.quantile(lo_q))
             hi_erc = float(erc.quantile(hi_q))
 
-            sample = group[(group["erc"] >= lo_erc) & (group["erc"] <= hi_erc)]
+            sample = ts[(ts["erc"] >= lo_erc) & (ts["erc"] <= hi_erc)]
             if sample.empty:
                 # Fallback: single nearest-neighbor day at the target quantile
                 target = float(erc.quantile(p))
-                sample = group.iloc[[(group["erc"] - target).abs().idxmin()]]
+                sample = ts.iloc[[(ts["erc"] - target).abs().idxmin()]]
 
-            fm1 = float(np.nanmedian(calc_1hr_fm(sample[tmmx_col].values, sample[rmin_col].values)))
-            fm10 = float(np.nanmedian(calc_10hr_fm(sample[tmmx_col].values, sample[rmin_col].values)))
-            fm100 = float(np.nanmedian(sample[fm100_col].values))
+            fm1 = float(np.nanmedian(sample["FM1"].values))
+            fm10 = float(np.nanmedian(sample["FM10"].values))
+            fm100 = float(np.nanmedian(sample["FM100"].values))
+            fm100_gridmet = float(np.nanmedian(sample[fm100_col].values))
             erc_center = float(np.nanmedian(sample["erc"].values))
-            median_doy = float(np.nanmedian(sample["doy"].values))
 
-            if "tmmn_f" in sample.columns and lat_deg is not None:
-                if "vpd_pa" in sample.columns:
-                    vpd = sample["vpd_pa"].values
-                else:
-                    vpd = calc_vpd_pa(sample[tmmx_col].values, sample[rmin_col].values)
-                dl = calc_daylength(sample["doy"].values, lat_deg)
-                gsi = float(np.nanmedian(calc_gsi(sample["tmmn_f"].values, vpd, dl)))
-                fm_herb = float(calc_herb_fm_gsi(gsi))
-                fm_woody = float(calc_woody_fm_gsi(gsi))
-            else:
-                fm_herb = float(calc_herb_fm(median_doy))
-                fm_woody = float(calc_woody_fm(median_doy))
+            # RTMA overrides — keep ERC selection (GridMET) but swap in
+            # hourly-derived FM medians on the same band days.
+            fm_herb_rtma: float | None = None
+            fm_woody_rtma: float | None = None
+            if use_rtma:
+                pid_rtma = rtma_by_pyrome.get(pid_str)
+                if pid_rtma is not None:
+                    sample_dates = pd.to_datetime(sample["date"]).dt.normalize().unique()
+                    rtma_sample = pid_rtma.reindex(sample_dates).dropna(how="all")
+                    if not rtma_sample.empty:
+                        if dead_fm_source == "rtma":
+                            if "FM1" in rtma_sample.columns:
+                                fm1 = float(np.nanmedian(rtma_sample["FM1"].values))
+                            if "FM10" in rtma_sample.columns:
+                                fm10 = float(np.nanmedian(rtma_sample["FM10"].values))
+                            if "FM100" in rtma_sample.columns:
+                                fm100 = float(np.nanmedian(rtma_sample["FM100"].values))
+                        if live_fm_source == "rtma":
+                            if "FM_herb" in rtma_sample.columns:
+                                fm_herb_rtma = float(np.nanmedian(rtma_sample["FM_herb"].values))
+                            if "FM_woody" in rtma_sample.columns:
+                                fm_woody_rtma = float(np.nanmedian(rtma_sample["FM_woody"].values))
+
+            # Median DOY of the sampled band (core season only) — stored for
+            # reference. Running max keeps scenario_doy non-decreasing across
+            # percentiles (monsoon years can invert the order).
+            core_doys = sample.loc[sample["doy"] >= 152, "doy"].values
+            median_doy = float(
+                np.nanmedian(core_doys) if len(core_doys) > 0
+                else np.nanmedian(sample["doy"].values)
+            )
+            effective_doy = max(median_doy, running_max_doy)
+            running_max_doy = effective_doy
+
+            # Live FM. Default path: dead-FM scaling — monotonically ordered
+            # with ERC by construction. DOY-based phenology fails here
+            # because all ERC percentile bands tend to cluster at the same
+            # calendar date (e.g. late-August in CO), producing identical
+            # live FM values across scenarios.
+            _herb_arr, _woody_arr = calc_live_fm_from_dead(
+                fm100,
+                herb_scale=_LIVE_FM_HERB_SCALE,
+                woody_scale=_LIVE_FM_WOODY_SCALE,
+                herb_floor=30.0,
+                woody_floor=60.0,
+            )
+            fm_herb = float(_herb_arr) if fm_herb_rtma is None else fm_herb_rtma
+            fm_woody = float(_woody_arr) if fm_woody_rtma is None else fm_woody_rtma
 
             entry: dict = {
                 "FM_1hr": round(fm1, 1),
                 "FM_10hr": round(fm10, 1),
                 "FM_100hr": round(fm100, 1),
+                "FM_100hr_gridmet": round(fm100_gridmet, 1),
                 "FM_herb": round(fm_herb, 1),
                 "FM_woody": round(fm_woody, 1),
                 "WIND_DIRECTION": wind_direction,
                 "erc_quantile_band": [round(lo_q, 3), round(hi_q, 3)],
                 "erc_center": round(erc_center, 1),
-                "scenario_doy": int(round(median_doy)),
+                "scenario_doy": int(round(effective_doy)),
                 "n_sample_days": int(len(sample)),
             }
 
@@ -1050,6 +1212,8 @@ def build_flammap_scenario_cache(
             "erc_band": erc_band,
             "wind_direction": wind_direction,
             "wind_speed_source": ws_source_label,
+            "dead_fm_source": dead_fm_source,
+            "live_fm_source": live_fm_source,
             "scenarios": scenarios,
         }
         result[pid_str] = cache
@@ -1058,7 +1222,8 @@ def build_flammap_scenario_cache(
             _write_json(cache, out_dir / f"pyrome_{pyrome_id}_flammap.json")
 
     print(f"  [build_flammap_scenario_cache] {len(result)} pyromes × {len(percentiles)} scenarios "
-          f"(±{erc_band:.3f} ERC band, wind={ws_source_label})")
+          f"(±{erc_band:.3f} ERC band, wind={ws_source_label}, "
+          f"dead_fm={dead_fm_source}, live_fm={live_fm_source})")
     return result
 
 

@@ -263,8 +263,8 @@ def build_rtma_live_fm(
     tmp_col: str = "tmp_f",
     vpd_col: str = "vpd_pa",
     tz_offset_hours: float = -7.0,
-    daytime_local_start: int = 6,
-    daytime_local_end: int = 18,
+    vpd_local_start: int = 13,
+    vpd_local_end: int = 16,
 ) -> pd.DataFrame:
     """
     Compute daily GSI-based herb/woody fuel moisture from hourly RTMA data.
@@ -272,12 +272,12 @@ def build_rtma_live_fm(
     Aggregates the hourly frame to daily inputs and applies the NFDRS 2016
     Growing Season Index (Jolly et al. 2005; NWCG PMS 437):
 
-        Tmin       = min over hourly T in the local day
-        VPD_day    = mean over daytime hours (``[daytime_local_start,
-                     daytime_local_end)``) of hourly VPD — better stress
-                     signal than the 24-hr mean which is depressed by
-                     nighttime saturation
-        photoperiod = ``calc_daylength(lat_deg, doy)``
+        Tmin            = min hourly T over the full local day
+        VPD_firewindow  = mean VPD over ``[vpd_local_start, vpd_local_end)``
+                          local hours (default 1300–1600 LST, the fire-behavior
+                          window) — matches the FireFamilyPlus convention of
+                          using the 1400 LST RAWS observation for GSI VPD input
+        photoperiod     = ``calc_daylength(lat_deg, doy)``
 
     GSI ∈ [0, 1] maps to FM_herb ∈ [30 %, 250 %] and FM_woody ∈
     [60 %, 200 %] via :func:`~fb_tools.weather.nfdrs.calc_herb_fm_gsi` /
@@ -287,12 +287,18 @@ def build_rtma_live_fm(
     by ``tz_offset_hours`` (no DST handling — RTMA records are UTC; choose
     -7 for MST year-round, matching RAWS/WIMS reporting convention).
 
-    **Calibration caveat.** Jolly thresholds were calibrated for
-    temperate/boreal vegetation.  In semi-arid CO pyromes the VPD bound
-    (4100 Pa "limiting") under-discriminates fire-season days — GSI tends
-    to sit low across the entire summer.  Higher-resolution RTMA inputs
-    cannot fix this; the threshold itself is the bottleneck.  See
-    ``CLAUDE.md`` GridMET ERC climatology notes.
+    **VPD window rationale.** The prior default (6–18 daytime mean) included
+    low-VPD morning and evening hours, suppressing the fire-weather VPD signal
+    and leaving GSI too high on extreme fire days.  The 1300–1600 window
+    (peak fire-behavior hours) produces VPD values comparable to the 1400 LST
+    RAWS observation FireFamilyPlus uses, giving better discrimination between
+    fire-weather severity levels.
+
+    **Spatial note.** The RTMA pyrome-mean VPD will always be lower than a
+    valley RAWS station point on extreme fire days (high-elevation pixels
+    dilute the mean).  For pyromes with strong elevation gradients this may
+    slightly under-estimate GSI-inhibiting VPD; compare against a
+    representative mid-elevation RAWS station if needed.
 
     Parameters
     ----------
@@ -304,15 +310,16 @@ def build_rtma_live_fm(
         Column names.
     tz_offset_hours : float
         UTC offset of the local time zone.  Default -7 (MST).
-    daytime_local_start, daytime_local_end : int
-        Half-open local-hour window for daytime VPD averaging.  Defaults
-        ``[6, 18)``.
+    vpd_local_start, vpd_local_end : int
+        Half-open local-hour window for VPD averaging used in the GSI
+        calculation.  Defaults ``[13, 16)`` (1300–1600 LST), matching the
+        FireFamilyPlus 1400 LST RAWS observation convention.
 
     Returns
     -------
     pd.DataFrame
-        Per pyrome × local date: ``pyrome_id, date, doy, tmin_f, vpd_day_pa,
-        gsi, FM_herb, FM_woody``.
+        Per pyrome × local date: ``pyrome_id, date, doy, tmin_f,
+        vpd_firewindow_pa, gsi, FM_herb, FM_woody``.
     """
     for col in (pyrome_col, datetime_col, tmp_col, vpd_col):
         if col not in df.columns:
@@ -325,9 +332,9 @@ def build_rtma_live_fm(
     work["doy"] = local.dt.dayofyear
     work["hour_local"] = local.dt.hour
 
-    daytime_mask = (
-        (work["hour_local"] >= daytime_local_start)
-        & (work["hour_local"] < daytime_local_end)
+    fire_window_mask = (
+        (work["hour_local"] >= vpd_local_start)
+        & (work["hour_local"] < vpd_local_end)
     )
 
     tmin = (
@@ -336,11 +343,11 @@ def build_rtma_live_fm(
             .rename("tmin_f")
             .reset_index()
     )
-    vpd_day = (
-        work.loc[daytime_mask]
+    vpd_fw = (
+        work.loc[fire_window_mask]
             .groupby([pyrome_col, "date"])[vpd_col]
             .mean()
-            .rename("vpd_day_pa")
+            .rename("vpd_firewindow_pa")
             .reset_index()
     )
     doy = (
@@ -349,14 +356,14 @@ def build_rtma_live_fm(
             .reset_index()
     )
 
-    daily = tmin.merge(vpd_day, on=[pyrome_col, "date"], how="left").merge(
+    daily = tmin.merge(vpd_fw, on=[pyrome_col, "date"], how="left").merge(
         doy, on=[pyrome_col, "date"], how="left"
     )
 
     daylength_hr = calc_daylength(daily["doy"].values, lat_deg)
     daily["gsi"] = calc_gsi(
         tmin_f=daily["tmin_f"].values,
-        vpd_pa=daily["vpd_day_pa"].values,
+        vpd_pa=daily["vpd_firewindow_pa"].values,
         daylength_hr=daylength_hr,
     )
     daily["FM_herb"] = calc_herb_fm_gsi(daily["gsi"].values)

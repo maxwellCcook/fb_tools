@@ -4,6 +4,7 @@ from .lcp import (
     create_ignition_ascii,
     create_container_ignition,
     create_random_ignitions,
+    create_directional_ignitions,
     create_fod_ignitions,
     get_band_by_longname,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "create_ignition_ascii",
     "create_container_ignition",
     "create_random_ignitions",
+    "create_directional_ignitions",
     "create_fod_ignitions",
     "get_band_by_longname",
     "adjust_lcp",

@@ -12,6 +12,7 @@ from .container import (
     prepare_container_fspro,
     postprocess_fspro_outputs,
     prepare_counterfactual_fspro,
+    prepare_counterfactual_ignition_set,
     patch_fspro_input_paths,
 )
 
@@ -31,5 +32,6 @@ __all__ = [
     "prepare_container_fspro",
     "postprocess_fspro_outputs",
     "prepare_counterfactual_fspro",
+    "prepare_counterfactual_ignition_set",
     "patch_fspro_input_paths",
 ]

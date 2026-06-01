@@ -639,6 +639,51 @@ def load_pyrome_wind_cells(
     return data
 
 
+def dominant_wind_direction(
+    pyrome_id: "str | int",
+    cache_dir: "Path | str",
+) -> float:
+    """
+    Return the dominant wind direction (degrees FROM) for a cached pyrome.
+
+    Loads the cached ``WindCellValues`` rose, sums frequency across all wind
+    speed bins to get a per-direction marginal distribution, and returns the
+    azimuth of the centre of the highest-frequency direction bin.
+
+    Direction bins are defined by ``WindDirBreaks_deg`` (upper bounds); bin
+    *i* spans ``(breaks[i-1], breaks[i]]`` with the first bin starting at 0°.
+    The returned value uses the meteorological FROM convention (0/360 = north).
+
+    Parameters
+    ----------
+    pyrome_id : str or int
+        Group identifier matching the JSON filename prefix.
+    cache_dir : Path or str
+        Directory containing ``pyrome_{id}_wind.json`` files.
+
+    Returns
+    -------
+    float
+        Dominant wind direction in degrees FROM (0–360).
+
+    Raises
+    ------
+    FileNotFoundError
+        If no cached file exists for this group.
+    """
+    meta = load_pyrome_wind_cells(pyrome_id, cache_dir, return_meta=True)
+    cells = np.asarray(meta["WindCellValues"], dtype=float)
+    breaks = list(meta["WindDirBreaks_deg"])
+
+    # Marginal frequency per direction bin (sum across speed bins)
+    dir_freq = cells.sum(axis=0)
+    dom_idx = int(np.argmax(dir_freq))
+
+    lower = 0.0 if dom_idx == 0 else float(breaks[dom_idx - 1])
+    upper = float(breaks[dom_idx])
+    return round((lower + upper) / 2.0, 1)
+
+
 def build_hrrr_wind_percentiles(
     hrrr_df: "pd.DataFrame",
     percentiles: "list[float] | None" = None,

@@ -67,10 +67,12 @@ _DEFAULT_SPOTTING: list[list[float]] = [
 ]
 
 # Scale factors: NFDRS78-lag 100-hr FM (fire-season range ~5–25%) → live FM.
-# Chosen so that p25-danger fm100 (~20%) maps to actively-green herb (~130%),
-# and p97-danger fm100 (~7%) maps near the dormant floor (30% herb, 60% woody).
-# DOY-based phenology is unsuitable as a fallback because all ERC percentile
-# bands tend to cluster at the same calendar date within a fire season.
+# Empirically tuned for CO fire season (p25 fm100 ~20% → herb ~130%,
+# p97 fm100 ~7% → near dormant floor 30%/60%).  Not NFDRS-standard —
+# the FFP-aligned GSI approach in build_rtma_live_fm() is preferred when
+# RTMA data are available.  DOY-based phenology is unsuitable as a fallback
+# because all ERC percentile bands tend to cluster at the same calendar
+# date within a fire season, producing identical live FM across scenarios.
 _LIVE_FM_HERB_SCALE: float = 6.5
 _LIVE_FM_WOODY_SCALE: float = 9.0
 

@@ -973,6 +973,252 @@ def prepare_counterfactual_fspro(
     return manifest
 
 
+def prepare_counterfactual_ignition_set(
+    treatments_gdf,
+    values_gdf,
+    out_dir: "str | Path",
+    weather_dir: "str | Path",
+    pyromes_gdf,
+    baseline_lcp_path: "str | Path",
+    treated_lcp_path: "str | Path",
+    wind_from_deg: "float | None" = None,
+    n_ignitions: int = 15,
+    dist_band_km: tuple = (2.0, 10.0),
+    sector_deg: float = 45.0,
+    require_treatment_intersect: bool = True,
+    num_fires: int = 1000,
+    duration: int = 5,
+    resolution: float = 90.0,
+    erc_classes: "np.ndarray | None" = None,
+    gridmet_csv: "str | Path | None" = None,
+    current_erc_start_doy: int = 91,
+    current_erc_n_days: int = 79,
+    seed: int = 617327,
+    ignition_seed=None,
+    **fspro_kwargs,
+) -> dict:
+    """Prepare a per-ignition counterfactual FSPro experiment ("upwind toward values").
+
+    Unlike :func:`prepare_counterfactual_fspro` — which builds a single
+    ``IgnitionFile`` that FSPro treats as one fire — this function generates
+    *N independent ignitions* placed upwind of a treatment cluster, and writes
+    one FSPro input file per ignition.  Each ignition becomes its own FSPro run
+    (``NumFires`` simulations), so per-ignition burn-probability and fire-growth
+    results can be aggregated across the ensemble.
+
+    All ignitions share the same pyrome weather and the same ``SPOTTING_SEED``,
+    and each input file is run against both the baseline and treated LCP — a
+    clean paired counterfactual.  ``SavePerimeters`` is forced on so per-fire
+    daily perimeters are available for early/extreme growth analysis.
+
+    Parameters
+    ----------
+    treatments_gdf : geopandas.GeoDataFrame
+        Treatment polygons (the treatment group under test).  Any CRS.
+    values_gdf : geopandas.GeoDataFrame
+        Values / assets to protect (WUI, communities, structures, POD).
+        Used to orient the ignition→treatments→values geometry.
+    out_dir : str or Path
+        Root output directory.  Sub-directories created automatically::
+
+            out_dir/
+              ignitions/      ← ign_XXX.shp  (one feature each)
+              fspro_inputs/   ← ign_XXX.input  (one per ignition)
+              runs.csv        ← scenario table for run_fspro_batch
+              run_manifest.json
+
+    weather_dir : str or Path
+        Root weather cache directory (``pyrome_erc/``, ``pyrome_wind/``).
+    pyromes_gdf : geopandas.GeoDataFrame or str or Path
+        NIFC pyrome polygons, or a path read with ``geopandas.read_file``.
+    baseline_lcp_path, treated_lcp_path : str or Path
+        Pre-built landscape GeoTIFFs.  Must already exist.
+    wind_from_deg : float, optional
+        Dominant wind direction (degrees FROM).  When ``None`` (default), it
+        is derived from the pyrome wind climatology via
+        :func:`~fb_tools.weather.dominant_wind_direction`.
+    n_ignitions : int
+        Number of ignitions to generate.  Default 15.
+    dist_band_km : tuple of float
+        ``(min, max)`` upwind distance band from the treatment centroid, km.
+        Default ``(2, 10)``.
+    sector_deg : float
+        Angular width of the upwind placement wedge.  Default 45.
+    require_treatment_intersect : bool
+        Keep only ignitions whose downwind ray crosses the treatments.
+    num_fires : int
+        ``NumFires`` per ignition.  Default 1000.
+    duration : int
+        ``Duration`` (max burn period, days).  Default 5 — the early window.
+    resolution : float
+        Output grid cell size, metres.  Default 90.
+    erc_classes : np.ndarray, optional
+        Pre-computed ERC class table ``(5, 10)``.
+    gridmet_csv : str or Path, optional
+        GridMET CSV, used when ``erc_classes`` is not supplied.
+    current_erc_start_doy, current_erc_n_days : int
+        Current-season ERC window (1 = April 1).  Defaults 91, 79.
+    seed : int
+        Shared ``SPOTTING_SEED`` for all runs.  Default 617327.
+    ignition_seed : int, optional
+        Random seed for ignition placement.
+    **fspro_kwargs
+        Overrides for ``_FSPRO_DEFAULTS``.  ``pyrome_col`` is intercepted.
+        ``SavePerimeters`` is forced to 1.
+
+    Returns
+    -------
+    dict
+        Manifest with keys: ``baseline_lcp_path``, ``treated_lcp_path``,
+        ``pyrome_id``, ``wind_from_deg``, ``downwind_az``, ``seed``,
+        ``ignition_shapefiles`` (list), ``fspro_input_paths`` (list),
+        ``ignitions_gdf`` (GeoDataFrame), ``runs_df`` (DataFrame for
+        :func:`~fb_tools.models.fspro.run_fspro_batch`), ``runs_csv``,
+        ``out_dir``, ``manifest_path``.
+
+    Notes
+    -----
+    ``runs_df`` is laid out for ``run_fspro_batch`` — it organises outputs as
+    ``output_root/<lcp_stem>/<ign_XXX>/``.  Run it on Windows after patching
+    the ``IgnitionFile`` paths in each input file with
+    :func:`patch_fspro_input_paths`.
+    """
+    import geopandas as gpd
+    import pandas as pd
+    import rasterio
+    from fb_tools.fuelscape.lcp import create_directional_ignitions
+    from fb_tools.models.fspro import build_treatment_pair
+    from fb_tools.utils.geo import lookup_pyrome
+    from fb_tools.weather.hrrr import dominant_wind_direction
+
+    if isinstance(pyromes_gdf, (str, Path)):
+        pyromes_gdf = gpd.read_file(pyromes_gdf)
+
+    baseline_lcp_path = Path(baseline_lcp_path)
+    treated_lcp_path  = Path(treated_lcp_path)
+    if not baseline_lcp_path.exists():
+        raise FileNotFoundError(f"baseline_lcp_path not found: {baseline_lcp_path}")
+    if not treated_lcp_path.exists():
+        raise FileNotFoundError(f"treated_lcp_path not found: {treated_lcp_path}")
+
+    out_dir    = Path(out_dir).resolve()
+    ign_dir    = out_dir / "ignitions"
+    inputs_dir = out_dir / "fspro_inputs"
+    for d in (ign_dir, inputs_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    with rasterio.open(baseline_lcp_path) as src:
+        lcp_crs = src.crs
+
+    # ── Dominant pyrome from the treatments + values footprint ───────────────
+    pyrome_col = fspro_kwargs.pop("pyrome_col", "Pyrome_ID")
+    analysis_area = gpd.GeoDataFrame(
+        geometry=list(treatments_gdf.geometry) + list(values_gdf.geometry),
+        crs=treatments_gdf.crs,
+    ).to_crs(pyromes_gdf.crs)
+    try:
+        analysis_union = analysis_area.geometry.union_all()
+    except AttributeError:
+        analysis_union = analysis_area.geometry.unary_union
+    pyrome_id = str(lookup_pyrome(analysis_union, pyromes_gdf, pyrome_col=pyrome_col))
+    print(f"[prepare_counterfactual_ignition_set] Dominant pyrome: {pyrome_id}")
+
+    # ── Weather (shared by every ignition and both landscapes) ───────────────
+    print("[prepare_counterfactual_ignition_set] Loading pyrome weather …")
+    wx = _load_weather_for_pyrome(
+        pyrome_id, weather_dir,
+        current_erc_start_doy=current_erc_start_doy,
+        current_erc_n_days=current_erc_n_days,
+        erc_classes=erc_classes,
+        gridmet_csv=gridmet_csv,
+    )
+
+    # ── Wind direction for upwind placement ──────────────────────────────────
+    if wind_from_deg is None:
+        wind_from_deg = dominant_wind_direction(
+            pyrome_id, Path(weather_dir) / "pyrome_wind"
+        )
+        print(f"[prepare_counterfactual_ignition_set] Dominant wind FROM "
+              f"(pyrome climatology): {wind_from_deg:.0f}°")
+
+    # ── Directional ignition set ──────────────────────────────────────────────
+    ign = create_directional_ignitions(
+        treatments_gdf=treatments_gdf,
+        values_gdf=values_gdf,
+        wind_from_deg=wind_from_deg,
+        lcp_fp=baseline_lcp_path,
+        out_dir=ign_dir,
+        n_ignitions=n_ignitions,
+        dist_band_km=dist_band_km,
+        sector_deg=sector_deg,
+        require_treatment_intersect=require_treatment_intersect,
+        seed=ignition_seed,
+    )
+    ign_shps = ign["ignition_shapefiles"]
+
+    # ── One FSPro input file per ignition (shared seed, SavePerimeters on) ────
+    sim_params = {
+        "NumFires": num_fires, "Duration": duration, "Resolution": resolution,
+        "SavePerimeters": 1,
+    }
+    sim_params.update(fspro_kwargs)
+    sim_params["SavePerimeters"] = 1  # always on — perimeter analysis needs it
+
+    input_paths = []
+    run_rows = []
+    for i, ign_shp in enumerate(ign_shps):
+        scenario = f"ign_{i:03d}"
+        inp = build_treatment_pair(
+            out_path      = inputs_dir / f"{scenario}.input",
+            ignition_file = ign_shp,
+            wind_cells    = wx["wind_cells"],
+            calm_value    = wx["calm_value"],
+            erc_historic  = wx["erc_historic"],
+            erc_avg       = wx["erc_avg"],
+            erc_std       = wx["erc_std"],
+            erc_classes   = wx["erc_classes"],
+            current_erc   = wx["current_erc"],
+            seed          = seed,
+            **sim_params,
+        )
+        input_paths.append(inp)
+        run_rows.append({
+            "Scenario": scenario, "LCP": str(baseline_lcp_path),
+            "FSPro_input": str(inp), "output_basename": "baseline",
+        })
+        run_rows.append({
+            "Scenario": scenario, "LCP": str(treated_lcp_path),
+            "FSPro_input": str(inp), "output_basename": "treated",
+        })
+
+    runs_df = pd.DataFrame(run_rows)
+    runs_csv = out_dir / "runs.csv"
+    runs_df.to_csv(runs_csv, index=False)
+    print(f"[prepare_counterfactual_ignition_set] {len(ign_shps)} ignition(s) → "
+          f"{len(runs_df)} FSPro runs (NumFires={num_fires}, Duration={duration})")
+
+    manifest = {
+        "baseline_lcp_path":    baseline_lcp_path,
+        "treated_lcp_path":     treated_lcp_path,
+        "pyrome_id":            pyrome_id,
+        "wind_from_deg":        float(wind_from_deg),
+        "downwind_az":          ign["downwind_az"],
+        "seed":                 seed,
+        "ignition_shapefiles":  [str(p) for p in ign_shps],
+        "fspro_input_paths":    [str(p) for p in input_paths],
+        "runs_csv":             runs_csv,
+        "out_dir":              out_dir,
+    }
+    manifest_path = out_dir / "run_manifest.json"
+    _write_manifest(manifest, manifest_path)
+
+    manifest["manifest_path"] = manifest_path
+    manifest["runs_df"]       = runs_df
+    manifest["ignitions_gdf"] = ign["ignitions_gdf"]
+    print(f"[prepare_counterfactual_ignition_set] Done. Manifest → {manifest_path}")
+    return manifest
+
+
 def patch_fspro_input_paths(
     input_file: "str | Path",
     mac_prefix: str,

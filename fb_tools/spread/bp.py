@@ -125,6 +125,103 @@ def delta_burn_probability(baseline_bp, treatment_bp, out_path=None, scale=100):
     return delta
 
 
+def _ensemble_stack(bp_list):
+    """Align a list of burn-probability rasters to a common grid and stack them.
+
+    Returns a single DataArray with a leading ``ignition`` dimension.
+    """
+    das = [_open_bp(src) for src in bp_list]
+    ref = das[0]
+    aligned = [ref]
+    for da in das[1:]:
+        _, da_a = xr.align(ref, da, join="left")
+        aligned.append(da_a)
+    return xr.concat(aligned, dim=xr.Variable("ignition", range(len(aligned))))
+
+
+def aggregate_ignition_bp(
+    baseline_bps,
+    treated_bps,
+    out_dir=None,
+    out_prefix="ensemble",
+):
+    """
+    Aggregate per-ignition burn probability rasters into an ensemble surface.
+
+    Each ignition was run as a separate FSPro fire (see
+    :func:`~fb_tools.models.container.prepare_counterfactual_ignition_set`).
+    This collapses the per-ignition burn-probability rasters into a single
+    ensemble surface by averaging across ignitions — every ignition is
+    weighted equally (i.e. treated as equally likely to occur).
+
+    Parameters
+    ----------
+    baseline_bps : list of str, Path, or xarray.DataArray
+        Per-ignition baseline burn-probability rasters.
+    treated_bps : list of str, Path, or xarray.DataArray
+        Per-ignition treated burn-probability rasters.  Must be the same
+        length as *baseline_bps* and in matching ignition order.
+    out_dir : str or Path, optional
+        If provided, writes ``{out_prefix}_baseline.tif``,
+        ``{out_prefix}_treated.tif``, and ``{out_prefix}_delta.tif`` here.
+    out_prefix : str
+        Filename prefix for written GeoTIFFs.  Default ``"ensemble"``.
+
+    Returns
+    -------
+    dict
+        ``"baseline_mean"`` : xarray.DataArray
+            Mean burn probability across ignitions, baseline landscape.
+        ``"treated_mean"`` : xarray.DataArray
+            Mean burn probability across ignitions, treated landscape.
+        ``"baseline_max"`` / ``"treated_max"`` : xarray.DataArray
+            Per-pixel maximum across ignitions (worst-case ignition).
+        ``"delta_mean"`` : xarray.DataArray
+            ``baseline_mean - treated_mean`` — positive = treatments reduced
+            ensemble burn probability.
+
+    Raises
+    ------
+    ValueError
+        If the two lists differ in length or are empty.
+    """
+    if len(baseline_bps) != len(treated_bps):
+        raise ValueError(
+            f"baseline_bps ({len(baseline_bps)}) and treated_bps "
+            f"({len(treated_bps)}) must have the same length."
+        )
+    if not baseline_bps:
+        raise ValueError("No burn probability rasters provided.")
+
+    bl_stack = _ensemble_stack(baseline_bps)
+    tr_stack = _ensemble_stack(treated_bps)
+
+    bl_mean = bl_stack.mean(dim="ignition").astype("float32")
+    tr_mean = tr_stack.mean(dim="ignition").astype("float32")
+    bl_max  = bl_stack.max(dim="ignition").astype("float32")
+    tr_max  = tr_stack.max(dim="ignition").astype("float32")
+
+    bl_mean.attrs = _open_bp(baseline_bps[0]).attrs
+    delta_mean = delta_burn_probability(bl_mean, tr_mean)
+
+    if out_dir is not None:
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        bl_mean.rio.to_raster(out_dir / f"{out_prefix}_baseline.tif")
+        tr_mean.rio.to_raster(out_dir / f"{out_prefix}_treated.tif")
+        delta_mean.rio.to_raster(out_dir / f"{out_prefix}_delta.tif")
+        print(f"Ensemble burn probability ({len(baseline_bps)} ignitions) "
+              f"written to {out_dir}")
+
+    return {
+        "baseline_mean": bl_mean,
+        "treated_mean":  tr_mean,
+        "baseline_max":  bl_max,
+        "treated_max":   tr_max,
+        "delta_mean":    delta_mean,
+    }
+
+
 def summarize_bp_treatments(
     treatments_gdf,
     id_col,

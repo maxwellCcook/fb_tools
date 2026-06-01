@@ -45,6 +45,7 @@ from .fuelscape import (
     create_ignition_ascii,
     create_container_ignition,
     create_random_ignitions,
+    create_directional_ignitions,
     create_fod_ignitions,
     get_band_by_longname,
     adjust_lcp,
@@ -68,12 +69,17 @@ from .models import (
     prepare_container_fspro,
     postprocess_fspro_outputs,
     prepare_counterfactual_fspro,
+    prepare_counterfactual_ignition_set,
     patch_fspro_input_paths,
 )
 from .spread import (
     delta_burn_probability,
+    aggregate_ignition_bp,
     summarize_bp_treatments,
     downwind_treatment_effect,
+    load_fspro_perimeters,
+    summarize_early_growth,
+    compare_growth,
 )
 from .utils import (
     is_valid_geom,
@@ -92,6 +98,7 @@ from .weather import (
     build_wind_cells,
     build_pyrome_wind_cells,
     load_pyrome_wind_cells,
+    dominant_wind_direction,
     build_hrrr_wind_percentiles,
     wind_percentiles_from_cell_cache,
     load_gridmet_csv,
@@ -124,6 +131,7 @@ __all__ = [
     "create_ignition_ascii",
     "create_container_ignition",
     "create_random_ignitions",
+    "create_directional_ignitions",
     "create_fod_ignitions",
     "get_band_by_longname",
     "adjust_lcp",
@@ -146,11 +154,16 @@ __all__ = [
     "prepare_container_fspro",
     "postprocess_fspro_outputs",
     "prepare_counterfactual_fspro",
+    "prepare_counterfactual_ignition_set",
     "patch_fspro_input_paths",
     # spread
     "delta_burn_probability",
+    "aggregate_ignition_bp",
     "summarize_bp_treatments",
     "downwind_treatment_effect",
+    "load_fspro_perimeters",
+    "summarize_early_growth",
+    "compare_growth",
     # utils
     "is_valid_geom",
     "mask_raster",
@@ -166,6 +179,7 @@ __all__ = [
     "build_wind_cells",
     "build_pyrome_wind_cells",
     "load_pyrome_wind_cells",
+    "dominant_wind_direction",
     "build_hrrr_wind_percentiles",
     "wind_percentiles_from_cell_cache",
     # weather — gridmet

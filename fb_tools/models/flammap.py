@@ -14,6 +14,7 @@ or a Parallels-accessible UNC / mapped path when calling from macOS.
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from pathlib import Path
 
@@ -49,7 +50,7 @@ def run_flammap_scenarios(
 
         - ``FM_1hr``, ``FM_10hr``, ``FM_100hr``, ``FM_herb``, ``FM_woody``
           — dead/live fuel moistures (%)
-        - ``CROWN_FIRE_METHOD`` — ``1`` (Rothermel) or ``2`` (Scott & Reinhardt)
+        - ``CROWN_FIRE_METHOD`` — ``"Finney"`` or ``"ScottReinhardt"``
         - ``WIND_SPEED`` — 20-ft wind speed (mph)
         - ``WIND_DIRECTION`` — wind azimuth (degrees); ``-1`` = uphill, ``-2`` = downhill
         - ``GRIDDED_WINDS_GENERATE`` — ``"Yes"`` to enable WindNinja
@@ -114,8 +115,12 @@ def run_flammap_scenarios(
 
     # --- Write the FlamMap command file
     # Format: <lcp_path> <input_filename> <output_dir> <mode>
+    # FlamMap's parser splits on whitespace with no quote support, so use a
+    # relative path from output_directory to the LCP.  Both live under the
+    # same Box root, so the common prefix (which contains spaces) cancels out.
+    lcp_rel = Path(os.path.relpath(lcp_fp, output_directory))
     with open(command_file, "w") as f:
-        f.write(f"{Path(lcp_fp)} {input_file.name} . 2\n")
+        f.write(f"{lcp_rel} {input_file.name} . 2\n")
 
     # --- Run the model
     result = run_cli(
@@ -261,8 +266,9 @@ def run_flammap_conditioning(
         for output_type in outputs:
             f.write(f"{output_type}:\n")
 
+    lcp_rel = Path(os.path.relpath(lcp_fp, output_directory))
     with open(command_file, "w") as f:
-        f.write(f"{Path(lcp_fp)} {input_file.name} . 2\n")
+        f.write(f"{lcp_rel} {input_file.name} . 2\n")
 
     result = run_cli(
         exe_path=fm_exe,

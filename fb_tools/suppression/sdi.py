@@ -618,7 +618,11 @@ def calculate_sdi(lcp, roads_gdf, trails_gdf, rtc_path,
     if out_path is not None:
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        da_out.rio.to_raster(str(out_path), dtype="int16", compress="deflate")
+        da_out.rio.to_raster(
+            str(out_path), dtype="int16",
+            compress="deflate", predictor=2, zlevel=9,
+            tiled=True, blockxsize=256, blockysize=256,
+        )
         print(f"SDI saved → {out_path}")
 
     return da_out
@@ -674,7 +678,11 @@ def calculate_delta_sdi(baseline_sdi, treatment_sdi, out_path=None):
     if out_path is not None:
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        da_out.rio.to_raster(str(out_path), dtype="int16", compress="deflate")
+        da_out.rio.to_raster(
+            str(out_path), dtype="int16",
+            compress="deflate", predictor=2, zlevel=9,
+            tiled=True, blockxsize=256, blockysize=256,
+        )
         print(f"Delta SDI saved → {out_path}")
 
     return da_out

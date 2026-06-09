@@ -42,17 +42,23 @@ _FIRE_HINTS = ("fire", "firenum", "fire_id", "fid", "sim", "run")
 _TIME_HINTS = ("day", "time", "period", "elapsed", "hour", "burn")
 
 
-def _detect_col(columns, hints, label):
-    """Return the first column whose lowercased name contains any hint."""
+def _detect_col(columns, hints, label, required=True):
+    """Return the first column whose lowercased name contains any hint.
+
+    When *required* is ``False`` returns ``None`` instead of raising if no
+    match is found.
+    """
     lowered = {c: c.lower() for c in columns}
     for hint in hints:
         for col, low in lowered.items():
             if hint in low:
                 return col
-    raise ValueError(
-        f"Could not auto-detect the {label} column among {list(columns)}. "
-        f"Pass it explicitly."
-    )
+    if required:
+        raise ValueError(
+            f"Could not auto-detect the {label} column among {list(columns)}. "
+            f"Pass it explicitly."
+        )
+    return None
 
 
 def load_fspro_perimeters(shp, fire_col=None, time_col=None):
@@ -87,19 +93,40 @@ def load_fspro_perimeters(shp, fire_col=None, time_col=None):
     if not shp.exists():
         raise FileNotFoundError(f"Perimeter shapefile not found: {shp}")
 
-    gdf = gpd.read_file(shp)
+    # on_invalid="warn" skips malformed ring geometries (unclosed LinearRings)
+    # that FSPro occasionally writes, instead of raising a GEOSException.
+    gdf = gpd.read_file(shp, on_invalid="warn")
+
+    # Drop rows where geometry could not be parsed
+    n_before = len(gdf)
+    gdf = gdf[gdf.geometry.notna() & ~gdf.geometry.is_empty].copy()
+    n_dropped = n_before - len(gdf)
+    if n_dropped:
+        print(f"[load_fspro_perimeters] {shp.name}: dropped {n_dropped} invalid geometry row(s).")
 
     if fire_col is None:
         fire_col = _detect_col(gdf.columns.drop("geometry"), _FIRE_HINTS, "fire-id")
     if time_col is None:
-        time_col = _detect_col(gdf.columns.drop("geometry"), _TIME_HINTS, "elapsed-time")
-
-    print(f"[load_fspro_perimeters] {shp.name}: {len(gdf)} perimeters; "
-          f"fire_col='{fire_col}', time_col='{time_col}'")
+        time_col = _detect_col(
+            gdf.columns.drop("geometry"), _TIME_HINTS, "elapsed-time", required=False
+        )
 
     gdf = gdf.copy()
     gdf["fire_id"] = gdf[fire_col].astype(int)
-    gdf["elapsed"] = gdf[time_col].astype(float)
+
+    if time_col is not None:
+        gdf["elapsed"] = gdf[time_col].astype(float)
+        elapsed_desc = f"time_col='{time_col}'"
+    else:
+        # FSPro SavePerimeters output contains only final-state perimeters
+        # (no elapsed-time column).  Assign elapsed = 1.0 so downstream
+        # logic treats each record as a "day 1+" snapshot — area and arrival
+        # metrics will reflect final burned extent rather than daily growth.
+        gdf["elapsed"] = 1.0
+        elapsed_desc = "no time column found — elapsed set to 1.0 (final-state perimeters)"
+
+    print(f"[load_fspro_perimeters] {shp.name}: {len(gdf)} perimeters; "
+          f"fire_col='{fire_col}', {elapsed_desc}")
     return gdf
 
 

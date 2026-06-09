@@ -30,6 +30,7 @@ models/
   cell2fire.py — stub (NotImplementedError)
 spread/
   bp.py        — delta_burn_probability, summarize_bp_treatments, downwind_treatment_effect
+  perimeters.py — load_fspro_perimeters, summarize_early_growth, compare_growth
   convert.py   — stub: lcp_to_cell2fire, build_cell2fire_weather
 suppression/
   roads.py     — fetch_osm_roads() via osmnx
@@ -38,10 +39,14 @@ utils/
   geo.py       — mask_raster, rasterize, clip_raster_inplace, lookup_pyrome, is_valid_geom
   io.py        — list_files()
   plot.py      — plot_bands()
+analysis/
+  zonal.py     — zonal statistics helpers
+  treatments.py — deprecated stub → import from tealom.analyses
 weather/
   hrrr.py      — HRRR fire-hour wind extraction; pyrome wind climatology
-  gridmet.py   — GEE GridMET CSV → ERC arrays, classes, stats
+  gridmet.py   — GEE GridMET CSV → ERC arrays, classes, stats; FlamMap scenario cache
   nfdrs.py     — NFDRS fuel moisture (EMC, 1-hr, 10-hr)
+  rtma.py      — NWS RTMA → NFDRS78 dead FM (FM1/FM10/FM100) + GSI live FM; build_rtma_scenario_fm
 ```
 
 ## Code conventions

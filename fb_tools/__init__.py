@@ -115,7 +115,6 @@ from .weather import (
     calc_1hr_fm,
     calc_10hr_fm,
 )
-from .analysis import summarize_treatments, run_treatment_pipeline
 from .plotting import (
     plot_fl_stackedbar,
     plot_fl_delta_bar,
@@ -202,12 +201,37 @@ __all__ = [
     "calculate_delta_sdi",
     "fetch_osm_roads",
     "fetch_counties",
-    # analysis
-    "summarize_treatments",
-    "run_treatment_pipeline",
     # plotting
     "plot_fl_stackedbar",
     "plot_fl_delta_bar",
     "plot_cs_stackedbar_multipct",
     "plot_sdi_boxplot",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Deprecation shim: treatment-evaluation API moved to ``tealom``.
+#
+# ``summarize_treatments`` / ``run_treatment_pipeline`` now live in
+# ``tealom.analyses.treatments`` (treatment *evaluation* belongs in TEALOM;
+# fb_tools provides the fire-modeling primitives).  They are re-exported here
+# lazily so existing ``from fb_tools import summarize_treatments`` code keeps
+# working with a warning.  The import is deferred to call time to avoid an
+# import-time cycle (tealom imports fb_tools).
+# ---------------------------------------------------------------------------
+_MOVED_TO_TEALOM = {"summarize_treatments", "run_treatment_pipeline"}
+
+
+def __getattr__(name):
+    if name in _MOVED_TO_TEALOM:
+        import warnings
+        warnings.warn(
+            f"fb_tools.{name} has moved to tealom.analyses.{name}. "
+            f"Import it as `from tealom.analyses import {name}`; the fb_tools "
+            f"alias is deprecated and will be removed in a future release.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        from tealom.analyses import treatments
+        return getattr(treatments, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -162,6 +162,9 @@ def apply_treatment(lcp, canopy_df, surface_df, scenario, band_map=None, mask=No
 
     out = lcp.copy(deep=True)
 
+    if mask is not None:
+        mask = mask.reindex_like(lcp.isel(band=0), fill_value=0)
+
     canopy_nm  = scenario["canopy"]
     surface_nm = scenario["surface"]
 

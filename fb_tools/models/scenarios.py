@@ -216,6 +216,7 @@ def run_batch(
     stack_out=False,
     cleanup=False,
     mask=None,
+    skip_existing=False,
 ):
     """
     Run all scenarios in *scenarios_df* and return a status summary.
@@ -250,6 +251,11 @@ def run_batch(
         Passed through to :func:`run_flammap_scenarios`.  If provided,
         output TIFFs are clipped to this geometry before stacking after
         each scenario completes.  Default ``None``.
+    skip_existing : bool
+        If ``True``, skip any scenario whose output directory already
+        contains at least one ``.tif`` file.  Useful for resuming a
+        partially-completed batch without re-running finished scenarios.
+        Default ``False``.
 
     Returns
     -------
@@ -275,6 +281,18 @@ def run_batch(
         out_dir.mkdir(parents=True, exist_ok=True)
 
         log_path = out_dir / "TestFlamMap_run.log"
+
+        if skip_existing and any(out_dir.glob("*.tif")):
+            print(f"[skip] {lcp_stem} / {scenario_name}")
+            summary_rows.append({
+                "Scenario":   scenario_name,
+                "LCP":        str(lcp_path),
+                "output_dir": str(out_dir),
+                "status":     "skipped",
+                "log_path":   str(log_path),
+            })
+            continue
+
         status = "success"
 
         try:

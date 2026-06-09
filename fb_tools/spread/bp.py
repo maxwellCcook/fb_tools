@@ -119,7 +119,9 @@ def delta_burn_probability(baseline_bp, treatment_bp, out_path=None, scale=100):
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_int = (delta * scale).round().astype("int16")
-        out_int.rio.to_raster(out_path, dtype="int16")
+        out_int.rio.to_raster(out_path, dtype="int16",
+                              compress="deflate", predictor=2,
+                              tiled=True, blockxsize=256, blockysize=256)
         print(f"Delta burn probability written to {out_path}")
 
     return delta
@@ -193,6 +195,18 @@ def aggregate_ignition_bp(
     if not baseline_bps:
         raise ValueError("No burn probability rasters provided.")
 
+    # Drop ignitions where either side produced no output (None)
+    valid_pairs = [
+        (bl, tr) for bl, tr in zip(baseline_bps, treated_bps)
+        if bl is not None and tr is not None
+    ]
+    n_dropped = len(baseline_bps) - len(valid_pairs)
+    if n_dropped:
+        print(f"Warning: {n_dropped} ignition(s) had missing outputs and were skipped.")
+    if not valid_pairs:
+        raise ValueError("No valid ignition pairs after filtering None outputs.")
+    baseline_bps, treated_bps = zip(*valid_pairs)
+
     bl_stack = _ensemble_stack(baseline_bps)
     tr_stack = _ensemble_stack(treated_bps)
 
@@ -207,9 +221,12 @@ def aggregate_ignition_bp(
     if out_dir is not None:
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        bl_mean.rio.to_raster(out_dir / f"{out_prefix}_baseline.tif")
-        tr_mean.rio.to_raster(out_dir / f"{out_prefix}_treated.tif")
-        delta_mean.rio.to_raster(out_dir / f"{out_prefix}_delta.tif")
+        # Float burn-probability means — plain DEFLATE (no predictor: the
+        # floating-point predictor tends to enlarge this kind of output).
+        _fkw = dict(compress="deflate", tiled=True, blockxsize=256, blockysize=256)
+        bl_mean.rio.to_raster(out_dir / f"{out_prefix}_baseline.tif", **_fkw)
+        tr_mean.rio.to_raster(out_dir / f"{out_prefix}_treated.tif", **_fkw)
+        delta_mean.rio.to_raster(out_dir / f"{out_prefix}_delta.tif", **_fkw)
         print(f"Ensemble burn probability ({len(baseline_bps)} ignitions) "
               f"written to {out_dir}")
 

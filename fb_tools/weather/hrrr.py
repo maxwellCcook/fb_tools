@@ -799,7 +799,7 @@ def wind_percentiles_from_cell_cache(
         percentiles = [0.25, 0.50, 0.75, 0.90, 0.97]
 
     cache_dir = Path(cache_dir)
-    files = sorted(cache_dir.glob("pyrome_*_wind.json"))
+    files = sorted(cache_dir.glob("pyrome_*[0-9]_wind.json"))
     result: dict[str, dict] = {}
 
     for path in files:

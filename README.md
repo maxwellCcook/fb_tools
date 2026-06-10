@@ -9,18 +9,24 @@ Python wrapper for CLI fire behavior models (FlamMap, FSPro, FSim, MTT) with too
 The geospatial stack must come from conda — do not let pip manage GDAL/rasterio.
 
 ```bash
-# Clone and set up the environment
+# 1. Clone the repository
 git clone https://github.com/maxwellCcook/fb_tools.git
 cd fb_tools
 
+# 2. One-time conda config — run once per machine, then forget it
+conda config --set channel_priority strict
+
+# 3. Create and activate the environment
 conda env create -f environment.yml
 conda activate fb_tools
 
-# Install in editable mode — --no-deps is critical
+# 4. Install in editable mode — --no-deps is critical
 pip install -e . --no-deps
 ```
 
-`--no-deps` prevents pip from overwriting conda's GDAL/PROJ/rasterio builds. Omitting it will break raster I/O.
+**`--no-deps` is critical:** conda builds GDAL, PROJ, and rasterio against shared C libraries. If pip re-resolves dependencies it overwrites those with PyPI wheels that carry their own GDAL — the two versions conflict at import time. `--no-deps` tells pip to install only `fb_tools` itself.
+
+**`channel_priority strict`:** prevents conda from silently mixing conda-forge and Anaconda `defaults` builds of the same C library, which causes DLL load failures — especially on Windows.
 
 **Optional** (not in conda-forge):
 ```bash

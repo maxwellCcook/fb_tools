@@ -127,15 +127,20 @@ def delta_burn_probability(baseline_bp, treatment_bp, out_path=None, scale=100):
     return delta
 
 
-def _ensemble_stack(bp_list):
-    """Align a list of burn-probability rasters to a common grid and stack them.
+def _ensemble_stack(bp_list, ref=None):
+    """Align a list of rasters to a common grid and stack along ``ignition``.
+
+    When *ref* is given, every raster is aligned to it — so that a baseline and
+    a treated stack share one grid and can be differenced per ignition.
+    Otherwise the first raster in the list is used as the reference.
 
     Returns a single DataArray with a leading ``ignition`` dimension.
     """
     das = [_open_bp(src) for src in bp_list]
-    ref = das[0]
-    aligned = [ref]
-    for da in das[1:]:
+    if ref is None:
+        ref = das[0]
+    aligned = []
+    for da in das:
         _, da_a = xr.align(ref, da, join="left")
         aligned.append(da_a)
     return xr.concat(aligned, dim=xr.Variable("ignition", range(len(aligned))))
@@ -146,41 +151,64 @@ def aggregate_ignition_bp(
     treated_bps,
     out_dir=None,
     out_prefix="ensemble",
+    paired=True,
 ):
     """
-    Aggregate per-ignition burn probability rasters into an ensemble surface.
+    Aggregate per-ignition rasters into an ensemble surface + treatment delta.
 
     Each ignition was run as a separate FSPro fire (see
     :func:`~fb_tools.models.container.prepare_counterfactual_ignition_set`).
-    This collapses the per-ignition burn-probability rasters into a single
-    ensemble surface by averaging across ignitions — every ignition is
-    weighted equally (i.e. treated as equally likely to occur).
+    This collapses the per-ignition rasters into a single ensemble surface,
+    weighting every ignition equally.  Works for any of the FSPro grids — burn
+    probability, average flame length, or average arrival time.
+
+    The treatment delta (``delta_mean``) can be formed two ways:
+
+    ``paired=True`` (default, recommended)
+        Compute the per-ignition difference ``baseline_i - treated_i`` on the
+        pixels that burned in *both* runs of that ignition (the two runs share
+        ``SPOTTING_SEED``, so they pair 1:1), then average those differences
+        across ignitions.  This is the robust estimator for grids defined only
+        where the fire burned (flame length, arrival time): it never differences
+        means taken over *different* subsets of ignitions.  For burn probability
+        (defined at every pixel) it is identical to ``paired=False``.
+
+    ``paired=False``
+        Average each side across ignitions first, then difference the means
+        (the original behaviour).
 
     Parameters
     ----------
     baseline_bps : list of str, Path, or xarray.DataArray
-        Per-ignition baseline burn-probability rasters.
+        Per-ignition baseline rasters.
     treated_bps : list of str, Path, or xarray.DataArray
-        Per-ignition treated burn-probability rasters.  Must be the same
-        length as *baseline_bps* and in matching ignition order.
+        Per-ignition treated rasters.  Must be the same length as
+        *baseline_bps* and in matching ignition order.
     out_dir : str or Path, optional
         If provided, writes ``{out_prefix}_baseline.tif``,
-        ``{out_prefix}_treated.tif``, and ``{out_prefix}_delta.tif`` here.
+        ``{out_prefix}_treated.tif``, ``{out_prefix}_delta.tif`` and
+        ``{out_prefix}_n_ignitions.tif`` here.
     out_prefix : str
         Filename prefix for written GeoTIFFs.  Default ``"ensemble"``.
+    paired : bool
+        Use the per-ignition paired delta (default ``True``).
 
     Returns
     -------
     dict
-        ``"baseline_mean"`` : xarray.DataArray
-            Mean burn probability across ignitions, baseline landscape.
-        ``"treated_mean"`` : xarray.DataArray
-            Mean burn probability across ignitions, treated landscape.
+        ``"baseline_mean"`` / ``"treated_mean"`` : xarray.DataArray
+            Mean across ignitions for each landscape.
         ``"baseline_max"`` / ``"treated_max"`` : xarray.DataArray
             Per-pixel maximum across ignitions (worst-case ignition).
         ``"delta_mean"`` : xarray.DataArray
-            ``baseline_mean - treated_mean`` — positive = treatments reduced
-            ensemble burn probability.
+            Treatment delta (see *paired*).  Positive = ``baseline > treated``.
+        ``"delta_std"`` : xarray.DataArray or None
+            Across-ignition standard deviation of the per-ignition delta — an
+            uncertainty surface (``paired=True`` only; ``None`` otherwise).
+        ``"n_ignitions"`` : xarray.DataArray
+            Per-pixel count of ignitions where *both* runs burned the pixel
+            (i.e. that contributed to the delta).  Use this to mask pixels
+            supported by too few ignitions.
 
     Raises
     ------
@@ -193,7 +221,7 @@ def aggregate_ignition_bp(
             f"({len(treated_bps)}) must have the same length."
         )
     if not baseline_bps:
-        raise ValueError("No burn probability rasters provided.")
+        raise ValueError("No rasters provided.")
 
     # Drop ignitions where either side produced no output (None)
     valid_pairs = [
@@ -207,28 +235,54 @@ def aggregate_ignition_bp(
         raise ValueError("No valid ignition pairs after filtering None outputs.")
     baseline_bps, treated_bps = zip(*valid_pairs)
 
-    bl_stack = _ensemble_stack(baseline_bps)
-    tr_stack = _ensemble_stack(treated_bps)
+    # Align BOTH sides to one reference grid so per-ignition pairs can be
+    # differenced cell-for-cell.
+    ref = _open_bp(baseline_bps[0])
+    bl_stack = _ensemble_stack(baseline_bps, ref=ref)
+    tr_stack = _ensemble_stack(treated_bps, ref=ref)
 
     bl_mean = bl_stack.mean(dim="ignition").astype("float32")
     tr_mean = tr_stack.mean(dim="ignition").astype("float32")
     bl_max  = bl_stack.max(dim="ignition").astype("float32")
     tr_max  = tr_stack.max(dim="ignition").astype("float32")
 
-    bl_mean.attrs = _open_bp(baseline_bps[0]).attrs
-    delta_mean = delta_burn_probability(bl_mean, tr_mean)
+    # Per-ignition paired difference: NaN for any ignition where either run did
+    # not burn the pixel, so only co-burned ignitions contribute.
+    per_ign_delta = bl_stack - tr_stack
+    n_ignitions   = per_ign_delta.notnull().sum(dim="ignition").astype("int16")
+
+    if paired:
+        # All-NaN pixels (no co-burned ignition) make numpy warn during the
+        # mean/std reductions; they correctly yield NaN, so silence the noise.
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            delta_mean = per_ign_delta.mean(dim="ignition").astype("float32")
+            delta_std  = per_ign_delta.std(dim="ignition").astype("float32")
+    else:
+        bl_mean.attrs = dict(ref.attrs)
+        delta_mean = delta_burn_probability(bl_mean, tr_mean)
+        delta_std  = None
+
+    # Preserve CRS on derived surfaces (arithmetic can drop the grid mapping).
+    crs = ref.rio.crs
+    delta_mean  = delta_mean.rio.write_crs(crs)
+    n_ignitions = n_ignitions.rio.write_crs(crs)
+    if delta_std is not None:
+        delta_std = delta_std.rio.write_crs(crs)
 
     if out_dir is not None:
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
-        # Float burn-probability means — plain DEFLATE (no predictor: the
-        # floating-point predictor tends to enlarge this kind of output).
+        # Float means/deltas — plain DEFLATE (no predictor: the floating-point
+        # predictor tends to enlarge this kind of output).
         _fkw = dict(compress="deflate", tiled=True, blockxsize=256, blockysize=256)
         bl_mean.rio.to_raster(out_dir / f"{out_prefix}_baseline.tif", **_fkw)
         tr_mean.rio.to_raster(out_dir / f"{out_prefix}_treated.tif", **_fkw)
         delta_mean.rio.to_raster(out_dir / f"{out_prefix}_delta.tif", **_fkw)
-        print(f"Ensemble burn probability ({len(baseline_bps)} ignitions) "
-              f"written to {out_dir}")
+        n_ignitions.rio.to_raster(out_dir / f"{out_prefix}_n_ignitions.tif", **_fkw)
+        print(f"Ensemble ({len(baseline_bps)} ignitions, "
+              f"{'paired' if paired else 'mean-diff'} delta) written to {out_dir}")
 
     return {
         "baseline_mean": bl_mean,
@@ -236,6 +290,8 @@ def aggregate_ignition_bp(
         "baseline_max":  bl_max,
         "treated_max":   tr_max,
         "delta_mean":    delta_mean,
+        "delta_std":     delta_std,
+        "n_ignitions":   n_ignitions,
     }
 
 

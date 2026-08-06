@@ -101,8 +101,23 @@ rows actually written (including `None → 0`); leaving it set without rows made
 ### FSPro counterfactual workflow
 Spatial container (HUC12/fireshed/POD) as analysis unit. Baseline vs. treated LCP runs share
 one input file and the same `SPOTTING_SEED` → paired comparison via `delta_burn_probability()`.
-Whether that pairing is *exact* (common random numbers) or merely statistical is the P0.1 question —
-`code/dev/FSPro/p0_experiments.py`, run on the VM.
+
+**P0.1 answered (2026-08-05, VM, 416 sample @ 100 fires / Duration 7): `SPOTTING_SEED` does NOT
+give common random numbers.** Two runs at the *same* seed differ on 66% of burned cells
+(|ΔBP| p95 = 0.07, max 0.18). Same-seed and different-seed noise are statistically
+indistinguishable (p95 0.07 vs 0.05) — the seed reaches only spotting, not the ERC stream or wind
+draws, so it buys **no variance reduction at all**. Consequences:
+- Pairing is statistical, never exact. **Every reported Δ needs a null band.**
+- Per-pixel ΔBP noise scales as 1/√N: p95 ≈ 0.022 at N=1,000, ≈ 0.011 at N=4,000.
+  Resolving a 0.01 BP effect needs **N ≈ 4,900**.
+- **`Σ BP × cell_area` (the Ager TF_ij estimator) is far more robust** — pixel errors average out.
+  Expected area burned varies only 1.46% run-to-run at N=100, ≈ 0.23% at N=4,000. Prefer
+  area-integrated transmission metrics over pixel-level ΔBP wherever the question allows.
+- Runtime measured at **1.22 s/fire at Duration 7** on this 740×783 @ 90 m grid → ~4.1 h per run at
+  `Duration=21, NumFires=4000`; 30 runs ≈ 5.1 days serial, ≈ 1.3 days at 4 concurrent processes.
+
+P0.2 (full runtime grid) and P0.3 (ignition footprint size) remain unrun — see
+`code/dev/FSPro/p0_experiments.py`.
 
 ### FSPro outputs
 - `_DailyAcres.txt` — `day,acres`, **daily increments**, one block of `Duration` rows per fire.

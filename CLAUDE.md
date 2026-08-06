@@ -20,6 +20,8 @@ pip install herbie-data
 fuelscape/
   lfps.py      — LFPS REST API client
   lcp.py       — stack_rasters, ignition ASCII/shapefile helpers, get_band_by_longname
+  ignitions.py — footprint sizing, FPA-FOD density surface, clustering test,
+                 downwind cone, select_design_ignitions  (Phase 2)
   adjust.py    — adjust_lcp, apply_treatment, build_surface_lut
 models/
   base.py      — run_cli(), _write_shortterm_inputs()
@@ -119,6 +121,79 @@ draws, so it buys **no variance reduction at all**. Consequences:
 P0.2 (full runtime grid) and P0.3 (ignition footprint size) remain unrun — see
 `code/dev/FSPro/p0_experiments.py`.
 
+### Phase 2 — domain, arms, and design fires
+**`prepare_fspro_experiment()` is the entry point.** `prepare_container_fspro` and
+`prepare_counterfactual_fspro` are frozen (one/two arms, one ignition, no new features);
+`prepare_counterfactual_ignition_set` is a deprecated alias that raises on the removed
+`sector_deg` / `require_treatment_intersect` kwargs.
+
+- **N arms**: `lcps={"untreated": …, "background": …, "coswap": …}` + `contrasts`
+  (default = every ordered pair, so the Phase 3 additivity check has all three).
+  Two-arm `baseline_lcp_path`/`treated_lcp_path` shim still works; mixing the two raises.
+  `runs.csv` gains an `Arm` column and a `w_i` column; `output_basename` is the arm name.
+- **Grid congruence is asserted before any run** — CRS, transform, and shape must match
+  across arms, because `xr.align(join="left")` in `delta_burn_probability` would silently
+  paper over a mismatch and return a plausible, wrong Δ surface.
+- **`domain_gdf` is never used to clip** — validation and manifest provenance only. It
+  warns when the LCPs don't cover the domain. `container_gdf` in
+  `postprocess_fspro_outputs` is documented display-only; Δ statistics run unclipped.
+- **`ignition_mode` has no default** (defect #1). Omitting it raises with an explanation.
+  `"container"` is kept only for reproducing an observed fire from its real perimeter.
+- **One shapefile per ignition** (P2.5). `create_random_ignitions` and
+  `create_fod_ignitions` now return `list[Path]` and take an `out_dir`, not an `out_path`.
+  Both used to write all N circles into one file, which FSPro reads as one fire starting
+  simultaneously at all N points. `create_fod_ignitions`' old docstring claim that
+  overlapping circles weight dense areas proportionally was false for the same reason.
+- **Ignition footprint** defaults to a **10-acre** day-1 perimeter (`footprint_acres`);
+  `None` gives the old half-pixel circle. P0.3 has not been run — revisit when it is.
+  `footprint_ac` is measured off the written polygon (≈9.999 for a nominal 10), not the
+  nominal circle.
+- **Downwind cone replaces the zero-width ray test.** Measured on the real LCP: the ray
+  kept 7,219 of 20,732 candidates where the cone keeps 20,656 — **the ray discarded 65%
+  of sources whose fire would burn straight through the treatment.** Half-angle defaults
+  to the narrowest arc holding 50% of non-calm fire-hour wind frequency
+  (`wind_cone_half_angle`) — **±38° for pyrome 47**, vs ±16° at 25% coverage.
+- **Design fires** are stratified over bearing × distance (default 3×2), allocated
+  proportional to each stratum's density mass with ≥1 per non-empty stratum, and drawn
+  within a stratum ∝ density. Weights are Horvitz–Thompson,
+  `w_i = stratum_mass / draws_in_stratum`, normalized to sum 1.
+- `ignition_density_surface` smooths on a **coarsened working grid** (σ ≈ 4 cells) and
+  resamples back. Smoothing at LCP resolution with a 20 km bandwidth is a 667-cell σ over
+  a heavily padded array and does not terminate.
+- **The public clustering function is `check_ignition_clustering`, not `test_*`** — a
+  public `test_`-prefixed name gets collected by pytest in any suite that imports it.
+
+### P2.2 ANSWERED — Ager's uniform-ignition assumption FAILS for Colorado
+`code/dev/FSPro/p2_ignition_clustering.{py,json}` (committed; `data/` is gitignored).
+FPA-FOD Class D–G, **1992–2024**, CO pyromes, 199 sims. Mean nearest-neighbour distance,
+observed ÷ CSR null:
+
+| subset | n | obs NN | null NN | ratio | p | L(r)−r @ 50 km |
+|---|---|---|---|---|---|---|
+| all     | 2,864 | 5,561 m | 7,715 m  | 0.721 | ≤0.01 | +11,074 |
+| natural | 1,355 | 7,322 m | 11,320 m | **0.647** | ≤0.01 | **+27,158** |
+| human   | 1,184 | 8,835 m | 12,118 m | 0.729 | ≤0.01 | +12,497 |
+
+All clustered; `L(r)−r` is outside the envelope at every radius 5–50 km. **The Natural
+(lightning) subset is the most clustered** — exactly the population Ager described as
+*"lightning caused and randomly located"*. Density-weighted sampling is therefore a real
+methodological improvement here, not a refinement.
+
+**Caveat to state when reporting:** the null is CSR over the pyrome polygons, *not*
+restricted to burnable fuel, because no pyrome-wide FBFM40 is on disk. Some of the
+clustering is fuel availability rather than ignition process. `mask_burnable=True` with
+an `lcp_fp` runs the stronger test once such a landscape exists.
+
+### FPA-FOD on disk — mind the vintage
+- **Authoritative, through 2024**: `/Users/mcc/Library/CloudStorage/Box-Box/MCC/data/
+  wildfire/FPA_FOD/RDS-2013-0009/Data/FPA_FOD_20260615.gpkg` — layer `Fires`, 2.66 M
+  records, EPSG:4269. Read with a `where=` clause (Class D–G over 7 states ≈ 1 s).
+- Everything under `data/spatial/raw/fpa_fod/` is **older**: the `SHP/Fires_ClassDEFG_*`
+  layers stop at **2022**, and `DRAFT_7th/FPA_FOD_DRAFT_7thED_points.shp` is a truncated
+  export holding only **1992–2009**. The `.accdb` beside it is the full draft 7th ed.
+- `_NB_CODES = {0, 91, 92, 93, 98, 99}` in `lcp.py` is **correct** — Scott & Burgan FBFM40
+  defines NB1/2/3/8/9 only; 94–97 are unassigned. (Plan flagged this as needing a check.)
+
 ### FSPro outputs
 - `_DailyAcres.txt` — `day,acres`, **daily increments**, one block of `Duration` rows per fire.
   This is the growth record; read with `read_daily_acres()`.
@@ -132,8 +207,11 @@ P0.2 (full runtime grid) and P0.3 (ignition footprint size) remain unrun — see
 ## Tests
 `pytest` from the repo root (conda env `fb_tools`). Tests needing model output or cached weather
 **skip** when absent, since `data/` is gitignored. `tests/conftest.py` holds the data paths.
-183 tests as of Phase 1: `test_fspro_input.py`, `test_fspro_outputs.py`, `test_erc_classes.py`,
-`test_current_erc.py`, `test_wind_cells.py`, `test_fspro_write_validation.py`, `test_fm_timeseries.py`.
+269 tests as of Phase 2: `test_fspro_input.py`, `test_fspro_outputs.py`, `test_erc_classes.py`,
+`test_current_erc.py`, `test_wind_cells.py`, `test_fspro_write_validation.py`,
+`test_fm_timeseries.py`, `test_ignitions.py`, `test_experiment_api.py`.
+The Phase 2 files depend on nothing in `data/` — `conftest.py` builds a synthetic
+heterogeneous LCP (`synth_lcp`) and a clustered point set (`synth_fod`) in-process.
 
 ## LANDFIRE layers
 Topo: `ELEV2020`, `SLPD2020`, `ASP2020`

@@ -174,15 +174,26 @@ def create_container_ignition(container_gdf, out_path):
     """
     Save a dissolved container polygon as an FSPro ignition shapefile.
 
-    FSPro accepts polygon or polyline ignitions via the ``IgnitionFile`` field.
-    This function dissolves all features in *container_gdf* to a single polygon
-    (the container boundary) and writes it as a shapefile.
+    .. warning::
+
+       ``IgnitionFile`` is a **starting fire perimeter**, not a sampling
+       domain.  Passing a whole container therefore starts every simulated
+       fire with the entire analysis unit already burned: burn probability is
+       ≈ 1.0 across the container by construction, so no treatment effect can
+       be measured inside it and every Δ statistic is diluted.  Measured on
+       the vendor 416 sample, **72.7% of pixels inside the ignition polygon
+       sit at BP ≥ 0.999, against 0.55% grid-wide.**
+
+       This suits exactly one use: reproducing an observed fire from its real
+       perimeter (the vendor's own README describes *"a polygon ignition file
+       based on an IR Perimeter"*).  For counterfactual or transmission work,
+       use :func:`~fb_tools.fuelscape.ignitions.select_design_ignitions`.
 
     Parameters
     ----------
     container_gdf : GeoDataFrame
-        Spatial container features (HUC12, fireshed, POD, etc.).
-        May have any CRS; it is written as-is.
+        Spatial container features (HUC12, fireshed, POD, etc.), or an
+        observed fire perimeter.  May have any CRS; it is written as-is.
     out_path : str or Path
         Destination shapefile path (e.g. ``"data/ignitions/huc12_ign.shp"``).
         Parent directory is created if it does not exist.
@@ -207,24 +218,22 @@ def create_random_ignitions(
     container_gdf,
     n_points: int,
     lcp_fp,
-    out_path,
+    out_dir,
     seed=None,
+    footprint_acres=None,
+    prefix="ign",
 ):
     """
     Generate spatially-distributed random ignition polygons within a container.
 
-    Samples *n_points* random pixel centers from burnable cells in *lcp_fp*
-    that fall inside *container_gdf*, then buffers each by half a pixel to
-    produce a set of small circle polygons suitable for FSPro's
-    ``IgnitionFile``.  Using many small ignition polygons instead of the full
-    container boundary forces FSPro to start each simulated fire from a
-    realistic, spatially-variable location rather than sampling uniformly from
-    the entire analysis area.
+    Samples *n_points* random pixel centres from burnable cells in *lcp_fp*
+    that fall inside *container_gdf*, buffers each into a small circular day-1
+    fire perimeter, and writes **one single-feature shapefile per ignition**.
 
     Non-burnable FBFM40 codes excluded from sampling: 0 (NoData) and
-    91–99 (NB1–NB5).  The FBFM40 band is located by searching raster band
-    descriptions for "FBFM"; band 4 is used as a fallback for standard
-    LANDFIRE LCP band order.
+    91/92/93/98/99 (NB1–NB3, NB8, NB9; 94–97 are unassigned in FBFM40).  The
+    FBFM40 band is located by searching raster band descriptions for "FBFM";
+    band 4 is used as a fallback for standard LANDFIRE LCP band order.
 
     Parameters
     ----------
@@ -232,32 +241,49 @@ def create_random_ignitions(
         Spatial container (HUC12, fireshed, POD, etc.).  May be in any CRS;
         it is reprojected to the LCP CRS internally.
     n_points : int
-        Target number of ignition points.  If fewer burnable pixels exist
-        inside the container, all burnable pixels are used and a warning is
-        printed.
+        Target number of ignitions.  If fewer burnable pixels exist inside
+        the container, all burnable pixels are used and a warning is printed.
     lcp_fp : str or Path
         Path to the landscape raster.  Used to determine CRS, pixel
         resolution, and burnable/non-burnable pixel locations.
-    out_path : str or Path
-        Destination shapefile path.  Parent directory is created if needed.
+    out_dir : str or Path
+        Destination **directory** for the per-ignition shapefiles, created if
+        needed.  Files are named ``{prefix}_000.shp``, ``_001`` …
     seed : int, optional
         Random seed for reproducibility.
+    footprint_acres : float, optional
+        Ignition footprint area in acres.  ``None`` (default) keeps the
+        historical half-pixel circle; see
+        :func:`~fb_tools.fuelscape.ignitions.footprint_radius_m` and
+        ``DEFAULT_FOOTPRINT_ACRES``.
+    prefix : str
+        Shapefile stem prefix.  Default ``"ign"``.
 
     Returns
     -------
-    Path
-        Absolute path to the written shapefile.
+    list of Path
+        One absolute shapefile path per ignition.
 
     Raises
     ------
     ValueError
         If no burnable pixels are found inside the container.
+
+    Notes
+    -----
+    Prior to P2.5 this wrote all N circles into a **single** shapefile.  FSPro
+    treats one ``IgnitionFile`` as one fire's starting perimeter, so that gave
+    every simulated fire N simultaneous disjoint starts rather than N
+    independent design fires.  Each ignition now gets its own file, and each
+    needs its own FSPro run.
     """
     import numpy as np
     import rasterio
 
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    from .ignitions import build_ignition_footprints, write_ignition_shapefiles
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     rng = np.random.default_rng(seed)
 
@@ -289,15 +315,20 @@ def create_random_ignitions(
         idx = rng.choice(len(inside_pts), size=n_points, replace=False)
         sampled = inside_pts.iloc[idx].reset_index(drop=True)
 
-    sampled = sampled.copy()
-    sampled["geometry"] = sampled.geometry.buffer(buffer_dist)
-    sampled[["geometry"]].to_file(out_path)
+    sampled = sampled.copy().reset_index(drop=True)
+    sampled["ign_id"] = np.arange(len(sampled))
+
+    foot = build_ignition_footprints(
+        sampled, acres=footprint_acres, lcp_res_m=buffer_dist * 2.0
+    )
+    shp_paths = write_ignition_shapefiles(foot, out_dir, prefix=prefix,
+                                          id_col="ign_id")
 
     print(
-        f"  [create_random_ignitions] {len(sampled)} ignition circles "
-        f"(buffer={buffer_dist:.1f} m, seed={seed}) → {out_path.name}"
+        f"  [create_random_ignitions] {len(foot)} ignition(s) "
+        f"({foot['footprint_ac'].iloc[0]:.2f} ac each, seed={seed}) → {out_dir}"
     )
-    return out_path.resolve()
+    return shp_paths
 
 
 def _bearing_deg(p_from, p_to):
@@ -357,6 +388,18 @@ def create_directional_ignitions(
 ):
     """
     Generate single-feature ignition shapefiles upwind of a treatment cluster.
+
+    .. deprecated:: P2.3
+
+       Superseded by
+       :func:`~fb_tools.fuelscape.ignitions.select_design_ignitions`, which
+       adds the FPA-FOD ignition-likelihood weights *w_i* required by the
+       Ager transmission estimator, stratifies across approach bearing and
+       distance, and replaces this function's zero-width ``LineString`` ray
+       test with a downwind spread cone.  The ray test asks only whether one
+       exact bearing clips the treatment polygon and ignores fire width
+       entirely, so it rejects candidates that would burn straight through the
+       treatment.  Retained for reproducing pre-Phase-2 runs.
 
     Implements an "upwind toward values" experimental design.  Ignitions are
     placed upwind of the treatment cluster (using the meteorological FROM wind
@@ -537,17 +580,18 @@ def create_fod_ignitions(
     container_gdf,
     fod_gdf,
     lcp_fp,
-    out_path,
-    buffer_m=None,
+    out_dir,
+    footprint_acres=None,
+    prefix="fod_ign",
 ):
     """
-    Build an FSPro ignition shapefile from historical FPA-FOD point locations.
+    Build FSPro ignitions from historical FPA-FOD point locations.
 
-    Clips *fod_gdf* to *container_gdf*, reprojects to the LCP CRS, and
-    buffers each point by half a pixel (or *buffer_m*) to produce a set of
-    small circle polygons.  Using historical ignition locations grounds the
-    FSPro simulation in where fires have actually started within the analysis
-    unit rather than drawing uniformly from the full container area.
+    Clips *fod_gdf* to *container_gdf*, reprojects to the LCP CRS, buffers
+    each point into a small circular day-1 fire perimeter, and writes **one
+    single-feature shapefile per ignition**.  Historical ignition locations
+    ground each design fire in where fires have actually started rather than
+    drawing uniformly from the container area.
 
     Parameters
     ----------
@@ -559,18 +603,20 @@ def create_fod_ignitions(
         calling this function.  Any CRS is accepted; it is reprojected
         internally.
     lcp_fp : str or Path
-        Path to the landscape raster.  Used to determine CRS and default
-        buffer distance.
-    out_path : str or Path
-        Destination shapefile path.  Parent directory is created if needed.
-    buffer_m : float, optional
-        Buffer radius in the LCP's linear units (usually metres).  Defaults
-        to half the minimum pixel dimension so each circle covers one pixel.
+        Path to the landscape raster.  Used to determine CRS and cell size.
+    out_dir : str or Path
+        Destination **directory** for the per-ignition shapefiles, created if
+        needed.  Files are named ``{prefix}_000.shp``, ``_001`` …
+    footprint_acres : float, optional
+        Ignition footprint area in acres.  ``None`` (default) keeps the
+        historical half-pixel circle.
+    prefix : str
+        Shapefile stem prefix.  Default ``"fod_ign"``.
 
     Returns
     -------
-    Path
-        Absolute path to the written shapefile.
+    list of Path
+        One absolute shapefile path per historical ignition.
 
     Raises
     ------
@@ -579,23 +625,27 @@ def create_fod_ignitions(
 
     Notes
     -----
-    Overlapping circles are intentional — densely-ignited areas will receive
-    proportionally more simulated fire starts, reflecting the historical
-    ignition density.
+    This previously wrote every circle into a single shapefile, with a
+    docstring claiming that overlapping circles weighted densely-ignited areas
+    proportionally.  That is not how FSPro reads ``IgnitionFile``: all features
+    in one file are one fire's starting perimeter, so every simulated fire
+    began simultaneously at *all* historical ignition points.  Ignition
+    likelihood is now expressed through the weights *w_i* attached by
+    :func:`~fb_tools.fuelscape.ignitions.select_design_ignitions`, not through
+    overlapping geometry.
     """
+    import numpy as np
     import rasterio
     import geopandas as gpd
 
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    from .ignitions import build_ignition_footprints, write_ignition_shapefiles
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     with rasterio.open(lcp_fp) as src:
         crs = src.crs
-        res_x, res_y = src.res
-        default_buffer = min(res_x, res_y) / 2.0
-
-    if buffer_m is None:
-        buffer_m = default_buffer
+        res_m = min(src.res)
 
     container_proj = container_gdf.to_crs(crs)
     fod_proj = fod_gdf.to_crs(crs)
@@ -609,14 +659,18 @@ def create_fod_ignitions(
         )
 
     result = fod_clipped[["geometry"]].copy().reset_index(drop=True)
-    result["geometry"] = result.geometry.buffer(buffer_m)
-    result.to_file(out_path)
+    result["ign_id"] = np.arange(len(result))
+
+    foot = build_ignition_footprints(result, acres=footprint_acres,
+                                     lcp_res_m=res_m)
+    shp_paths = write_ignition_shapefiles(foot, out_dir, prefix=prefix,
+                                          id_col="ign_id")
 
     print(
-        f"  [create_fod_ignitions] {len(result)} historical ignition circles "
-        f"(buffer={buffer_m:.1f} m) → {out_path.name}"
+        f"  [create_fod_ignitions] {len(foot)} historical ignition(s) "
+        f"({foot['footprint_ac'].iloc[0]:.2f} ac each) → {out_dir}"
     )
-    return out_path.resolve()
+    return shp_paths
 
 
 def create_ignition_ascii(ign_gdf, ref_img_fp, out_ascii_fp):

@@ -60,6 +60,78 @@ def weather_dir() -> Path:
 
 
 @pytest.fixture(scope="session")
+def synth_lcp(tmp_path_factory) -> Path:
+    """
+    A small heterogeneous landscape raster, built in-process.
+
+    200 x 200 cells at 30 m (6 x 6 km), EPSG:5070, nine bands in LANDFIRE
+    order so band 4 is FBFM40.  Fuels are burnable (TU5 = 165) except a
+    non-burnable water stripe (NB8 = 98) and an agriculture block (NB3 = 93),
+    which gives the burnable-mask code something real to exclude.  No
+    dependency on `data/`, so ignition tests run on a clean clone.
+    """
+    import numpy as np
+    import rasterio
+    from rasterio.transform import from_origin
+
+    path = tmp_path_factory.mktemp("synth") / "synth_lcp.tif"
+    n, res = 200, 30.0
+    left, top = -800_000.0, 1_960_000.0
+
+    fbfm = np.full((n, n), 165, dtype="int16")
+    fbfm[90:100, :] = 98        # water stripe across the middle
+    fbfm[:, 160:180] = 93       # agriculture block on the east side
+
+    bands = {
+        1: np.full((n, n), 2500, dtype="int16"),   # ELEV
+        2: np.full((n, n), 20, dtype="int16"),     # SLPD
+        3: np.full((n, n), 180, dtype="int16"),    # ASP
+        4: fbfm,                                   # FBFM40
+        5: np.full((n, n), 45, dtype="int16"),     # CC
+        6: np.full((n, n), 150, dtype="int16"),    # CH
+        7: np.full((n, n), 15, dtype="int16"),     # CBH
+        8: np.full((n, n), 10, dtype="int16"),     # CBD
+        9: np.full((n, n), 9999, dtype="int16"),   # EVT
+    }
+    names = ["LF2020_Elev_CONUS", "LF2020_SlpD_CONUS", "LF2020_Asp_CONUS",
+             "LF2022_FBFM40_CONUS", "LF2022_CC_CONUS", "LF2022_CH_CONUS",
+             "LF2022_CBH_CONUS", "LF2022_CBD_CONUS", "LF2022_EVT_CONUS"]
+
+    profile = dict(
+        driver="GTiff", dtype="int16", count=9, height=n, width=n,
+        crs="EPSG:5070", transform=from_origin(left, top, res, res),
+        nodata=-9999,
+    )
+    with rasterio.open(path, "w", **profile) as dst:
+        for i, arr in bands.items():
+            dst.write(arr, i)
+            dst.set_band_description(i, names[i - 1])
+    return path
+
+
+@pytest.fixture(scope="session")
+def synth_fod(synth_lcp):
+    """Clustered synthetic ignition points over the west half of `synth_lcp`."""
+    import numpy as np
+    import geopandas as gpd
+    import rasterio
+
+    with rasterio.open(synth_lcp) as src:
+        crs, b = src.crs, src.bounds
+
+    rng = np.random.default_rng(11)
+    # Three tight clusters, all in the western half
+    centres = [(b.left + 1200, b.bottom + 1200),
+               (b.left + 1500, b.top - 1500),
+               (b.left + 2500, (b.top + b.bottom) / 2)]
+    xs, ys = [], []
+    for cx, cy in centres:
+        xs.extend(rng.normal(cx, 300, 40))
+        ys.extend(rng.normal(cy, 300, 40))
+    return gpd.GeoDataFrame(geometry=gpd.points_from_xy(xs, ys), crs=crs)
+
+
+@pytest.fixture(scope="session")
 def gridmet_df():
     """
     The GridMET fire-season climatology, loaded once per session.

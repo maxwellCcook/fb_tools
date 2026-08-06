@@ -7,17 +7,20 @@ simulation directory on macOS, ready for execution on Windows.
 
 Public API
 ----------
-prepare_container_fspro
-    Orchestrates LCP download, ignition creation, weather extraction, and
-    FSPro input file assembly.  Returns a manifest dict with all file paths.
+prepare_fspro_experiment
+    **The Phase 2 entry point.**  N treatment arms with declared contrasts,
+    density-weighted stratified design fires, one FSPro run per ignition per
+    arm, and a pre-defined simulation domain used for validation only.
 
 postprocess_fspro_outputs
     Converts FSPro ASC output grids to GeoTIFFs, optionally clips to the
-    container boundary, and stacks into a multi-band output.
+    container boundary (display only), and stacks into a multi-band output.
 
-prepare_counterfactual_fspro
-    Builds a paired baseline/treated run using a shared SPOTTING_SEED for
-    clean counterfactual comparison.
+prepare_container_fspro, prepare_counterfactual_fspro
+    Frozen pre-Phase-2 entry points: one and two arms respectively, each
+    building a single run from a single ``IgnitionFile``.  Retained for
+    reproducing existing runs and observed fires.  New work should use
+    ``prepare_fspro_experiment``.
 
 Platform note
 -------------
@@ -106,6 +109,298 @@ def _resolve_ignition_season_day(
         f"using ignition_season_day={equivalent}"
     )
     return equivalent
+
+
+def _resolve_arms(
+    lcps: "dict | None",
+    baseline_lcp_path: "str | Path | None",
+    treated_lcp_path: "str | Path | None",
+    contrasts: "list | None",
+) -> "tuple[dict, list]":
+    """
+    Normalize the two-arm and N-arm landscape arguments into one mapping.
+
+    Accepts either the N-arm form (``lcps={"untreated": ..., "background":
+    ..., "coswap": ...}``) or the legacy two-arm shim
+    (``baseline_lcp_path`` / ``treated_lcp_path``), never both.
+
+    Returns
+    -------
+    tuple
+        ``(arms, contrasts)`` — an insertion-ordered ``{arm_name: Path}``
+        mapping and a list of ``(arm_a, arm_b)`` pairs.  When *contrasts* is
+        omitted it defaults to every ordered pair in arm order, so three arms
+        give ``untreated−background``, ``untreated−coswap``,
+        ``background−coswap``.
+
+    Raises
+    ------
+    ValueError
+        If both forms are supplied, if neither is, if fewer than two arms are
+        given, or if a contrast names an arm that does not exist.
+    FileNotFoundError
+        If any landscape path does not exist.
+    """
+    legacy = baseline_lcp_path is not None or treated_lcp_path is not None
+    if lcps is not None and legacy:
+        raise ValueError(
+            "Pass either lcps={arm: path, ...} or the legacy "
+            "baseline_lcp_path/treated_lcp_path pair, not both."
+        )
+
+    if lcps is None:
+        if not legacy:
+            raise ValueError(
+                "No landscapes supplied. Pass lcps={'untreated': ..., "
+                "'background': ..., 'coswap': ...} (arm name → LCP path)."
+            )
+        if baseline_lcp_path is None or treated_lcp_path is None:
+            raise ValueError(
+                "The two-arm shim needs both baseline_lcp_path and "
+                "treated_lcp_path."
+            )
+        print("  [_resolve_arms] baseline_lcp_path/treated_lcp_path is the "
+              "two-arm shim; prefer lcps={'baseline': ..., 'treated': ...}.")
+        arms = {"baseline": Path(baseline_lcp_path),
+                "treated":  Path(treated_lcp_path)}
+    else:
+        arms = {str(k): Path(v) for k, v in lcps.items()}
+
+    if len(arms) < 2:
+        raise ValueError(
+            f"A counterfactual needs at least two arms, got {list(arms)}."
+        )
+
+    for name, path in arms.items():
+        if not path.exists():
+            raise FileNotFoundError(f"LCP for arm '{name}' not found: {path}")
+
+    names = list(arms)
+    if contrasts is None:
+        contrasts = [(names[i], names[j])
+                     for i in range(len(names)) for j in range(i + 1, len(names))]
+    else:
+        contrasts = [(str(a), str(b)) for a, b in contrasts]
+        for a, b in contrasts:
+            for n in (a, b):
+                if n not in arms:
+                    raise ValueError(
+                        f"Contrast ({a}, {b}) names arm '{n}', which is not in "
+                        f"lcps: {names}."
+                    )
+    return arms, contrasts
+
+
+def _assert_grid_congruence(arms: dict) -> dict:
+    """
+    Assert every arm's landscape shares one grid, and return that grid.
+
+    A paired difference between arms is only meaningful cell-for-cell.
+    ``xr.align(join="left")`` inside
+    :func:`~fb_tools.spread.bp.delta_burn_probability` would silently paper
+    over a mismatch, producing a Δ surface that looks plausible and is wrong,
+    so the check belongs here — before any run is launched.
+
+    Parameters
+    ----------
+    arms : dict
+        ``{arm_name: Path}`` landscape mapping.
+
+    Returns
+    -------
+    dict
+        ``crs``, ``transform``, ``width``, ``height``, ``res``, ``bounds`` of
+        the shared grid.
+
+    Raises
+    ------
+    ValueError
+        If any arm differs in CRS, transform, or shape.
+    """
+    import rasterio
+
+    grids = {}
+    for name, path in arms.items():
+        with rasterio.open(path) as src:
+            grids[name] = {
+                "crs":       src.crs,
+                "transform": src.transform,
+                "width":     src.width,
+                "height":    src.height,
+                "res":       src.res,
+                "bounds":    src.bounds,
+            }
+
+    ref_name = next(iter(grids))
+    ref = grids[ref_name]
+    problems = []
+    for name, g in grids.items():
+        if name == ref_name:
+            continue
+        if g["crs"] != ref["crs"]:
+            problems.append(
+                f"  {name}: CRS {g['crs'].to_string()} != "
+                f"{ref_name} {ref['crs'].to_string()}"
+            )
+        if (g["width"], g["height"]) != (ref["width"], ref["height"]):
+            problems.append(
+                f"  {name}: shape {g['width']}x{g['height']} != "
+                f"{ref_name} {ref['width']}x{ref['height']}"
+            )
+        if not np.allclose(np.asarray(g["transform"]).astype(float),
+                           np.asarray(ref["transform"]).astype(float)):
+            problems.append(
+                f"  {name}: transform {tuple(round(v, 4) for v in g['transform'])} "
+                f"!= {ref_name} {tuple(round(v, 4) for v in ref['transform'])}"
+            )
+
+    if problems:
+        raise ValueError(
+            "Arm landscapes are not on a congruent grid, so a paired "
+            "difference between them would compare different ground:\n"
+            + "\n".join(problems)
+            + "\nRebuild every arm LCP over the same pre-defined domain."
+        )
+
+    print(f"  [_assert_grid_congruence] {len(arms)} arm(s) congruent: "
+          f"{ref['width']}x{ref['height']} @ {ref['res'][0]:g} m, "
+          f"EPSG:{ref['crs'].to_epsg()}")
+    return ref
+
+
+def _check_domain(domain_gdf, grid: dict, label: str = "domain") -> dict:
+    """
+    Validate a pre-defined simulation domain against the landscape grid.
+
+    The domain is **never** used to clip.  Clipping the LCP to an analysis
+    unit makes the container edge a hard boundary fire cannot cross, which
+    truncates growth, biases burn probability low near the edge, and leaves
+    nowhere for fire to be transmitted *to* — TF_ij becomes unmeasurable.
+    This function only records provenance and warns when the landscape does
+    not actually cover the domain it claims to.
+
+    Parameters
+    ----------
+    domain_gdf : geopandas.GeoDataFrame or None
+        Pre-defined simulation domain, delineated outside the package.
+    grid : dict
+        Output of :func:`_assert_grid_congruence`.
+    label : str
+        Name used in messages.
+
+    Returns
+    -------
+    dict
+        Provenance for the manifest: ``crs``, ``bounds``, ``area_ha``,
+        ``n_features``, ``covered_by_lcp``.  Empty dict when *domain_gdf*
+        is None.
+    """
+    if domain_gdf is None:
+        return {}
+
+    from shapely.geometry import box
+
+    dom = domain_gdf.to_crs(grid["crs"])
+    try:
+        dom_union = dom.geometry.union_all()
+    except AttributeError:
+        dom_union = dom.geometry.unary_union
+
+    lcp_box = box(*grid["bounds"])
+    covered = lcp_box.contains(dom_union)
+    if not covered:
+        outside_ha = (dom_union.difference(lcp_box)).area / 10_000.0
+        print(f"  [_check_domain] Warning: {outside_ha:,.0f} ha of the {label} "
+              f"falls outside the landscape extent. Fire cannot grow there, so "
+              f"burn probability is biased low along that edge. Rebuild the "
+              f"LCPs over the full domain.")
+
+    return {
+        "crs":            grid["crs"].to_string(),
+        "bounds":         [round(v, 2) for v in dom_union.bounds],
+        "area_ha":        round(dom_union.area / 10_000.0, 1),
+        "n_features":     int(len(dom)),
+        "covered_by_lcp": bool(covered),
+    }
+
+
+def _resolve_single_ignition(
+    ignition_mode: "str | None",
+    container_proj,
+    lcp_path,
+    ign_dir: Path,
+    n_ignitions: int,
+    fod_gdf,
+    ignition_seed,
+    caller: str,
+):
+    """
+    Build the one ``IgnitionFile`` the frozen single-run entry points need.
+
+    ``ignition_mode`` has no default (P2.1).  It used to default to
+    ``"container"``, which dissolves the whole analysis unit and hands it to
+    FSPro as a starting fire perimeter — every simulated fire began with the
+    container already burned, at BP ≈ 1.0 throughout.  Because that silently
+    invalidates any treatment effect measured inside the container, the mode
+    must now be stated explicitly.
+
+    Raises
+    ------
+    ValueError
+        If *ignition_mode* is None or unrecognized, if ``"fod"`` is requested
+        without *fod_gdf*, or if a mode yields more than one ignition — which
+        needs one FSPro run each and therefore
+        :func:`prepare_fspro_experiment`.
+    """
+    from fb_tools.fuelscape.lcp import (
+        create_container_ignition,
+        create_random_ignitions,
+        create_fod_ignitions,
+    )
+
+    valid = ("container", "random", "fod")
+    if ignition_mode is None:
+        raise ValueError(
+            f"{caller} requires an explicit ignition_mode — one of {valid}.\n"
+            "It used to default to 'container', which passes the dissolved "
+            "analysis unit to FSPro as a *starting fire perimeter*: every "
+            "simulated fire begins with the whole container burned (72.7% of "
+            "pixels at BP >= 0.999 on the vendor 416 sample), so no treatment "
+            "effect inside it is measurable. Use 'container' only to reproduce "
+            "an observed fire from its real perimeter.\n"
+            "For design-fire transmission work use prepare_fspro_experiment()."
+        )
+    if ignition_mode not in valid:
+        raise ValueError(
+            f"Unknown ignition_mode={ignition_mode!r}; expected one of {valid}."
+        )
+
+    if ignition_mode == "container":
+        return create_container_ignition(
+            container_proj, ign_dir / "container_ignition.shp"
+        )
+
+    if ignition_mode == "random":
+        paths = create_random_ignitions(
+            container_proj, n_ignitions, lcp_path, ign_dir,
+            seed=ignition_seed, prefix="random_ign",
+        )
+    else:
+        if fod_gdf is None:
+            raise ValueError("ignition_mode='fod' requires fod_gdf to be provided.")
+        paths = create_fod_ignitions(container_proj, fod_gdf, lcp_path, ign_dir)
+
+    if len(paths) != 1:
+        raise ValueError(
+            f"ignition_mode={ignition_mode!r} produced {len(paths)} ignitions, but "
+            f"{caller} builds a single FSPro run from a single IgnitionFile.\n"
+            "FSPro treats every feature in one IgnitionFile as part of *one* "
+            "fire's starting perimeter, so N ignitions in one file give N "
+            "simultaneous disjoint starts in every simulation — not N design "
+            "fires. Each ignition needs its own input file and its own run: use "
+            "prepare_fspro_experiment(), or set n_ignitions=1."
+        )
+    return paths[0]
 
 
 def _load_weather_for_pyrome(
@@ -321,13 +616,22 @@ def prepare_container_fspro(
     current_erc_percentile: float = 80.0,
     current_erc_start_doy: "int | None" = None,
     current_erc_n_days: "int | None" = None,
-    ignition_mode: str = "container",
+    ignition_mode: "str | None" = None,
     n_ignitions: int = 200,
     fod_gdf=None,
     ignition_seed=None,
     **fspro_kwargs,
 ) -> dict:
     """Prepare a complete FSPro simulation directory for a spatial container.
+
+    .. deprecated:: Phase 2
+
+       Frozen in favour of :func:`prepare_fspro_experiment`, which handles N
+       treatment arms, density-weighted design fires, and one FSPro run per
+       ignition.  This function builds exactly **one** run from **one**
+       ``IgnitionFile``, which is only correct when that file is a single
+       starting fire perimeter.  Retained for reproducing an observed fire and
+       for pre-Phase-2 runs; it receives no new Phase 2+ features.
 
     Orchestrates landscape download, ignition file creation, pyrome weather
     extraction, and FSPro input file assembly.  All steps run on macOS; model
@@ -413,19 +717,29 @@ def prepare_container_fspro(
         than 1 raises — FSPro reads ``CurrentERCValues`` positionally from
         season day 1, so an interior slice shifted the whole stream (defect #3).
     ignition_mode : {"container", "random", "fod"}
-        Controls how the ``IgnitionFile`` is built.
+        **Required — there is no default.**  Controls how the single
+        ``IgnitionFile`` is built.
 
-        ``"container"`` (default)
-            Dissolves the full container polygon.  Uniform sampling across
-            the entire analysis area.
+        ``"container"``
+            Dissolves the full container polygon and hands it to FSPro as a
+            **starting fire perimeter**, so every simulated fire begins with
+            the whole analysis unit burned (72.7% of interior pixels at
+            BP ≥ 0.999 on the vendor 416 sample, against 0.55% grid-wide).
+            Correct only for reproducing an observed fire from its real
+            perimeter — never for a treatment-effect study.
         ``"random"``
-            Samples *n_ignitions* burnable pixels at random from within the
-            container and buffers each to a small circle.  Requires
-            ``lcp_path`` to be known (i.e. the LCP is available before
-            calling this function, or will be downloaded by it).
+            Samples burnable pixels at random from within the container.
+            Because each ignition is a separate fire needing its own run,
+            only ``n_ignitions=1`` is accepted here; use
+            :func:`prepare_fspro_experiment` for a design-fire set.
         ``"fod"``
             Uses historical FPA-FOD (or equivalent) point locations clipped
-            to the container.  Requires *fod_gdf*.
+            to the container.  Requires *fod_gdf*, and likewise accepts only
+            a single resulting ignition.
+
+        This parameter used to default to ``"container"`` (defect #1), which
+        silently made every treatment effect measured inside the container
+        unmeasurable.  Omitting it now raises.
     n_ignitions : int
         Number of random ignition points for ``ignition_mode="random"``.
         Default 200.
@@ -565,22 +879,11 @@ def prepare_container_fspro(
     )
 
     # ── 4. Ignition file ──────────────────────────────────────────────────────
-    if ignition_mode == "random":
-        ign_path = create_random_ignitions(
-            container_proj, n_ignitions, lcp_path,
-            ign_dir / "random_ignitions.shp", seed=ignition_seed,
-        )
-    elif ignition_mode == "fod":
-        if fod_gdf is None:
-            raise ValueError("ignition_mode='fod' requires fod_gdf to be provided.")
-        ign_path = create_fod_ignitions(
-            container_proj, fod_gdf, lcp_path,
-            ign_dir / "fod_ignitions.shp",
-        )
-    else:
-        ign_path = create_container_ignition(
-            container_proj, ign_dir / "container_ignition.shp"
-        )
+    ign_path = _resolve_single_ignition(
+        ignition_mode, container_proj, lcp_path, ign_dir,
+        n_ignitions, fod_gdf, ignition_seed,
+        caller="prepare_container_fspro",
+    )
     print(f"[prepare_container_fspro] Ignition ({ignition_mode}): {ign_path.name}")
 
     # ── 5. FSPro input file ───────────────────────────────────────────────────
@@ -650,7 +953,11 @@ def postprocess_fspro_outputs(
         Prefix used by FSPro for output filenames.  Default ``"fspro_out"``.
     container_gdf : geopandas.GeoDataFrame, optional
         If provided, each output GeoTIFF is clipped to this boundary after
-        conversion.
+        conversion.  **Display only.**  Every Δ statistic — ΔBP, ΔTF_ij,
+        Δ flame length, Δ arrival time — must be computed on the *unclipped*
+        grid: destinations for transmitted fire lie outside any one container
+        by definition, and clipping first discards exactly the pixels TF_ij is
+        about.  Clip afterwards, for maps.
     ref_lcp : str or Path, optional
         Reference LCP GeoTIFF.  Its CRS is injected into each output raster
         (FSPro ASC outputs carry no embedded CRS).  When omitted, the output
@@ -810,13 +1117,22 @@ def prepare_counterfactual_fspro(
     current_erc_start_doy: "int | None" = None,
     current_erc_n_days: "int | None" = None,
     seed: int = 617327,
-    ignition_mode: str = "container",
+    ignition_mode: "str | None" = None,
     n_ignitions: int = 200,
     fod_gdf=None,
     ignition_seed=None,
     **fspro_kwargs,
 ) -> dict:
     """Prepare paired baseline and treated FSPro runs for counterfactual analysis.
+
+    .. deprecated:: Phase 2
+
+       Frozen in favour of :func:`prepare_fspro_experiment`, which generalizes
+       this to N arms (``untreated`` / ``background`` / ``coswap``) with
+       declared contrasts, asserts grid congruence across arms, accepts a
+       pre-defined simulation domain, and builds density-weighted design fires
+       with one FSPro run each.  This function is hard-wired to two arms and
+       one ignition.  Retained for pre-Phase-2 runs; no new features.
 
     Assembles the shared experimental design — ignition file, pyrome weather,
     and a single FSPro input file with a fixed ``SPOTTING_SEED`` — for two
@@ -894,17 +1210,24 @@ def prepare_counterfactual_fspro(
         ``SPOTTING_SEED`` shared by both runs.  **Do not vary between
         baseline and treated.**  Default 617327.
     ignition_mode : {"container", "random", "fod"}
-        Controls how the shared ``IgnitionFile`` is built (same for both
-        baseline and treated runs).
+        **Required — there is no default.**  Controls how the shared
+        ``IgnitionFile`` is built (same for both baseline and treated runs).
 
-        ``"container"`` (default)
-            Dissolves the full container polygon.
+        ``"container"``
+            Dissolves the full container polygon and hands it to FSPro as a
+            **starting fire perimeter**, so every fire begins with the whole
+            analysis unit burned.  Correct only for reproducing an observed
+            fire — never for a treatment-effect study.
         ``"random"``
-            Samples *n_ignitions* burnable pixels at random from the
-            baseline LCP and buffers each to a small circle.
+            Samples burnable pixels at random from the baseline LCP.  Only
+            ``n_ignitions=1`` is accepted; see
+            :func:`prepare_fspro_experiment` for a design-fire set.
         ``"fod"``
             Uses historical FPA-FOD point locations clipped to the
-            container.  Requires *fod_gdf*.
+            container.  Requires *fod_gdf*; likewise single-ignition only.
+
+        This parameter used to default to ``"container"`` (defect #1).
+        Omitting it now raises.
     n_ignitions : int
         Number of random ignition points for ``ignition_mode="random"``.
         Default 200.
@@ -1046,22 +1369,11 @@ def prepare_counterfactual_fspro(
 
     # ── 4. Ignition file (shared by baseline and treated runs) ───────────────
     container_proj = container_gdf.to_crs(lcp_crs)
-    if ignition_mode == "random":
-        ign_path = create_random_ignitions(
-            container_proj, n_ignitions, baseline_lcp_path,
-            ign_dir / "random_ignitions.shp", seed=ignition_seed,
-        )
-    elif ignition_mode == "fod":
-        if fod_gdf is None:
-            raise ValueError("ignition_mode='fod' requires fod_gdf to be provided.")
-        ign_path = create_fod_ignitions(
-            container_proj, fod_gdf, baseline_lcp_path,
-            ign_dir / "fod_ignitions.shp",
-        )
-    else:
-        ign_path = create_container_ignition(
-            container_proj, ign_dir / "container_ignition.shp"
-        )
+    ign_path = _resolve_single_ignition(
+        ignition_mode, container_proj, baseline_lcp_path, ign_dir,
+        n_ignitions, fod_gdf, ignition_seed,
+        caller="prepare_counterfactual_fspro",
+    )
     print(f"[prepare_counterfactual_fspro] Ignition ({ignition_mode}): {ign_path.name}")
 
     # ── 5. Shared FSPro input file with fixed SPOTTING_SEED ───────────────────
@@ -1107,21 +1419,31 @@ def prepare_counterfactual_fspro(
     return manifest
 
 
-def prepare_counterfactual_ignition_set(
+def prepare_fspro_experiment(
     treatments_gdf,
     values_gdf,
     out_dir: "str | Path",
     weather_dir: "str | Path",
     pyromes_gdf,
-    baseline_lcp_path: "str | Path",
-    treated_lcp_path: "str | Path",
+    lcps: "dict | None" = None,
+    contrasts: "list | None" = None,
+    domain_gdf=None,
+    baseline_lcp_path: "str | Path | None" = None,
+    treated_lcp_path: "str | Path | None" = None,
+    fod_gdf=None,
+    density: "dict | None" = None,
+    density_bandwidth_m: "float | None" = None,
     wind_from_deg: "float | None" = None,
-    n_ignitions: int = 15,
-    dist_band_km: tuple = (2.0, 10.0),
-    sector_deg: float = 45.0,
-    require_treatment_intersect: bool = True,
-    num_fires: int = 1000,
-    duration: int = 5,
+    cone_half_angle_deg: "float | None" = None,
+    cone_coverage: float = 0.5,
+    n_ignitions: int = 10,
+    dist_band_km: tuple = (5.0, 25.0),
+    n_bearing_strata: int = 3,
+    n_distance_strata: int = 2,
+    footprint_acres: "float | None" = 10.0,
+    require_ordering: bool = True,
+    num_fires: int = 4000,
+    duration: int = 21,
     resolution: float = 90.0,
     erc_classes: "np.ndarray | None" = None,
     gridmet_csv: "str | Path | None" = None,
@@ -1135,68 +1457,121 @@ def prepare_counterfactual_ignition_set(
     ignition_seed=None,
     **fspro_kwargs,
 ) -> dict:
-    """Prepare a per-ignition counterfactual FSPro experiment ("upwind toward values").
+    """Prepare an N-arm FSPro transmission experiment from design fires.
 
-    Unlike :func:`prepare_counterfactual_fspro` — which builds a single
-    ``IgnitionFile`` that FSPro treats as one fire — this function generates
-    *N independent ignitions* placed upwind of a treatment cluster, and writes
-    one FSPro input file per ignition.  Each ignition becomes its own FSPro run
-    (``NumFires`` simulations), so per-ignition burn-probability and fire-growth
-    results can be aggregated across the ensemble.
+    The Phase 2 entry point, superseding
+    :func:`prepare_counterfactual_fspro` (two arms, one ignition) and
+    :func:`prepare_container_fspro` (one arm, one ignition).  It assembles:
 
-    All ignitions share the same pyrome weather and the same ``SPOTTING_SEED``,
-    and each input file is run against both the baseline and treated LCP — a
-    clean paired counterfactual.  ``SavePerimeters`` is forced on so per-fire
-    daily perimeters are available for early/extreme growth analysis.
+    - **N treatment arms** — ``lcps={"untreated": ..., "background": ...,
+      "coswap": ...}`` — with declared *contrasts*.  Because ``TestFSPro.exe``
+      takes the LCP as a runtime argument, **one input file serves every arm**,
+      so all pairwise contrasts share an ignition, a weather stream, and a
+      ``SPOTTING_SEED``, and cost scales as arms × design fires.
+    - **Design fires** selected by
+      :func:`~fb_tools.fuelscape.ignitions.select_design_ignitions`: candidates
+      drawn from an FPA-FOD ignition-likelihood surface, filtered so the
+      treatment lies inside the ignition's downwind spread cone and nearer than
+      the values, then stratified over approach bearing and distance.  Each
+      carries a weight *w_i* for ``Σ_i w_i · TF_ij``.
+    - **One FSPro input file and one run per ignition per arm**, tabulated in
+      ``runs.csv`` for :func:`~fb_tools.models.fspro.run_fspro_batch`.
+
+    The simulation domain is **not** derived here and is never used to clip.
+    Domain delineation is data prep, decided per study area; pass it as
+    *domain_gdf* for validation and manifest provenance only.  Clipping the
+    landscape to an analysis unit makes its edge a boundary fire cannot cross,
+    which truncates growth, biases burn probability low near the edge, and
+    leaves nowhere for fire to be transmitted *to* — TF_ij becomes
+    unmeasurable.
 
     Parameters
     ----------
     treatments_gdf : geopandas.GeoDataFrame
-        Treatment polygons (the treatment group under test).  Any CRS.
-    values_gdf : geopandas.GeoDataFrame
-        Values / assets to protect (WUI, communities, structures, POD).
-        Used to orient the ignition→treatments→values geometry.
+        Treatment polygons under test.  Any CRS.
+    values_gdf : geopandas.GeoDataFrame or None
+        Values to protect (WUI, structures, POD), orienting the
+        ignition → treatment → values geometry.  ``None`` skips the ordering
+        and downwind checks.
     out_dir : str or Path
         Root output directory.  Sub-directories created automatically::
 
             out_dir/
               ignitions/      ← ign_XXX.shp  (one feature each)
-              fspro_inputs/   ← ign_XXX.input  (one per ignition)
+              fspro_inputs/   ← ign_XXX.input  (one per ignition, all arms)
               runs.csv        ← scenario table for run_fspro_batch
+              ignition_density.tif   (when a density surface is built here)
               run_manifest.json
 
     weather_dir : str or Path
         Root weather cache directory (``pyrome_erc/``, ``pyrome_wind/``).
     pyromes_gdf : geopandas.GeoDataFrame or str or Path
         NIFC pyrome polygons, or a path read with ``geopandas.read_file``.
-    baseline_lcp_path, treated_lcp_path : str or Path
-        Pre-built landscape GeoTIFFs.  Must already exist.
+    lcps : dict, optional
+        Ordered ``{arm_name: lcp_path}``.  Arm names become the FSPro output
+        basenames and the ``Arm`` column of ``runs.csv``.  Every arm must sit
+        on a congruent grid — asserted before anything is written.
+    contrasts : list of tuple, optional
+        Declared ``(arm_a, arm_b)`` comparisons.  Defaults to every ordered
+        pair in arm order, so three arms give ``untreated−background``,
+        ``untreated−coswap``, and ``background−coswap``.
+    domain_gdf : geopandas.GeoDataFrame, optional
+        Pre-defined simulation domain.  **Validation and provenance only** —
+        never used to clip.  A warning is printed if the landscapes do not
+        cover it.
+    baseline_lcp_path, treated_lcp_path : str or Path, optional
+        Two-arm convenience shim, equivalent to
+        ``lcps={"baseline": ..., "treated": ...}``.  Cannot be combined with
+        *lcps*.
+    fod_gdf : geopandas.GeoDataFrame, optional
+        Historical ignition points (FPA-FOD, pre-filtered to large-fire-capable
+        records).  Used to build the density surface when *density* is not
+        supplied.  Omitting both gives uniform candidate weights — Ager's
+        assumption, which
+        :func:`~fb_tools.fuelscape.ignitions.check_ignition_clustering` rejects
+        for Colorado.
+    density : dict, optional
+        A pre-built surface from
+        :func:`~fb_tools.fuelscape.ignitions.ignition_density_surface`.
+        Takes precedence over *fod_gdf*.
+    density_bandwidth_m : float, optional
+        Kernel bandwidth when building the surface from *fod_gdf*.
     wind_from_deg : float, optional
-        Dominant wind direction (degrees FROM).  When ``None`` (default), it
-        is derived from the pyrome wind climatology via
-        :func:`~fb_tools.weather.dominant_wind_direction`.
+        Dominant wind direction, degrees FROM.  Derived from the pyrome wind
+        climatology when omitted.
+    cone_half_angle_deg : float, optional
+        Half-width of the downwind spread cone.  When omitted it is derived
+        from the pyrome wind-direction spread at *cone_coverage* via
+        :func:`~fb_tools.fuelscape.ignitions.wind_cone_half_angle`.
+    cone_coverage : float
+        Fraction of non-calm fire-hour wind frequency the derived cone spans.
+        Default 0.5.
     n_ignitions : int
-        Number of ignitions to generate.  Default 15.
+        Number of design fires.  Default 10 — the Part A target of 8–12
+        weighted source locations rather than a dense ensemble.
     dist_band_km : tuple of float
-        ``(min, max)`` upwind distance band from the treatment centroid, km.
-        Default ``(2, 10)``.
-    sector_deg : float
-        Angular width of the upwind placement wedge.  Default 45.
-    require_treatment_intersect : bool
-        Keep only ignitions whose downwind ray crosses the treatments.
+        ``(min, max)`` upwind distance from the treatment centroid, km.
+        Default ``(5, 25)``.
+    n_bearing_strata, n_distance_strata : int
+        Stratification grid.  Default 3 × 2.
+    footprint_acres : float or None
+        Ignition footprint area.  Default 10 ac; ``None`` gives a half-pixel
+        circle.
+    require_ordering : bool
+        Require the treatment nearer the ignition than the values are.
     num_fires : int
-        ``NumFires`` per ignition.  Default 1000.
+        ``NumFires`` per run.  Default 4000 — P0.1 measured per-pixel ΔBP
+        noise at p95 ≈ 0.011 there, against 0.07 at 100 fires.
     duration : int
-        ``Duration`` (max burn period, days).  Default 5 — the early window.
+        ``Duration`` in days.  Default 21.
     resolution : float
-        Output grid cell size, metres.  Default 90.
+        Output cell size, metres.  Default 90.
     erc_classes : np.ndarray, optional
         Pre-computed ERC class table ``(5, 10)``.
     gridmet_csv : str or Path, optional
-        GridMET CSV, used when ``erc_classes`` is not supplied.
+        GridMET CSV, used when *erc_classes* is not supplied.
     ignition_season_day : int
         1-based fire-season day of ignition (1 = April 1).  Default 80.
-        ``CurrentERCValues`` covers season days 1 … ignition-1.
     current_erc_mode : {"analog_year", "percentile", "median", "observed"}
         How the antecedent ERC stream is built.  Default ``"analog_year"``.
     analog_year : int, optional
@@ -1206,9 +1581,12 @@ def prepare_counterfactual_ignition_set(
     current_erc_start_doy, current_erc_n_days : int, optional
         Deprecated pre-P1.2 window keywords; a start other than day 1 raises.
     seed : int
-        Shared ``SPOTTING_SEED`` for all runs.  Default 617327.
+        Shared ``SPOTTING_SEED``.  Default 617327.  Note P0.1: this seeds only
+        spotting, **not** the ERC stream or wind draws, so it buys no variance
+        reduction and pairing between arms is statistical, never exact.  Every
+        reported Δ needs a null band.
     ignition_seed : int, optional
-        Random seed for ignition placement.
+        Random seed for design-fire selection.
     **fspro_kwargs
         Overrides for ``_FSPRO_DEFAULTS``.  ``pyrome_col`` is intercepted.
         ``SavePerimeters`` is forced to 1.
@@ -1216,24 +1594,43 @@ def prepare_counterfactual_ignition_set(
     Returns
     -------
     dict
-        Manifest with keys: ``baseline_lcp_path``, ``treated_lcp_path``,
-        ``pyrome_id``, ``wind_from_deg``, ``downwind_az``, ``seed``,
-        ``ignition_shapefiles`` (list), ``fspro_input_paths`` (list),
-        ``ignitions_gdf`` (GeoDataFrame), ``runs_df`` (DataFrame for
-        :func:`~fb_tools.models.fspro.run_fspro_batch`), ``runs_csv``,
-        ``out_dir``, ``manifest_path``.
+        ``"arms"``                : dict, arm name → LCP Path
+        ``"contrasts"``           : list of (arm_a, arm_b)
+        ``"grid"``                : shared grid metadata
+        ``"domain"``              : domain provenance (empty without *domain_gdf*)
+        ``"pyrome_id"``           : str
+        ``"wind_from_deg"``, ``"downwind_az"``, ``"cone_half_angle_deg"``
+        ``"seed"``                : int
+        ``"ignition_shapefiles"`` : list of Path
+        ``"fspro_input_paths"``   : list of Path
+        ``"ignitions_gdf"``       : GeoDataFrame with ``ign_id`` and ``w_i``
+        ``"ignition_weights"``    : dict, ``ign_id`` → *w_i*
+        ``"density_raster"``      : Path or None
+        ``"runs_df"``, ``"runs_csv"``, ``"out_dir"``, ``"manifest_path"``
+
+    Raises
+    ------
+    ValueError
+        If fewer than two arms are given, if arm landscapes are not congruent,
+        or if no design fire survives the transmission-geometry filters.
+    FileNotFoundError
+        If any arm's landscape does not exist.
 
     Notes
     -----
-    ``runs_df`` is laid out for ``run_fspro_batch`` — it organises outputs as
-    ``output_root/<lcp_stem>/<ign_XXX>/``.  Run it on Windows after patching
-    the ``IgnitionFile`` paths in each input file with
+    ``runs_df`` has one row per (ignition × arm) with columns ``Scenario``,
+    ``Arm``, ``LCP``, ``FSPro_input``, ``output_basename``, ``w_i``.  Run it on
+    Windows after patching ``IgnitionFile`` paths with
     :func:`patch_fspro_input_paths`.
     """
     import geopandas as gpd
     import pandas as pd
-    import rasterio
-    from fb_tools.fuelscape.lcp import create_directional_ignitions
+    from fb_tools.fuelscape.ignitions import (
+        ignition_density_surface,
+        select_design_ignitions,
+        wind_cone_half_angle,
+        write_density_raster,
+    )
     from fb_tools.models.fspro import build_treatment_pair
     from fb_tools.utils.geo import lookup_pyrome
     from fb_tools.weather.hrrr import dominant_wind_direction
@@ -1241,12 +1638,12 @@ def prepare_counterfactual_ignition_set(
     if isinstance(pyromes_gdf, (str, Path)):
         pyromes_gdf = gpd.read_file(pyromes_gdf)
 
-    baseline_lcp_path = Path(baseline_lcp_path)
-    treated_lcp_path  = Path(treated_lcp_path)
-    if not baseline_lcp_path.exists():
-        raise FileNotFoundError(f"baseline_lcp_path not found: {baseline_lcp_path}")
-    if not treated_lcp_path.exists():
-        raise FileNotFoundError(f"treated_lcp_path not found: {treated_lcp_path}")
+    # ── Arms, grid congruence, domain provenance (P2.0 / P2.0b) ──────────────
+    arms, contrasts = _resolve_arms(lcps, baseline_lcp_path, treated_lcp_path,
+                                    contrasts)
+    grid = _assert_grid_congruence(arms)
+    domain_info = _check_domain(domain_gdf, grid, label="simulation domain")
+    ref_lcp = next(iter(arms.values()))
 
     out_dir    = Path(out_dir).resolve()
     ign_dir    = out_dir / "ignitions"
@@ -1254,24 +1651,26 @@ def prepare_counterfactual_ignition_set(
     for d in (ign_dir, inputs_dir):
         d.mkdir(parents=True, exist_ok=True)
 
-    with rasterio.open(baseline_lcp_path) as src:
-        lcp_crs = src.crs
+    print(f"[prepare_fspro_experiment] {len(arms)} arm(s): {list(arms)}")
+    print(f"[prepare_fspro_experiment] {len(contrasts)} contrast(s): "
+          + ", ".join(f"{a}−{b}" for a, b in contrasts))
 
     # ── Dominant pyrome from the treatments + values footprint ───────────────
     pyrome_col = fspro_kwargs.pop("pyrome_col", "Pyrome_ID")
-    analysis_area = gpd.GeoDataFrame(
-        geometry=list(treatments_gdf.geometry) + list(values_gdf.geometry),
-        crs=treatments_gdf.crs,
-    ).to_crs(pyromes_gdf.crs)
+    geoms = list(treatments_gdf.to_crs(pyromes_gdf.crs).geometry)
+    if values_gdf is not None:
+        geoms += list(values_gdf.to_crs(pyromes_gdf.crs).geometry)
+    analysis_area = gpd.GeoDataFrame(geometry=geoms, crs=pyromes_gdf.crs)
     try:
         analysis_union = analysis_area.geometry.union_all()
     except AttributeError:
         analysis_union = analysis_area.geometry.unary_union
-    pyrome_id = str(lookup_pyrome(analysis_union, pyromes_gdf, pyrome_col=pyrome_col))
-    print(f"[prepare_counterfactual_ignition_set] Dominant pyrome: {pyrome_id}")
+    pyrome_id = str(lookup_pyrome(analysis_union, pyromes_gdf,
+                                  pyrome_col=pyrome_col))
+    print(f"[prepare_fspro_experiment] Dominant pyrome: {pyrome_id}")
 
-    # ── Weather (shared by every ignition and both landscapes) ───────────────
-    print("[prepare_counterfactual_ignition_set] Loading pyrome weather …")
+    # ── Weather (shared by every ignition and every arm) ─────────────────────
+    print("[prepare_fspro_experiment] Loading pyrome weather …")
     wx = _load_weather_for_pyrome(
         pyrome_id, weather_dir,
         ignition_season_day=_resolve_ignition_season_day(
@@ -1286,36 +1685,62 @@ def prepare_counterfactual_ignition_set(
         gridmet_csv=gridmet_csv,
     )
 
-    # ── Wind direction for upwind placement ──────────────────────────────────
+    # ── Wind direction and spread-cone half-angle ────────────────────────────
+    wind_dir = Path(weather_dir) / "pyrome_wind"
     if wind_from_deg is None:
-        wind_from_deg = dominant_wind_direction(
-            pyrome_id, Path(weather_dir) / "pyrome_wind"
-        )
-        print(f"[prepare_counterfactual_ignition_set] Dominant wind FROM "
+        wind_from_deg = dominant_wind_direction(pyrome_id, wind_dir)
+        print(f"[prepare_fspro_experiment] Dominant wind FROM "
               f"(pyrome climatology): {wind_from_deg:.0f}°")
+    if cone_half_angle_deg is None:
+        cone = wind_cone_half_angle(pyrome_id, wind_dir, coverage=cone_coverage)
+        cone_half_angle_deg = cone["half_angle_deg"]
+        print(f"[prepare_fspro_experiment] Spread cone ±"
+              f"{cone_half_angle_deg:.0f}° — the narrowest arc holding "
+              f"{cone_coverage:.0%} of non-calm fire-hour wind frequency "
+              f"(centred {cone['center_az']:.0f}°).")
 
-    # ── Directional ignition set ──────────────────────────────────────────────
-    ign = create_directional_ignitions(
+    # ── Ignition-likelihood surface (P2.2) ───────────────────────────────────
+    density_raster = None
+    if density is None and fod_gdf is not None:
+        print("[prepare_fspro_experiment] Building ignition density surface …")
+        density = ignition_density_surface(
+            fod_gdf, ref_lcp, bandwidth_m=density_bandwidth_m
+        )
+        density_raster = write_density_raster(
+            density, out_dir / "ignition_density.tif"
+        )
+    elif density is None:
+        print("[prepare_fspro_experiment] No fod_gdf or density surface — "
+              "candidates will be weighted uniformly (Ager's assumption). "
+              "check_ignition_clustering() rejects it for Colorado.")
+
+    # ── Design fires (P2.3 / P2.4 / P2.5) ────────────────────────────────────
+    ign = select_design_ignitions(
         treatments_gdf=treatments_gdf,
         values_gdf=values_gdf,
-        wind_from_deg=wind_from_deg,
-        lcp_fp=baseline_lcp_path,
+        lcp_fp=ref_lcp,
         out_dir=ign_dir,
+        wind_from_deg=wind_from_deg,
+        density=density,
         n_ignitions=n_ignitions,
         dist_band_km=dist_band_km,
-        sector_deg=sector_deg,
-        require_treatment_intersect=require_treatment_intersect,
+        cone_half_angle_deg=cone_half_angle_deg,
+        n_bearing_strata=n_bearing_strata,
+        n_distance_strata=n_distance_strata,
+        footprint_acres=footprint_acres,
+        require_ordering=require_ordering,
         seed=ignition_seed,
     )
-    ign_shps = ign["ignition_shapefiles"]
+    ign_shps    = ign["ignition_shapefiles"]
+    ignitions   = ign["ignitions_gdf"]
+    weights     = {int(r.ign_id): float(r.w_i) for r in ignitions.itertuples()}
 
-    # ── One FSPro input file per ignition (shared seed, SavePerimeters on) ────
+    # ── One FSPro input per ignition; one run per (ignition × arm) ───────────
     sim_params = {
         "NumFires": num_fires, "Duration": duration, "Resolution": resolution,
-        "SavePerimeters": 1,
     }
     sim_params.update(fspro_kwargs)
-    sim_params["SavePerimeters"] = 1  # always on — perimeter analysis needs it
+    sim_params["SavePerimeters"] = 1  # always on — growth analysis needs it
 
     input_paths = []
     run_rows = []
@@ -1337,42 +1762,91 @@ def prepare_counterfactual_ignition_set(
             **sim_params,
         )
         input_paths.append(inp)
-        run_rows.append({
-            "Scenario": scenario, "LCP": str(baseline_lcp_path),
-            "FSPro_input": str(inp), "output_basename": "baseline",
-        })
-        run_rows.append({
-            "Scenario": scenario, "LCP": str(treated_lcp_path),
-            "FSPro_input": str(inp), "output_basename": "treated",
-        })
+        for arm_name, arm_lcp in arms.items():
+            run_rows.append({
+                "Scenario":        scenario,
+                "Arm":             arm_name,
+                "LCP":             str(arm_lcp),
+                "FSPro_input":     str(inp),
+                "output_basename": arm_name,
+                "w_i":             weights.get(i, float("nan")),
+            })
 
     runs_df = pd.DataFrame(run_rows)
     runs_csv = out_dir / "runs.csv"
     runs_df.to_csv(runs_csv, index=False)
-    print(f"[prepare_counterfactual_ignition_set] {len(ign_shps)} ignition(s) → "
-          f"{len(runs_df)} FSPro runs (NumFires={num_fires}, Duration={duration})")
+    print(f"[prepare_fspro_experiment] {len(ign_shps)} design fire(s) × "
+          f"{len(arms)} arm(s) = {len(runs_df)} FSPro runs "
+          f"(NumFires={num_fires}, Duration={duration}, "
+          f"Resolution={resolution}m)")
 
     manifest = {
-        "baseline_lcp_path":    baseline_lcp_path,
-        "treated_lcp_path":     treated_lcp_path,
-        "pyrome_id":            pyrome_id,
-        "wind_from_deg":        float(wind_from_deg),
-        "downwind_az":          ign["downwind_az"],
-        "seed":                 seed,
-        "ignition_shapefiles":  [str(p) for p in ign_shps],
-        "fspro_input_paths":    [str(p) for p in input_paths],
-        "runs_csv":             runs_csv,
-        "out_dir":              out_dir,
+        "arms":               {k: str(v) for k, v in arms.items()},
+        "contrasts":          [list(c) for c in contrasts],
+        "grid":               {
+            "crs":    grid["crs"].to_string(),
+            "width":  grid["width"],
+            "height": grid["height"],
+            "res":    list(grid["res"]),
+            "bounds": [round(v, 2) for v in grid["bounds"]],
+        },
+        "domain":             domain_info,
+        "pyrome_id":          pyrome_id,
+        "wind_from_deg":      float(wind_from_deg),
+        "downwind_az":        ign["downwind_az"],
+        "cone_half_angle_deg": float(cone_half_angle_deg),
+        "seed":               seed,
+        "ignition_shapefiles": [str(p) for p in ign_shps],
+        "fspro_input_paths":  [str(p) for p in input_paths],
+        "ignition_weights":   weights,
+        "uniform_weights":    ign["uniform_weights"],
+        "density_raster":     str(density_raster) if density_raster else None,
+        "num_fires":          num_fires,
+        "duration":           duration,
+        "resolution":         resolution,
+        "runs_csv":           runs_csv,
+        "out_dir":            out_dir,
     }
     manifest_path = out_dir / "run_manifest.json"
     _write_manifest(manifest, manifest_path)
 
-    manifest["manifest_path"] = manifest_path
-    manifest["runs_df"]       = runs_df
-    manifest["ignitions_gdf"] = ign["ignitions_gdf"]
-    print(f"[prepare_counterfactual_ignition_set] Done. Manifest → {manifest_path}")
+    manifest["manifest_path"]  = manifest_path
+    manifest["runs_df"]        = runs_df
+    manifest["ignitions_gdf"]  = ignitions
+    manifest["arms"]           = arms
+    manifest["contrasts"]      = contrasts
+    manifest["density_raster"] = density_raster
+    print(f"[prepare_fspro_experiment] Done. Manifest → {manifest_path}")
     return manifest
 
+
+def prepare_counterfactual_ignition_set(*args, **kwargs) -> dict:
+    """Deprecated alias for :func:`prepare_fspro_experiment`.
+
+    .. deprecated:: Phase 2
+
+       Renamed and generalized.  The replacement takes N arms via
+       ``lcps={arm: path}`` (the ``baseline_lcp_path`` / ``treated_lcp_path``
+       shim still works), accepts a pre-defined ``domain_gdf``, asserts grid
+       congruence across arms, draws design fires from an FPA-FOD
+       ignition-likelihood surface with weights *w_i*, and replaces the
+       zero-width ray test with a wind-derived downwind spread cone.
+
+       Two argument changes to note when migrating: ``sector_deg`` and
+       ``require_treatment_intersect`` are gone — the cone geometry is set by
+       ``cone_half_angle_deg`` / ``cone_coverage`` and is always applied.
+    """
+    for gone in ("sector_deg", "require_treatment_intersect"):
+        if gone in kwargs:
+            raise TypeError(
+                f"{gone!r} is no longer accepted. The zero-width downwind ray "
+                "test it configured has been replaced by a spread cone — see "
+                "cone_half_angle_deg and cone_coverage on "
+                "prepare_fspro_experiment()."
+            )
+    print("  [prepare_counterfactual_ignition_set] Deprecated — "
+          "call prepare_fspro_experiment() instead.")
+    return prepare_fspro_experiment(*args, **kwargs)
 
 def patch_fspro_input_paths(
     input_file: "str | Path",

@@ -80,7 +80,10 @@ VENDOR_INPUT = VENDOR_DIR / "416inputsfile.input"
 VENDOR_LCP = VENDOR_DIR / "416lcp.lcp"
 VENDOR_IGN = VENDOR_DIR / "416ign.shp"
 
-DEFAULT_EXE = REPO_ROOT / "code" / "FB" / "TestFSPro" / "TestFSPro.exe"
+# The FB toolchain ships as one bin/ directory holding every executable plus the
+# DLLs they link against; TestFSPro.exe must stay beside them.  This matches the
+# vendor's own RunFSPro.bat, which invokes ``..\..\bin\TestFSPro``.
+DEFAULT_EXE = REPO_ROOT / "code" / "FB" / "bin" / "TestFSPro.exe"
 
 WORK_DIR = REPO_ROOT / "data" / "fspro_test" / "p0_experiments"
 RUNS_DIR = WORK_DIR / "runs"

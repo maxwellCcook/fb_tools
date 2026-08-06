@@ -32,7 +32,10 @@ models/
   fspro_validate.py — parse_fspro_input(), validate_fspro_input(), assert_valid_fspro_input()
   cell2fire.py — stub (NotImplementedError)
 spread/
-  bp.py        — delta_burn_probability, summarize_bp_treatments, downwind_treatment_effect
+  bp.py        — delta_burn_probability, aggregate_ignition_bp, summarize_bp_treatments,
+                 downwind_treatment_effect  (all reworked in Phase 3a)
+  noise.py     — P0.1 Monte Carlo null bands: bp_noise_floor, area_noise_floor,
+                 required_num_fires, annotate_noise_floor, describe_noise_floor
   perimeters.py — load_fspro_perimeters, summarize_early_growth, compare_growth
                   (BROKEN: _Perimeters.shp has malformed LinearRings — use fspro_outputs)
   fspro_outputs.py — read_daily_acres(), check_domain_adequacy()
@@ -194,6 +197,47 @@ an `lcp_fp` runs the stronger test once such a landscape exists.
 - `_NB_CODES = {0, 91, 92, 93, 98, 99}` in `lcp.py` is **correct** — Scott & Burgan FBFM40
   defines NB1/2/3/8/9 only; 94–97 are unassigned. (Plan flagged this as needing a check.)
 
+### Phase 3a — pre-flight correctness (branch `fspro-phase3a`)
+Scoped ahead of the COSWAP production test: fix what would silently corrupt results or
+waste a multi-day campaign. The analysis layer (P3.1 remainder, P3.3 transmission matrix,
+P3.4 exposure, P3.5 decomposition) is deliberately deferred to Phase 3b, to be built
+against real output.
+
+- **`summarize_bp_treatments` is a rewrite, not a patch — its signature changed.** The old
+  one called `geom_to_raster_crs` with **three** args against a two-arg signature, so it
+  raised `TypeError` on the first polygon and **had never run**. It now takes
+  `(zones_gdf, delta_bp=…)` or `(zones_gdf, baseline_bp=…, treatment_bp=…)` and computes
+  zonal stats on the **aligned** Δ raster. Returns `dBP_sum_ha` — the area-integrated
+  ΔTF_ij estimator — alongside the pixel means.
+- **`delta_burn_probability` writes explicit nodata** (`DELTA_NODATA = -32768`). Masked
+  pixels used to descale to a plausible-looking **−327.68**. Overflow is now rejected.
+- **Grid congruence is enforced at difference time** (`strict_grid=True`), not just in
+  `prepare_fspro_experiment`. `xr.align(join="left")` silently papers over a shape or
+  half-pixel transform mismatch and returns a plausible, wrong Δ surface.
+- **`aggregate_ignition_bp` consumes the design weights.** Phase 2 wrote `w_i` to
+  `runs.csv` and nothing read it. Weights are resolved against the **full** input list
+  before dropping ignitions with missing output, so a dropped arm cannot shift the
+  weight-to-ignition correspondence. `delta_std` is now written to disk.
+- **`n_ignitions` cannot detect co-burn for BP** — unburned interior pixels are `0.0`, not
+  nodata, so it equals the ignition count almost everywhere. **Use the new `n_burned`** to
+  mask BP surfaces; `n_ignitions` remains correct for FL/arrival grids, which are NaN
+  outside the burn.
+- **The ignition footprint is masked from every Δ statistic** (`ignition=` on all four
+  entry points; `ignitions=` takes one footprint per design fire).
+- **`downwind_treatment_effect`**: `src_crs` was hard-set to `None` on both branches, so
+  the reprojection was unreachable and a WGS84 polygon returned all-NaN. Now resolves CRS
+  from the object, then `src_crs`. FlamMap's `-1`/`-2` slope sentinels are rejected.
+- **`run_fspro(check=True)` is the highest-value fix for production.** `subprocess.run`
+  had no `check`, the return code was never read, and `run_fspro_batch` marked any
+  non-raising run `"success"`. A run now fails loudly unless it exits `0` **and** writes
+  output; the batch prints a failure summary and carries `Arm`/`w_i` through.
+
+**Noise floors (`spread/noise.py`).** P0.1 settled that every reported Δ needs a null band
+and nothing computed one. Calibrated on the P0.1 measurement (N=100, Duration 7: pixel
+|ΔBP| p95 0.07, area CV 1.46%) and scaled by 1/√N. `area_noise_floor(for_difference=True)`
+applies the √2 two-run inflation; the area calibration is a **CV on the total**, so
+`annotate_noise_floor(metric="area")` requires a `total_col`, not just the delta.
+
 ### FSPro outputs
 - `_DailyAcres.txt` — `day,acres`, **daily increments**, one block of `Duration` rows per fire.
   This is the growth record; read with `read_daily_acres()`.
@@ -207,11 +251,14 @@ an `lcp_fp` runs the stronger test once such a landscape exists.
 ## Tests
 `pytest` from the repo root (conda env `fb_tools`). Tests needing model output or cached weather
 **skip** when absent, since `data/` is gitignored. `tests/conftest.py` holds the data paths.
-269 tests as of Phase 2: `test_fspro_input.py`, `test_fspro_outputs.py`, `test_erc_classes.py`,
+335 tests as of Phase 3a: `test_fspro_input.py`, `test_fspro_outputs.py`, `test_erc_classes.py`,
 `test_current_erc.py`, `test_wind_cells.py`, `test_fspro_write_validation.py`,
-`test_fm_timeseries.py`, `test_ignitions.py`, `test_experiment_api.py`.
-The Phase 2 files depend on nothing in `data/` — `conftest.py` builds a synthetic
-heterogeneous LCP (`synth_lcp`) and a clustered point set (`synth_fod`) in-process.
+`test_fm_timeseries.py`, `test_ignitions.py`, `test_experiment_api.py`, plus Phase 3a's
+`test_bp_delta.py`, `test_noise_floor.py`, `test_fspro_runcheck.py`.
+The Phase 2/3a files depend on nothing in `data/` — `conftest.py` builds a synthetic
+heterogeneous LCP (`synth_lcp`) and a clustered point set (`synth_fod`) in-process, and
+`test_bp_delta.py` writes its own small BP rasters.
+`_assert_fspro_succeeded` is tested directly since `TestFSPro.exe` is Windows-only.
 
 ## LANDFIRE layers
 Topo: `ELEV2020`, `SLPD2020`, `ASP2020`

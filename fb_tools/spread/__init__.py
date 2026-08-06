@@ -11,6 +11,15 @@ from .bp import (
     aggregate_ignition_bp,
     summarize_bp_treatments,
     downwind_treatment_effect,
+    DELTA_NODATA,
+)
+from .noise import (
+    bp_noise_floor,
+    area_noise_floor,
+    required_num_fires,
+    annotate_noise_floor,
+    describe_noise_floor,
+    P01_REFERENCE,
 )
 from .perimeters import (
     load_fspro_perimeters,
@@ -29,6 +38,13 @@ __all__ = [
     "aggregate_ignition_bp",
     "summarize_bp_treatments",
     "downwind_treatment_effect",
+    "DELTA_NODATA",
+    "bp_noise_floor",
+    "area_noise_floor",
+    "required_num_fires",
+    "annotate_noise_floor",
+    "describe_noise_floor",
+    "P01_REFERENCE",
     "load_fspro_perimeters",
     "summarize_early_growth",
     "compare_growth",

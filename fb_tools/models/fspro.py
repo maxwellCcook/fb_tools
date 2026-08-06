@@ -535,6 +535,7 @@ def run_fspro(
     output_basename=None,
     num_fires_warn=1000,
     verbose=True,
+    check=True,
 ):
     """
     Run a single FSPro scenario.
@@ -568,17 +569,23 @@ def run_fspro(
         and one for the fire simulations — with elapsed time at each 10 %
         milestone.  Output is also written to the log file regardless.
         Set to ``False`` for silent execution (original behaviour).
+    check : bool
+        Raise ``RuntimeError`` unless FSPro exits ``0`` **and** writes at least
+        one output file (default ``True``).  ``TestFSPro.exe`` is not launched
+        with ``check=True``, so without this a crashed run looks identical to a
+        successful one — across a multi-day batch that means silent gaps found
+        only at analysis time.  Set ``False`` only to inspect a failure.
 
     Returns
     -------
     subprocess.CompletedProcess or subprocess.Popen
-        The completed process object.  Check ``.returncode`` for success
-        (``0`` = clean exit).
+        The completed process object.  ``.returncode`` is ``0`` on success.
 
     Raises
     ------
     RuntimeError
-        On non-Windows platforms (TestFSPro.exe is Windows-only).
+        On non-Windows platforms (TestFSPro.exe is Windows-only), or — when
+        *check* is ``True`` — if FSPro returns non-zero or writes no output.
     FileNotFoundError
         If *fspro_exe*, *lcp_fp*, or *input_file* does not exist.
 
@@ -635,7 +642,7 @@ def run_fspro(
 
     if verbose:
         print(f"[FSPro] Starting: {lcp_fp.name}  →  {output_directory.name}/")
-        return _run_fspro_verbose(cmd, log_path, num_fires_total, output_directory)
+        result = _run_fspro_verbose(cmd, log_path, num_fires_total, output_directory)
     else:
         with open(log_path, "w") as log:
             result = subprocess.run(
@@ -645,7 +652,52 @@ def run_fspro(
                 text=True,
                 cwd=str(output_directory),
             )
-        return result
+
+    if check:
+        _assert_fspro_succeeded(result, output_base, log_path)
+
+    return result
+
+
+def _assert_fspro_succeeded(result, output_base, log_path):
+    """
+    Raise unless the FSPro run both exited cleanly and wrote output.
+
+    ``TestFSPro.exe`` is not run with ``check=True`` — the return code has to be
+    inspected explicitly, and a zero exit is not on its own proof of success:
+    a run can terminate early and leave the output directory empty.  Without
+    both checks a crashed run is indistinguishable from a good one, which over
+    a multi-day batch means silent gaps discovered only at analysis time.
+
+    Parameters
+    ----------
+    result : subprocess.CompletedProcess or subprocess.Popen
+        Anything exposing ``.returncode``.
+    output_base : Path
+        Output base path (directory + basename, no extension).
+    log_path : Path
+        Run log, quoted in the error message.
+
+    Raises
+    ------
+    RuntimeError
+        If the return code is non-zero, or no output files were written.
+    """
+    rc = getattr(result, "returncode", None)
+    if rc is not None and rc != 0:
+        raise RuntimeError(
+            f"FSPro exited with return code {rc} (expected 0). "
+            f"The run failed — see the log at {log_path}."
+        )
+
+    produced = sorted(output_base.parent.glob(f"{output_base.name}*"))
+    if not produced:
+        raise RuntimeError(
+            f"FSPro exited cleanly (return code {rc}) but wrote no files "
+            f"matching '{output_base.name}*' in {output_base.parent}. "
+            f"Treating this as a failed run — see the log at {log_path}."
+        )
+    return True
 
 
 def run_fspro_batch(
@@ -656,6 +708,7 @@ def run_fspro_batch(
     input_file_col="FSPro_input",
     output_basename_col="output_basename",
     num_fires_warn=1000,
+    check=True,
 ):
     """
     Run all FSPro scenarios in *scenarios_df* and return a status summary.
@@ -694,12 +747,28 @@ def run_fspro_batch(
         (default ``"output_basename"``).
     num_fires_warn : int
         Passed through to :func:`run_fspro`.  Set to ``0`` to silence.
+    check : bool
+        Passed through to :func:`run_fspro` (default ``True``): a run that
+        exits non-zero or writes no output is recorded as ``error:``, not
+        ``success``.  Set ``False`` to let the batch continue past failures
+        while still recording the return code.
 
     Returns
     -------
     pd.DataFrame
-        One row per scenario with columns:
-        ``Scenario``, ``LCP``, ``output_dir``, ``status``, ``log_path``.
+        One row per scenario with columns: ``Scenario``, ``LCP``,
+        ``output_dir``, ``status``, ``returncode``, ``log_path``, plus ``Arm``
+        and ``w_i`` when present in *scenarios_df* (as in the ``runs.csv``
+        written by
+        :func:`~fb_tools.models.container.prepare_fspro_experiment`).
+        ``status`` is ``"success"`` only for runs that exited cleanly **and**
+        produced output.
+
+    Notes
+    -----
+    A failure summary is printed at the end.  Always check it before
+    differencing arms — a missing arm for one design fire silently biases that
+    contrast rather than failing.
     """
     output_root = Path(output_root)
     if lcp_dir is not None:
@@ -734,26 +803,51 @@ def run_fspro_batch(
 
         out_basename = row.get(output_basename_col, "fspro_out")
 
+        returncode = None
         try:
-            run_fspro(
+            result = run_fspro(
                 fspro_exe=fspro_exe,
                 lcp_fp=lcp_path,
                 input_file=inp,
                 output_directory=out_dir,
                 output_basename=str(out_basename) if out_basename else None,
                 num_fires_warn=num_fires_warn,
+                check=check,
             )
+            returncode = getattr(result, "returncode", None)
+            if not check and returncode not in (0, None):
+                status = f"error: FSPro returned {returncode}"
         except Exception as exc:
             status = f"error: {exc}"
 
-        summary_rows.append({
+        row_out = {
             "Scenario":   scenario_name,
             "LCP":        str(lcp_path),
             "output_dir": str(out_dir),
             "status":     status,
+            "returncode": returncode,
             "log_path":   str(log_path),
-        })
+        }
+        # Carry the arm and design-fire weight through when the caller passed a
+        # runs.csv from prepare_fspro_experiment, so the summary can be joined
+        # straight back to the experiment manifest.
+        for extra in ("Arm", "w_i"):
+            if extra in row.index:
+                row_out[extra] = row[extra]
+        summary_rows.append(row_out)
 
         print(f"[{status}] {lcp_stem} / {scenario_name}")
 
-    return pd.DataFrame(summary_rows)
+    summary = pd.DataFrame(summary_rows)
+
+    n_failed = int((summary["status"] != "success").sum())
+    if n_failed:
+        print(f"\n*** {n_failed} of {len(summary)} FSPro run(s) FAILED. ***")
+        for _, r in summary[summary["status"] != "success"].iterrows():
+            print(f"    {r['Scenario']}: {r['status']}")
+        print("    Exclude these from any delta before reporting — a missing "
+              "arm silently biases the contrast.")
+    else:
+        print(f"\nAll {len(summary)} FSPro run(s) completed successfully.")
+
+    return summary

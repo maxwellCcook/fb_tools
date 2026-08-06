@@ -9,6 +9,11 @@ from .scenarios import (
 )
 from .mtt import run_mtt, run_mtt_batch
 from .fspro import run_fspro, run_fspro_batch, build_fspro_inputs, build_treatment_pair
+from .fspro_validate import (
+    parse_fspro_input,
+    validate_fspro_input,
+    assert_valid_fspro_input,
+)
 from .container import (
     prepare_container_fspro,
     postprocess_fspro_outputs,
@@ -31,6 +36,9 @@ __all__ = [
     "run_fspro_batch",
     "build_fspro_inputs",
     "build_treatment_pair",
+    "parse_fspro_input",
+    "validate_fspro_input",
+    "assert_valid_fspro_input",
     "prepare_container_fspro",
     "postprocess_fspro_outputs",
     "prepare_counterfactual_fspro",

@@ -32,3 +32,11 @@ dependencies = [
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["fb_tools*"]
+
+# ── Tests ─────────────────────────────────────────────────────────────────────
+# Run with the conda env active:  pytest
+# Tests that need model output or cached weather skip when the data is absent.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+addopts = "-ra --strict-markers"

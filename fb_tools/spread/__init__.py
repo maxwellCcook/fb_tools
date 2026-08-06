@@ -17,8 +17,14 @@ from .perimeters import (
     summarize_early_growth,
     compare_growth,
 )
+from .fspro_outputs import (
+    read_daily_acres,
+    check_domain_adequacy,
+)
 
 __all__ = [
+    "read_daily_acres",
+    "check_domain_adequacy",
     "delta_burn_probability",
     "aggregate_ignition_bp",
     "summarize_bp_treatments",

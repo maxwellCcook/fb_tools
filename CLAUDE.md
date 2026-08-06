@@ -27,10 +27,13 @@ models/
   scenarios.py — load_scenarios, build_scenarios, run_batch, build_mtt_scenarios
   mtt.py       — run_mtt(), run_mtt_batch()
   fspro.py     — build_fspro_inputs(), build_treatment_pair(), run_fspro(), run_fspro_batch()
+  fspro_validate.py — parse_fspro_input(), validate_fspro_input(), assert_valid_fspro_input()
   cell2fire.py — stub (NotImplementedError)
 spread/
   bp.py        — delta_burn_probability, summarize_bp_treatments, downwind_treatment_effect
   perimeters.py — load_fspro_perimeters, summarize_early_growth, compare_growth
+                  (BROKEN: _Perimeters.shp has malformed LinearRings — use fspro_outputs)
+  fspro_outputs.py — read_daily_acres(), check_domain_adequacy()
   convert.py   — stub: lcp_to_cell2fire, build_cell2fire_weather
 suppression/
   roads.py     — fetch_osm_roads() via osmnx
@@ -68,13 +71,42 @@ Key sections and expected shapes:
 - `NumERCYears` / `NumWxPerYear`: typically 15 × 214 (April 1 – Oct 31)
 - `HistoricERCValues`: one row per year, 214 space-separated floats
 - `WindCellValues`: NumWindSpeeds rows × NumWindDirs cols (% frequency table)
-- ERC classes: 5 rows, each `lower upper fm1 fm10 fm100 fm_herb fm_woody spot_dist spot_prob spot2`
+- ERC classes: 5 rows, **descending ERC**, each
+  `MinERC MaxERC FM1 FM10 FM100 FMHerb FMWoody Duration SpotProbability SpotDelay` (spec p.4)
+  - **Column 8 is the daily burn period in minutes** (spec name `Duration`, distinct from the
+    run-level `Duration:` switch; echoed as `burnPeriod` in `_DayTypes.txt`). The `360/300/240/180/120`
+    ladder is 6h→2h and is a first-order control on daily growth. Historically mislabelled `spot_dist`.
+  - Fuel moisture must **fall as ERC rises** — every FM column non-decreasing down the rows
 - `CurrentERCValues`: ~79 days (climatological median for scenario runs)
-- `IgnitionFile`: polygon/polyline shapefile (NOT points) — use `create_container_ignition()`
+- Spec constraints: `MaxLag ≤ NumWxCurrYear < NumWxPerYear − Duration`; `NumForecast ∈ [0, Duration−1]`
+  with that many rows following; `PolyDegree ∈ [4,15]`; `CROWN_FIRE_METHOD ∈ {"Finney","ScottRheinhardt"}`
+  (**not** "Scott/Reinhardt"); forecast row order is `ERC WindSpeed WindDirection`
+- `WindCellValues` sums to ~100 **on its own**; `CalmValue` is stored separately, not subtracted
+- `IgnitionFile`: polygon/polyline shapefile (NOT points) — it is a **starting fire perimeter**, not a
+  sampling domain. BP ≈ 1.0 everywhere inside it by construction, so it must be masked out of every
+  Δ statistic, and a whole container must never be used as the ignition.
+
+Validate any written input with `assert_valid_fspro_input()` before running — it pins all of the above.
 
 ### FSPro counterfactual workflow
 Spatial container (HUC12/fireshed/POD) as analysis unit. Baseline vs. treated LCP runs share
 one input file and the same `SPOTTING_SEED` → paired comparison via `delta_burn_probability()`.
+Whether that pairing is *exact* (common random numbers) or merely statistical is the P0.1 question —
+`code/dev/FSPro/p0_experiments.py`, run on the VM.
+
+### FSPro outputs
+- `_DailyAcres.txt` — `day,acres`, **daily increments**, one block of `Duration` rows per fire.
+  This is the growth record; read with `read_daily_acres()`.
+- `_Perimeters.shp` — **cannot be loaded** (malformed LinearRings) and its DBF has no time field.
+- `_Ignitions.asc` — the ignition footprint already rasterized onto the output grid.
+- Also unread: `_FireStreams.txt`, `_ArrivalDistribution.shp`, `_DayTypes.txt`, `_ContainSummary.txt`,
+  `_EventCoverage.txt`, `_Suppression.asc`.
+- `Σ BP × cell_area` over the domain ≈ mean simulated fire size (verified within 7% on the p47 run) —
+  the identity behind the Ager `TF_ij` transmission estimator.
+
+## Tests
+`pytest` from the repo root (conda env `fb_tools`). Tests needing model output or cached weather
+**skip** when absent, since `data/` is gitignored. `tests/conftest.py` holds the data paths.
 
 ## LANDFIRE layers
 Topo: `ELEV2020`, `SLPD2020`, `ASP2020`

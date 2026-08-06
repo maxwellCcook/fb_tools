@@ -22,6 +22,12 @@ FSPRO_RUN_BASE = "fspro_p47"
 # Cached GridMET ERC climatology, one JSON per pyrome.
 PYROME_ERC_DIR = REPO_ROOT / "data" / "weather" / "pyrome_erc"
 
+# Weather cache root and the GEE-exported GridMET fire-season climatology.
+WEATHER_DIR = REPO_ROOT / "data" / "weather"
+GRIDMET_CSV = (
+    REPO_ROOT / "data" / "tabular" / "raw" / "weather" / "gridmet_clim_CO_pyromes.csv"
+)
+
 
 @pytest.fixture(scope="session")
 def repo_root() -> Path:
@@ -43,3 +49,26 @@ def fspro_run_dir() -> Path:
     if not FSPRO_RUN_DIR.is_dir():
         pytest.skip(f"FSPro run outputs not found: {FSPRO_RUN_DIR}")
     return FSPRO_RUN_DIR
+
+
+@pytest.fixture(scope="session")
+def weather_dir() -> Path:
+    """Root of the cached weather data (pyrome_erc/, flammap_rtma/, ...)."""
+    if not WEATHER_DIR.is_dir():
+        pytest.skip(f"weather cache not found: {WEATHER_DIR}")
+    return WEATHER_DIR
+
+
+@pytest.fixture(scope="session")
+def gridmet_df():
+    """
+    The GridMET fire-season climatology, loaded once per session.
+
+    Session-scoped because the CSV is ~30k rows and several tests rebuild ERC
+    class tables from it.  Consumers must not mutate the frame in place.
+    """
+    if not GRIDMET_CSV.exists():
+        pytest.skip(f"GridMET climatology not found: {GRIDMET_CSV}")
+    from fb_tools.weather.gridmet import load_gridmet_csv
+
+    return load_gridmet_csv(GRIDMET_CSV)

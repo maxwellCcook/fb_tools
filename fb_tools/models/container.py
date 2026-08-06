@@ -73,11 +73,50 @@ def _write_manifest(manifest: dict, out_path: Path) -> None:
         json.dump(serializable, f, indent=2)
 
 
+def _resolve_ignition_season_day(
+    ignition_season_day: int,
+    current_erc_start_doy: "int | None",
+    current_erc_n_days: "int | None",
+) -> int:
+    """
+    Resolve the ignition day, rejecting the pre-P1.2 window keywords.
+
+    ``current_erc_start_doy``/``current_erc_n_days`` described an arbitrary
+    interior slice of the fire season.  FSPro reads ``CurrentERCValues``
+    positionally from season day 1 (spec p.5), so any start other than day 1
+    silently shifted the antecedent stream (defect #3).
+    """
+    if current_erc_start_doy is None and current_erc_n_days is None:
+        return int(ignition_season_day)
+
+    start = 1 if current_erc_start_doy is None else int(current_erc_start_doy)
+    n = 79 if current_erc_n_days is None else int(current_erc_n_days)
+    equivalent = start + n
+    if start != 1:
+        raise ValueError(
+            f"current_erc_start_doy={current_erc_start_doy} is no longer supported. "
+            "CurrentERCValues must begin at fire-season day 1 (April 1) — FSPro "
+            "reads it positionally, so starting elsewhere shifts the whole "
+            "antecedent stream (spec p.5). Replace it with "
+            f"ignition_season_day={equivalent} to ignite on the same calendar day, "
+            f"or ignition_season_day={n + 1} to keep the same stream length."
+        )
+    print(
+        "  [prepare_*_fspro] current_erc_n_days is deprecated — "
+        f"using ignition_season_day={equivalent}"
+    )
+    return equivalent
+
+
 def _load_weather_for_pyrome(
     pyrome_id: "str | int",
     weather_dir: "str | Path",
-    current_erc_start_doy: int,
-    current_erc_n_days: int,
+    ignition_season_day: int,
+    current_erc_mode: str = "analog_year",
+    analog_year: "int | None" = None,
+    current_erc_percentile: float = 80.0,
+    max_lag: int = 30,
+    duration: int = 7,
     erc_classes: "np.ndarray | None" = None,
     gridmet_csv: "str | Path | None" = None,
 ) -> dict:
@@ -94,11 +133,20 @@ def _load_weather_for_pyrome(
               pyrome_erc/   ← pyrome_{id}_gridmet.json files
               pyrome_wind/  ← pyrome_{id}_wind.json files
 
-    current_erc_start_doy : int
-        1-based fire-season DOY (1 = April 1) at which ``CurrentERCValues``
-        begins.
-    current_erc_n_days : int
-        Length of the ``CurrentERCValues`` sequence.
+    ignition_season_day : int
+        1-based fire-season day of ignition (1 = April 1).  ``CurrentERCValues``
+        always starts at season day 1 and runs to the day before ignition, so
+        it carries ``ignition_season_day - 1`` values.
+    current_erc_mode : {"analog_year", "percentile", "median", "observed"}
+        How the antecedent ERC stream is built.  See
+        :func:`~fb_tools.weather.gridmet.build_current_erc_values`.
+    analog_year : int, optional
+        Force a specific year for ``current_erc_mode="analog_year"``.
+    current_erc_percentile : float
+        Quantile for ``current_erc_mode="percentile"``.
+    max_lag, duration : int
+        The run's ``MaxLag`` and ``Duration``, used to enforce the spec-p.5
+        window on the length of ``CurrentERCValues``.
     erc_classes : np.ndarray, optional
         Pre-computed ERC class table, shape ``(5, 10)``.  If provided,
         ``gridmet_csv`` is ignored for class building.
@@ -109,8 +157,11 @@ def _load_weather_for_pyrome(
     Returns
     -------
     dict
-        Keys: ``wind_cells``, ``calm_value``, ``erc_historic``,
-        ``erc_avg``, ``erc_std``, ``erc_classes``, ``current_erc``.
+        Keys: ``wind_cells``, ``calm_value``, ``speed_breaks``, ``dir_breaks``,
+        ``erc_historic``, ``erc_avg``, ``erc_std``, ``erc_classes``,
+        ``current_erc``, ``current_erc_meta``.  ``speed_breaks``/``dir_breaks``
+        are the bin edges the wind matrix was built on, or None when the cache
+        predates them.
 
     Raises
     ------
@@ -163,6 +214,23 @@ def _load_weather_for_pyrome(
     )
     wind_cells = wind_meta["WindCellValues"]   # already np.ndarray
     calm_value = float(wind_meta["CalmValue"])
+    # P1.5 — the cache records the bin edges the matrix was built on.  Dropping
+    # them let build_fspro_inputs fall back to its defaults, so a cache built
+    # with custom breaks silently contradicted its own frequency table.
+    speed_breaks = wind_meta.get("WindSpeedBreaks_mph")
+    dir_breaks = wind_meta.get("WindDirBreaks_deg")
+    if speed_breaks is not None and len(speed_breaks) != np.shape(wind_cells)[0]:
+        raise ValueError(
+            f"Pyrome {pyrome_id} wind cache is inconsistent: "
+            f"{len(speed_breaks)} speed breaks but the matrix has "
+            f"{np.shape(wind_cells)[0]} rows"
+        )
+    if dir_breaks is not None and len(dir_breaks) != np.shape(wind_cells)[1]:
+        raise ValueError(
+            f"Pyrome {pyrome_id} wind cache is inconsistent: "
+            f"{len(dir_breaks)} direction breaks but the matrix has "
+            f"{np.shape(wind_cells)[1]} columns"
+        )
 
     # Historic ERC
     erc_meta = load_gridmet_pyrome_cache(
@@ -175,12 +243,19 @@ def _load_weather_for_pyrome(
     erc_avg = stats[pyrome_id]["avg"]
     erc_std = stats[pyrome_id]["std"]
 
-    # Current ERC (climatological median window)
-    current_erc = build_current_erc_values(
+    # Current-season ERC — always season day 1 up to the day before ignition.
+    current_erc_meta = build_current_erc_values(
         {pyrome_id: erc_historic},
-        start_doy=current_erc_start_doy,
-        n_days=current_erc_n_days,
+        ignition_season_day=ignition_season_day,
+        mode=current_erc_mode,
+        years=erc_meta.get("years"),
+        analog_year=analog_year,
+        percentile=current_erc_percentile,
+        max_lag=max_lag,
+        duration=duration,
+        return_meta=True,
     )[pyrome_id]
+    current_erc = current_erc_meta["values"]
 
     # ERC classes — priority: explicit array > cache JSON > on-the-fly from CSV
     if erc_classes is not None:
@@ -198,7 +273,7 @@ def _load_weather_for_pyrome(
                 f"Pyrome '{pyrome_id}' not found in {gridmet_csv}. "
                 "Check that the CSV contains this pyrome ID."
             )
-        erc_classes_dict = build_erc_classes(df_p)
+        erc_classes_dict = build_erc_classes(df_p, weather_dir=weather_dir)
         erc_classes = erc_classes_dict[pyrome_id]
     else:
         raise ValueError(
@@ -212,13 +287,16 @@ def _load_weather_for_pyrome(
         )
 
     return {
-        "wind_cells":   wind_cells,
-        "calm_value":   calm_value,
-        "erc_historic": erc_historic,
-        "erc_avg":      erc_avg,
-        "erc_std":      erc_std,
-        "erc_classes":  erc_classes,
-        "current_erc":  current_erc,
+        "wind_cells":       wind_cells,
+        "calm_value":       calm_value,
+        "speed_breaks":     speed_breaks,
+        "dir_breaks":       dir_breaks,
+        "erc_historic":     erc_historic,
+        "erc_avg":          erc_avg,
+        "erc_std":          erc_std,
+        "erc_classes":      erc_classes,
+        "current_erc":      current_erc,
+        "current_erc_meta": current_erc_meta,
     }
 
 
@@ -237,8 +315,12 @@ def prepare_container_fspro(
     resolution: float = 90.0,
     erc_classes: "np.ndarray | None" = None,
     gridmet_csv: "str | Path | None" = None,
-    current_erc_start_doy: int = 91,
-    current_erc_n_days: int = 79,
+    ignition_season_day: int = 80,
+    current_erc_mode: str = "analog_year",
+    analog_year: "int | None" = None,
+    current_erc_percentile: float = 80.0,
+    current_erc_start_doy: "int | None" = None,
+    current_erc_n_days: "int | None" = None,
     ignition_mode: str = "container",
     n_ignitions: int = 200,
     fod_gdf=None,
@@ -309,11 +391,27 @@ def prepare_container_fspro(
     resolution : float
         Output grid cell size in metres (``Resolution``).  Default 90.0.
         Must be a multiple of the LCP cell size.
-    current_erc_start_doy : int
-        1-based fire-season DOY (1 = April 1) at which ``CurrentERCValues``
-        begins.  Default 91 (≈ July 1).
-    current_erc_n_days : int
-        Length of the current-season ERC sequence.  Default 79.
+    ignition_season_day : int
+        1-based fire-season day of ignition (1 = April 1).  Default 80
+        (≈ June 19).  ``CurrentERCValues`` runs from season day 1 to the day
+        before ignition, so it carries ``ignition_season_day - 1`` values, and
+        the spec-p.5 window ``MaxLag <= NumWxCurrYear < NumWxPerYear - Duration``
+        is enforced.
+    current_erc_mode : {"analog_year", "percentile", "median", "observed"}
+        How the antecedent ERC stream is built.  Default ``"analog_year"`` —
+        a real year's sequence, preserving variance and autocorrelation that a
+        cross-year median strips out.  See
+        :func:`~fb_tools.weather.gridmet.build_current_erc_values`.
+    analog_year : int, optional
+        Force a specific calendar year for ``current_erc_mode="analog_year"``.
+        When None, the year with the highest season-to-date ERC accumulation
+        is chosen.
+    current_erc_percentile : float
+        Quantile for ``current_erc_mode="percentile"``.  Default 80.
+    current_erc_start_doy, current_erc_n_days : int, optional
+        Deprecated pre-P1.2 window keywords.  ``current_erc_start_doy`` other
+        than 1 raises — FSPro reads ``CurrentERCValues`` positionally from
+        season day 1, so an interior slice shifted the whole stream (defect #3).
     ignition_mode : {"container", "random", "fod"}
         Controls how the ``IgnitionFile`` is built.
 
@@ -454,8 +552,14 @@ def prepare_container_fspro(
     wx = _load_weather_for_pyrome(
         pyrome_id,
         weather_dir,
-        current_erc_start_doy=current_erc_start_doy,
-        current_erc_n_days=current_erc_n_days,
+        ignition_season_day=_resolve_ignition_season_day(
+            ignition_season_day, current_erc_start_doy, current_erc_n_days
+        ),
+        current_erc_mode=current_erc_mode,
+        analog_year=analog_year,
+        current_erc_percentile=current_erc_percentile,
+        max_lag=int(fspro_kwargs.get("MaxLag", 30)),
+        duration=duration,
         erc_classes=erc_classes,
         gridmet_csv=gridmet_csv,
     )
@@ -494,6 +598,8 @@ def prepare_container_fspro(
         erc_std       = wx["erc_std"],
         erc_classes   = wx["erc_classes"],
         current_erc   = wx["current_erc"],
+        speed_breaks  = wx["speed_breaks"],
+        dir_breaks    = wx["dir_breaks"],
         ignition_file = ign_path,
         **sim_params,
     )
@@ -697,8 +803,12 @@ def prepare_counterfactual_fspro(
     resolution: float = 90.0,
     erc_classes: "np.ndarray | None" = None,
     gridmet_csv: "str | Path | None" = None,
-    current_erc_start_doy: int = 91,
-    current_erc_n_days: int = 79,
+    ignition_season_day: int = 80,
+    current_erc_mode: str = "analog_year",
+    analog_year: "int | None" = None,
+    current_erc_percentile: float = 80.0,
+    current_erc_start_doy: "int | None" = None,
+    current_erc_n_days: "int | None" = None,
     seed: int = 617327,
     ignition_mode: str = "container",
     n_ignitions: int = 200,
@@ -759,11 +869,27 @@ def prepare_counterfactual_fspro(
         Pre-computed ERC class table, shape ``(5, 10)``.
     gridmet_csv : str or Path, optional
         GEE-exported GridMET CSV, used when ``erc_classes`` is not provided.
-    current_erc_start_doy : int
-        1-based fire-season DOY (1 = April 1) at which ``CurrentERCValues``
-        begins.  Default 91 (≈ July 1).
-    current_erc_n_days : int
-        Length of the current-season ERC sequence.  Default 79.
+    ignition_season_day : int
+        1-based fire-season day of ignition (1 = April 1).  Default 80
+        (≈ June 19).  ``CurrentERCValues`` runs from season day 1 to the day
+        before ignition, so it carries ``ignition_season_day - 1`` values, and
+        the spec-p.5 window ``MaxLag <= NumWxCurrYear < NumWxPerYear - Duration``
+        is enforced.
+    current_erc_mode : {"analog_year", "percentile", "median", "observed"}
+        How the antecedent ERC stream is built.  Default ``"analog_year"`` —
+        a real year's sequence, preserving variance and autocorrelation that a
+        cross-year median strips out.  See
+        :func:`~fb_tools.weather.gridmet.build_current_erc_values`.
+    analog_year : int, optional
+        Force a specific calendar year for ``current_erc_mode="analog_year"``.
+        When None, the year with the highest season-to-date ERC accumulation
+        is chosen.
+    current_erc_percentile : float
+        Quantile for ``current_erc_mode="percentile"``.  Default 80.
+    current_erc_start_doy, current_erc_n_days : int, optional
+        Deprecated pre-P1.2 window keywords.  ``current_erc_start_doy`` other
+        than 1 raises — FSPro reads ``CurrentERCValues`` positionally from
+        season day 1, so an interior slice shifted the whole stream (defect #3).
     seed : int
         ``SPOTTING_SEED`` shared by both runs.  **Do not vary between
         baseline and treated.**  Default 617327.
@@ -906,8 +1032,14 @@ def prepare_counterfactual_fspro(
     wx = _load_weather_for_pyrome(
         pyrome_id,
         weather_dir,
-        current_erc_start_doy=current_erc_start_doy,
-        current_erc_n_days=current_erc_n_days,
+        ignition_season_day=_resolve_ignition_season_day(
+            ignition_season_day, current_erc_start_doy, current_erc_n_days
+        ),
+        current_erc_mode=current_erc_mode,
+        analog_year=analog_year,
+        current_erc_percentile=current_erc_percentile,
+        max_lag=int(fspro_kwargs.get("MaxLag", 30)),
+        duration=duration,
         erc_classes=erc_classes,
         gridmet_csv=gridmet_csv,
     )
@@ -946,6 +1078,8 @@ def prepare_counterfactual_fspro(
         erc_std       = wx["erc_std"],
         erc_classes   = wx["erc_classes"],
         current_erc   = wx["current_erc"],
+        speed_breaks  = wx["speed_breaks"],
+        dir_breaks    = wx["dir_breaks"],
         seed          = seed,
         **sim_params,
     )
@@ -991,8 +1125,12 @@ def prepare_counterfactual_ignition_set(
     resolution: float = 90.0,
     erc_classes: "np.ndarray | None" = None,
     gridmet_csv: "str | Path | None" = None,
-    current_erc_start_doy: int = 91,
-    current_erc_n_days: int = 79,
+    ignition_season_day: int = 80,
+    current_erc_mode: str = "analog_year",
+    analog_year: "int | None" = None,
+    current_erc_percentile: float = 80.0,
+    current_erc_start_doy: "int | None" = None,
+    current_erc_n_days: "int | None" = None,
     seed: int = 617327,
     ignition_seed=None,
     **fspro_kwargs,
@@ -1056,8 +1194,17 @@ def prepare_counterfactual_ignition_set(
         Pre-computed ERC class table ``(5, 10)``.
     gridmet_csv : str or Path, optional
         GridMET CSV, used when ``erc_classes`` is not supplied.
-    current_erc_start_doy, current_erc_n_days : int
-        Current-season ERC window (1 = April 1).  Defaults 91, 79.
+    ignition_season_day : int
+        1-based fire-season day of ignition (1 = April 1).  Default 80.
+        ``CurrentERCValues`` covers season days 1 … ignition-1.
+    current_erc_mode : {"analog_year", "percentile", "median", "observed"}
+        How the antecedent ERC stream is built.  Default ``"analog_year"``.
+    analog_year : int, optional
+        Force a specific year for ``current_erc_mode="analog_year"``.
+    current_erc_percentile : float
+        Quantile for ``current_erc_mode="percentile"``.  Default 80.
+    current_erc_start_doy, current_erc_n_days : int, optional
+        Deprecated pre-P1.2 window keywords; a start other than day 1 raises.
     seed : int
         Shared ``SPOTTING_SEED`` for all runs.  Default 617327.
     ignition_seed : int, optional
@@ -1127,8 +1274,14 @@ def prepare_counterfactual_ignition_set(
     print("[prepare_counterfactual_ignition_set] Loading pyrome weather …")
     wx = _load_weather_for_pyrome(
         pyrome_id, weather_dir,
-        current_erc_start_doy=current_erc_start_doy,
-        current_erc_n_days=current_erc_n_days,
+        ignition_season_day=_resolve_ignition_season_day(
+            ignition_season_day, current_erc_start_doy, current_erc_n_days
+        ),
+        current_erc_mode=current_erc_mode,
+        analog_year=analog_year,
+        current_erc_percentile=current_erc_percentile,
+        max_lag=int(fspro_kwargs.get("MaxLag", 30)),
+        duration=duration,
         erc_classes=erc_classes,
         gridmet_csv=gridmet_csv,
     )
@@ -1178,6 +1331,8 @@ def prepare_counterfactual_ignition_set(
             erc_std       = wx["erc_std"],
             erc_classes   = wx["erc_classes"],
             current_erc   = wx["current_erc"],
+            speed_breaks  = wx["speed_breaks"],
+            dir_breaks    = wx["dir_breaks"],
             seed          = seed,
             **sim_params,
         )

@@ -77,7 +77,13 @@ Key sections and expected shapes:
     run-level `Duration:` switch; echoed as `burnPeriod` in `_DayTypes.txt`). The `360/300/240/180/120`
     ladder is 6h→2h and is a first-order control on daily growth. Historically mislabelled `spot_dist`.
   - Fuel moisture must **fall as ERC rises** — every FM column non-decreasing down the rows
-- `CurrentERCValues`: ~79 days (climatological median for scenario runs)
+- `CurrentERCValues`: the season-to-date stream, **always starting at fire-season day 1 (April 1)**
+  and ending the day before ignition — FSPro reads it positionally, so an interior slice shifts the
+  whole stream (defect #3, fixed in P1.2). Build with
+  `build_current_erc_values(ignition_season_day=N, mode=...)`; length is `N − 1`.
+  Modes: `analog_year` (default — a real year's observed sequence, keeps variance/autocorrelation
+  and is nameable in a writeup), `percentile`, `median` (the old mild reference), `observed`.
+  The pre-P1.2 `start_doy=` keyword now raises.
 - Spec constraints: `MaxLag ≤ NumWxCurrYear < NumWxPerYear − Duration`; `NumForecast ∈ [0, Duration−1]`
   with that many rows following; `PolyDegree ∈ [4,15]`; `CROWN_FIRE_METHOD ∈ {"Finney","ScottRheinhardt"}`
   (**not** "Scott/Reinhardt"); forecast row order is `ERC WindSpeed WindDirection`
@@ -86,7 +92,11 @@ Key sections and expected shapes:
   sampling domain. BP ≈ 1.0 everywhere inside it by construction, so it must be masked out of every
   Δ statistic, and a whole container must never be used as the ignition.
 
-Validate any written input with `assert_valid_fspro_input()` before running — it pins all of the above.
+`build_fspro_inputs()` validates what it wrote and raises on any violation (P1.6). A rejected file is
+moved aside to `*.input.invalid` so it cannot be run by accident — FSPro does not validate, it just
+misreads. Pass `validate=False` to opt out. `NumForecast` is always synced to the number of forecast
+rows actually written (including `None → 0`); leaving it set without rows made FSPro consume
+`BarrierFill` / `SavePerimeters` / `IgnitionFile` as forecast records (defect #8).
 
 ### FSPro counterfactual workflow
 Spatial container (HUC12/fireshed/POD) as analysis unit. Baseline vs. treated LCP runs share
@@ -107,6 +117,8 @@ Whether that pairing is *exact* (common random numbers) or merely statistical is
 ## Tests
 `pytest` from the repo root (conda env `fb_tools`). Tests needing model output or cached weather
 **skip** when absent, since `data/` is gitignored. `tests/conftest.py` holds the data paths.
+183 tests as of Phase 1: `test_fspro_input.py`, `test_fspro_outputs.py`, `test_erc_classes.py`,
+`test_current_erc.py`, `test_wind_cells.py`, `test_fspro_write_validation.py`, `test_fm_timeseries.py`.
 
 ## LANDFIRE layers
 Topo: `ELEV2020`, `SLPD2020`, `ASP2020`
@@ -117,9 +129,17 @@ Band normalization (`adjust.py`, `plot.py`): strip region prefix + LF version/ye
 ## HRRR wind climatology — non-obvious constraints
 - Reliable archive starts **2016** (NOT 2014 — gaps pre-2016)
 - HRRR longitude grid is **0–360**; must normalize to −180/180 for WGS84 fire points
-- Fire hours UTC: `[19, 20, 21, 22]` ≈ 13:00–16:00 MDT
+- Fire hours UTC: `[19, 20, 21, 22]` = 13:00–16:00 MDT / 12:00–15:00 MST
 - Wind direction (met FROM): `wd_deg = (degrees(arctan2(-u, -v)) + 360) % 360`
 - KD-tree built once per HRRR file; vectorized query across all fire points
+- `build_pyrome_wind_cells(season_months=(4, 10))` filters to the fire season (P1.5) — before this
+  the only temporal filter was `year >= 2016`
+- NaN winds are **missing, not calm**: `ws >= threshold` is False for NaN, so archive gaps used to
+  inflate `CalmValue`. Missing obs are now dropped from both the table and the calm denominator.
+- `k_neighbors=9` samples a 3×3 (~9 km) neighbourhood — these are pseudo-replicates of one wind
+  observation, so `min_obs_warn` is applied to `n_noncalm / k_neighbors` (200 raw ≈ 22 independent)
+- `WindSpeedBreaks_mph` / `WindDirBreaks_deg` from the cache are forwarded into the input file;
+  they used to be dropped, so a cache with custom breaks contradicted its own matrix
 
 ## GEE assets (project: cfri-ee)
 - Pyromes: `projects/cfri-ee/assets/weather/Pyromes_CONUS_20200206`
@@ -130,9 +150,24 @@ Band normalization (`adjust.py`, `plot.py`): strip region prefix + LF version/ye
 - Source: GEE-exported CSV, pyrome mean per day, April 1–Oct 31, 2008–2022
 - CSV columns: `pyrome, date, year, doy, erc, fm100, fm1000, tmmx, tmmn` (K→°F on load), `rmin, vpd` (kPa→Pa)
 - Day-of-season pivot anchored to April 1 (1–214), leap-year-safe
-- ERC class row: `[lower, upper, fm1, fm10, fm100, fm_herb, fm_woody, spot_dist, spot_prob, spot2]`
-  - `fm_herb` / `fm_woody`: DOY-based seasonal curing (`calc_herb_fm`, `calc_woody_fm`) for FlamMap scenarios;
-    GSI-based (`calc_herb_fm_gsi` via `calc_gsi`) for FSPro ERC classes when `tmmn_f`, `vpd_pa`, `lat_deg` available
+- ERC class row: `[min_erc, max_erc, fm1, fm10, fm100, fm_herb, fm_woody, burn_period_min, spot_prob, spot_delay]`
+- **`build_erc_classes` defaults (Phase 1)** — `dead_fm_source="rtma"`, `live_fm_source="dead_fm"`,
+  `class_percentiles=[0, 60, 80, 90, 97, 100]`. This combination is monotonic in all 9 cached CO
+  pyromes; the validator rejects anything that is not.
+  - **dead FM** from the RTMA daily peak-hour cache (`flammap_rtma/rtma_daily_fm.parquet`), median
+    over each ERC band's dates. `"gridmet"` falls back to the NFDRS78 lag; the two agree within ~1%
+    at the extreme class and diverge only in mild classes.
+  - **live FM** scaled from that FM100 via `calc_live_fm_from_dead(herb_scale=6.5, woody_scale=9.0)`.
+    Extreme class lands at 32–69% herb / 60–95% woody — Ager et al. 2014 Table 7 is 40–60 / 60–90.
+  - `live_fm_source="gsi"` (RTMA GSI columns) is **measured non-monotonic in 4 of 9 pyromes** and
+    pins 6 of 9 extreme classes at the 30/60 dormant floor. `"doy"` reproduces defect #2. Both are
+    selectable for comparison only.
+  - Tail-weighted bands matter: quintiles gave pyrome 47 a top class of ERC 67–94; the default now
+    resolves 84–94.
+- FlamMap scenarios (`build_flammap_fuel_moistures`) still use the DOY/GSI live-FM path — the
+  `lat_deg` GSI branch lives there, not in `build_erc_classes`.
   - NOTE: GSI with pyrome-mean GridMET VPD does not work for semi-arid western US fire season —
     Jolly et al. (2005) thresholds calibrated for temperate/boreal, not CO conditions
-  - fm1/fm10 from NFDRS equations (`tmmx_f + rmin`)
+- `build_fm_timeseries(max_gap_days=45)` restarts the NFDRS78 lag at each season break. Integrating
+  through the Oct 31 → Apr 1 gap carried the October end-state into spring, leaving April FM100
+  **2.5–7.2 pp too moist** across the 9 CO pyromes, converging by season day 18–22.

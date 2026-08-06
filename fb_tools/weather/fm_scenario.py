@@ -38,6 +38,27 @@ _TIMELAG_10_HR = 10.0
 _TIMELAG_100_HR = 100.0
 
 
+def _split_on_gaps(dates, idx, max_gap_days):
+    """
+    Split ``idx`` where consecutive ``dates`` differ by more than
+    ``max_gap_days``.
+
+    Yields index arrays for each contiguous run, in order.  ``max_gap_days=None``
+    yields ``idx`` unsplit, restoring the pre-P1.7 single-integration behaviour.
+    """
+    idx = np.asarray(idx)
+    if max_gap_days is None or len(idx) < 2:
+        yield idx
+        return
+    gaps = np.diff(np.asarray(dates, dtype="datetime64[D]")).astype(int)
+    breaks = np.flatnonzero(gaps > max_gap_days) + 1
+    if not len(breaks):
+        yield idx
+        return
+    for seg in np.split(idx, breaks):
+        yield seg
+
+
 def build_fm_timeseries(
     df: pd.DataFrame,
     tmax_col: str = "tmmx_f",
@@ -55,6 +76,7 @@ def build_fm_timeseries(
     fm_cap_10: float = 40.0,
     fm_cap_100: float = 40.0,
     dt_hr: float = 24.0,
+    max_gap_days: float | None = 45.0,
 ) -> pd.DataFrame:
     """
     Append ``EMC``, ``FM1``, ``FM10``, ``FM100`` columns to a daily weather table.
@@ -105,6 +127,26 @@ def build_fm_timeseries(
     dt_hr : float
         Time step in hours. Default 24 (daily). Use 1 to drive the same
         machinery from an hourly RTMA-derived EMC series.
+    max_gap_days : float, optional
+        Restart the lag integration wherever consecutive dates differ by more
+        than this many days. Default 45.
+
+        A fire-season record covers April 1 – October 31, so consecutive rows
+        step from October straight to the following April. Integrating across
+        that discontinuity treats a five-month gap as a single time step and
+        carries the October end-state into spring. At
+        ``alpha_100 = 1 - exp(-24/100) ~ 0.213/day`` the contamination takes
+        2–3 weeks to decay.
+
+        Measured over the nine cached Colorado pyromes, the carry-over made
+        April FM100 **too moist** — cool, humid late-October conditions give a
+        higher EMC than early April — by 2.5–7.2 percentage points on season
+        day 1, converging by season day 18–22. (The direction is worth stating:
+        a moist bias understates early-season fire potential.)
+
+        Each segment cold-starts from its own ``EMC[0]`` (or ``fm10_init`` /
+        ``fm100_init``), which for an April 1 start is a far better estimate
+        than the previous October. Pass None to integrate straight through.
 
     Returns
     -------
@@ -168,29 +210,45 @@ def build_fm_timeseries(
     else:
         groups = ((g, idx.to_numpy()) for g, idx in out.groupby(group_col).groups.items())
 
+    n_segments = 0
     for _, idx in groups:
-        emc_g = out.loc[idx, lag_emc_col].values
-        precip_g = out.loc[idx, precip_col].values if has_precip else None
+        # Split on temporal discontinuities before integrating.  A fire-season
+        # record runs Apr 1 – Oct 31, so consecutive rows step from October
+        # straight to April; integrating across that treats a five-month gap as
+        # one time step and carries the October end-state into the following
+        # spring.  At alpha_100 ~ 0.213/day it takes 2–3 weeks to wash out —
+        # measured at 2.5–7.2 pp too moist on season day 1 across the nine CO
+        # pyromes, converging by day 18–22.
+        for seg in _split_on_gaps(out.loc[idx, date_col].values, idx, max_gap_days):
+            n_segments += 1
+            emc_g = out.loc[seg, lag_emc_col].values
+            precip_g = out.loc[seg, precip_col].values if has_precip else None
 
-        fm10_arr[idx] = calc_lagged_fm(
-            emc_g,
-            timelag_hr=_TIMELAG_10_HR,
-            fm_init=fm10_init,
-            precip_mm=precip_g,
-            precip_fm_boost=precip_boost_10,
-            precip_threshold_mm=precip_threshold_mm,
-            fm_cap=fm_cap_10,
-            dt_hr=dt_hr,
-        )
-        fm100_arr[idx] = calc_lagged_fm(
-            emc_g,
-            timelag_hr=_TIMELAG_100_HR,
-            fm_init=fm100_init,
-            precip_mm=precip_g,
-            precip_fm_boost=precip_boost_100,
-            precip_threshold_mm=precip_threshold_mm,
-            fm_cap=fm_cap_100,
-            dt_hr=dt_hr,
+            fm10_arr[seg] = calc_lagged_fm(
+                emc_g,
+                timelag_hr=_TIMELAG_10_HR,
+                fm_init=fm10_init,
+                precip_mm=precip_g,
+                precip_fm_boost=precip_boost_10,
+                precip_threshold_mm=precip_threshold_mm,
+                fm_cap=fm_cap_10,
+                dt_hr=dt_hr,
+            )
+            fm100_arr[seg] = calc_lagged_fm(
+                emc_g,
+                timelag_hr=_TIMELAG_100_HR,
+                fm_init=fm100_init,
+                precip_mm=precip_g,
+                precip_fm_boost=precip_boost_100,
+                precip_threshold_mm=precip_threshold_mm,
+                fm_cap=fm_cap_100,
+                dt_hr=dt_hr,
+            )
+
+    if max_gap_days is not None and n_segments > 1:
+        print(
+            f"  [build_fm_timeseries] lag re-spun up over {n_segments} contiguous "
+            f"segments (gaps > {max_gap_days:g} days break the integration)"
         )
 
     out["FM10"] = fm10_arr

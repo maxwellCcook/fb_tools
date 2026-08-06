@@ -55,10 +55,20 @@ _N_SEASON_DAYS: int = 214
 _SEASON_START_MONTH: int = 4   # April
 _SEASON_END_MONTH: int = 10    # October
 
-# Default spotting parameter rows per ERC class (high → low danger, 5 rows)
-# Format: [spot_dist_ft, spot_prob, spot2]
+# Per-ERC-class behaviour rows (high → low danger, 5 rows), columns 8–10 of the
+# FSPro ERC class table.
+#
+# Format: ``[burn_period_min, spot_probability, spot_delay]``
+#
+# Column 8 is the **daily burn period in minutes** — the spec (p.4) names the
+# field ``Duration``, which is distinct from the run-level ``Duration:`` switch
+# that sets the number of fire days.  FSPro echoes these values back as
+# ``burnPeriod`` in ``_DayTypes.txt``.  The 360→120 ladder is 6 h down to 2 h and
+# is a first-order control on daily fire growth.  This column was historically
+# mislabelled ``spot_dist``/``spot_dist_ft``; see P1.4.
+#
 # Matches the 416inputsfile.input example file ordering (highest ERC first).
-_DEFAULT_SPOTTING: list[list[float]] = [
+_DEFAULT_ERC_CLASS_BEHAVIOR: list[list[float]] = [
     [360, 0.15, 0],
     [300, 0.10, 0],
     [240, 0.05, 0],
@@ -66,13 +76,38 @@ _DEFAULT_SPOTTING: list[list[float]] = [
     [120, 0.00, 0],
 ]
 
-# Scale factors: NFDRS78-lag 100-hr FM (fire-season range ~5–25%) → live FM.
+#: Deprecated alias for :data:`_DEFAULT_ERC_CLASS_BEHAVIOR`.  The name reflected
+#: the mislabelling of column 8 as a spotting distance.
+_DEFAULT_SPOTTING = _DEFAULT_ERC_CLASS_BEHAVIOR
+
+# Tail-weighted ERC class edges (percentiles).  Quintiles lump ordinary summer
+# days in with genuine extremes — for pyrome 47 the top quintile spans ERC 67–94.
+# Weighting the upper tail gives the extreme class the resolution that actually
+# drives simulated fire growth.
+_DEFAULT_CLASS_PERCENTILES: list[float] = [0.0, 60.0, 80.0, 90.0, 97.0, 100.0]
+
+# Default location of the cached RTMA daily peak-hour fuel-moisture frame,
+# relative to the weather cache root.  Written by the RTMA pipeline in
+# ``fb_tools.weather.rtma``.
+_RTMA_DAILY_RELPATH: str = "flammap_rtma/rtma_daily_fm.parquet"
+
+# Scale factors: 100-hr dead FM (fire-season range ~5–25%) → live FM.
 # Empirically tuned for CO fire season (p25 fm100 ~20% → herb ~130%,
-# p97 fm100 ~7% → near dormant floor 30%/60%).  Not NFDRS-standard —
-# the FFP-aligned GSI approach in build_rtma_live_fm() is preferred when
-# RTMA data are available.  DOY-based phenology is unsuitable as a fallback
-# because all ERC percentile bands tend to cluster at the same calendar
-# date within a fire season, producing identical live FM across scenarios.
+# p97 fm100 ~7% → near dormant floor 30%/60%).  Not NFDRS-standard, but
+# monotonic with ERC by construction, which is what the ERC class table
+# requires and what the two phenology-based alternatives fail to deliver:
+#
+# - DOY-based phenology pools spring green-up with cured autumn inside a
+#   single low-ERC bin, so the extreme class ends up the greenest (defect #2).
+# - GSI (the FFP-aligned method in build_rtma_live_fm) inherits the same
+#   pooling through its temperature term.  Measured against the nine cached
+#   CO pyromes it is non-monotonic in four, and pins six of nine extreme
+#   classes flat on the 30%/60% dormant floor — losing all discrimination
+#   exactly where fire behaviour is decided.
+#
+# Scaling from dead FM is monotonic in all nine pyromes and puts the extreme
+# class at 32–69% herbaceous / 60–95% woody, matching the 40–60 / 60–90 range
+# Ager et al. (2014, Table 7) used for their extreme-condition runs.
 _LIVE_FM_HERB_SCALE: float = 6.5
 _LIVE_FM_WOODY_SCALE: float = 9.0
 
@@ -379,6 +414,59 @@ def build_erc_stats(
     return stats
 
 
+def load_rtma_daily_fm(
+    source: "pd.DataFrame | str | Path | None" = None,
+    weather_dir: "str | Path | None" = None,
+    pyrome_col: str = "pyrome_id",
+    date_col: str = "date",
+) -> pd.DataFrame | None:
+    """
+    Load the cached RTMA daily peak-hour fuel-moisture frame.
+
+    Parameters
+    ----------
+    source : pd.DataFrame or path-like, optional
+        An already-loaded frame, or a path to the parquet cache.  When None,
+        the cache is looked up under ``weather_dir``.
+    weather_dir : path-like, optional
+        Root of the weather cache.  The frame is expected at
+        ``weather_dir/flammap_rtma/rtma_daily_fm.parquet``.
+    pyrome_col, date_col : str
+        Column names to normalize in the returned frame.
+
+    Returns
+    -------
+    pd.DataFrame or None
+        The frame with ``date_col`` normalized to midnight and ``pyrome_col``
+        cast to ``str``, or None when no cache could be located.
+    """
+    if isinstance(source, pd.DataFrame):
+        frame = source.copy()
+    else:
+        path = Path(source) if source is not None else None
+        if path is None and weather_dir is not None:
+            path = Path(weather_dir) / _RTMA_DAILY_RELPATH
+        if path is None or not path.exists():
+            return None
+        frame = pd.read_parquet(path) if path.suffix == ".parquet" else pd.read_csv(path)
+
+    if pyrome_col not in frame.columns or date_col not in frame.columns:
+        return None
+    frame[date_col] = pd.to_datetime(frame[date_col]).dt.normalize()
+    frame[pyrome_col] = frame[pyrome_col].astype(str)
+    return frame
+
+
+def _season_mask(df: pd.DataFrame, date_col: str = "date", doy_col: str = "doy"):
+    """Boolean mask selecting fire-season rows (April 1 – October 31)."""
+    if date_col in df.columns:
+        months = pd.to_datetime(df[date_col]).dt.month
+        return (months >= _SEASON_START_MONTH) & (months <= _SEASON_END_MONTH)
+    if doy_col in df.columns:
+        return (df[doy_col] >= 91) & (df[doy_col] <= 304)
+    return pd.Series(True, index=df.index)
+
+
 def build_erc_classes(
     df: pd.DataFrame,
     pyrome_col: str = "pyrome",
@@ -387,29 +475,68 @@ def build_erc_classes(
     fm100_col: str = "fm100",
     tmmx_col: str = "tmmx_f",
     rmin_col: str = "rmin",
-    spotting: list[list[float]] | None = None,
-    lat_deg: float | None = None,
+    class_percentiles: "list[float] | None" = None,
+    class_behavior: "list[list[float]] | None" = None,
+    burn_periods_min: "list[float] | None" = None,
+    dead_fm_source: str = "rtma",
+    live_fm_source: str = "dead_fm",
+    rtma_daily: "pd.DataFrame | str | Path | None" = None,
+    weather_dir: "str | Path | None" = None,
+    herb_scale: float = _LIVE_FM_HERB_SCALE,
+    woody_scale: float = _LIVE_FM_WOODY_SCALE,
+    season_only: bool = True,
+    spotting: "list[list[float]] | None" = None,
 ) -> dict[str, np.ndarray]:
     """
-    Build the 5-row ERC class table for FSPro ``NumERCClasses`` block.
+    Build the ERC class table for the FSPro ``NumERCClasses`` block.
 
-    Each row represents one ERC percentile class (highest ERC first) with
-    associated fuel moisture values derived from GridMET data.
+    Each row is one ERC percentile class (highest ERC first) with the fuel
+    moistures that apply when the generated ERC stream falls in that band.
 
-    Row format (10 columns):
-    ``[lower, upper, fm1, fm10, fm100, fm_herb, fm_woody, spot_dist, spot_prob, spot2]``
+    Row format (10 columns, spec p.4)::
 
-    Fuel moisture derivation:
-    - ``fm1``    : median NFDRS 1-hr FM (from tmmx_f + rmin via :func:`calc_1hr_fm`)
-    - ``fm10``   : median NFDRS 10-hr FM (from tmmx_f + rmin via :func:`calc_10hr_fm`)
-    - ``fm100``  : median GridMET fm100 (direct)
-    - ``fm_herb``: GSI-based live FM via :func:`calc_herb_fm_gsi` when ``tmmn_f``,
-      ``vpd_pa``, and ``lat_deg`` are available — replicates the NFDRS 2016 /
-      FireFamilyPlus method; otherwise falls back to DOY-based :func:`calc_herb_fm`
-    - ``fm_woody``: same GSI path via :func:`calc_woody_fm_gsi`, or DOY fallback
+        [min_erc, max_erc, fm1, fm10, fm100, fm_herb, fm_woody,
+         burn_period_min, spot_probability, spot_delay]
 
-    Quintile ERC bins are computed per pyrome from the full fire-season record.
-    Classes are ordered highest-to-lowest ERC (class 1 = most extreme).
+    Column 8 is the **daily burn period in minutes** — the spec names the field
+    ``Duration``, distinct from the run-level ``Duration:`` switch that sets the
+    number of fire days.  It was previously mislabelled ``spot_dist``.
+
+    Fuel moisture must **fall as ERC rises**; FSPro inputs whose class table
+    violates this are rejected by
+    :func:`~fb_tools.models.fspro_validate.assert_valid_fspro_input`.  The
+    defaults below are the combination that satisfies it across all nine cached
+    Colorado pyromes.
+
+    **Dead fuel moisture** (``dead_fm_source``):
+
+    - ``"rtma"`` *(default)* — per-band medians of the cached RTMA daily
+      peak-hour frame (hourly RTMA → per-pixel EMC → spatial reduction), joined
+      to the ERC band's dates.  Falls back to ``"gridmet"`` for any pyrome
+      missing from the cache.
+    - ``"gridmet"`` — the NFDRS78 time-lag integration run over this pyrome's
+      GridMET record by :func:`~fb_tools.weather.fm_scenario.build_fm_timeseries`.
+
+    Both agree to within ~1% at the extreme class.  They diverge in the mild
+    classes, where the GridMET lag reaches FM100 ≈ 30% and would drive scaled
+    live FM to implausible values.
+
+    **Live fuel moisture** (``live_fm_source``):
+
+    - ``"dead_fm"`` *(default)* — scaled from the FM100 selected above via
+      :func:`~fb_tools.weather.nfdrs.calc_live_fm_from_dead`.  Monotonic by
+      construction; puts the extreme class in Ager et al. (2014, Table 7)
+      territory (40–60% herbaceous / 60–90% woody).
+    - ``"gsi"`` — the GSI-derived ``FM_herb``/``FM_woody`` columns of the RTMA
+      cache (NFDRS 2016 / FireFamilyPlus method).  Requires the RTMA cache.
+      **Not monotonic for four of the nine cached CO pyromes**, and saturates
+      six of nine extreme classes at the 30%/60% dormant floor — offered for
+      comparison, not recommended as the production path.
+    - ``"doy"`` — day-of-year phenology (:func:`calc_herb_fm`,
+      :func:`calc_woody_fm`) keyed on each band's median DOY.  This is the
+      original behaviour and the source of defect #2: low-ERC bands pool spring
+      green-up with cured autumn, so the extreme class comes out the greenest.
+      Retained only to reproduce pre-P1.1 output.
 
     Parameters
     ----------
@@ -421,39 +548,130 @@ def build_erc_classes(
         Number of ERC classes (default 5).
     erc_col, fm100_col, tmmx_col, rmin_col : str
         Column names in ``df``.
+    class_percentiles : list of float, optional
+        Ascending percentile edges, length ``n_classes + 1``.  Defaults to
+        :data:`_DEFAULT_CLASS_PERCENTILES` — ``[0, 60, 80, 90, 97, 100]``, which
+        weights the upper tail.  Pass ``list(np.linspace(0, 100, n_classes + 1))``
+        for the previous equal-width quintiles.
+    class_behavior : list of list, optional
+        ``n_classes`` rows of ``[burn_period_min, spot_probability, spot_delay]``,
+        ordered highest-to-lowest ERC.  Defaults to
+        :data:`_DEFAULT_ERC_CLASS_BEHAVIOR`.
+    burn_periods_min : list of float, optional
+        Override just column 8 (daily burn period, minutes), highest ERC first.
+        The 360→120 default ladder is 6 h down to 2 h and is a first-order
+        control on daily fire growth.
+    dead_fm_source : {"rtma", "gridmet"}
+        Source of ``fm1``/``fm10``/``fm100``.  See above.
+    live_fm_source : {"dead_fm", "gsi", "doy"}
+        Derivation of ``fm_herb``/``fm_woody``.  See above.
+    rtma_daily : pd.DataFrame or path-like, optional
+        RTMA daily peak-hour frame, or a path to it.  When None it is looked up
+        under ``weather_dir``.
+    weather_dir : path-like, optional
+        Weather cache root used to locate the RTMA parquet.
+    herb_scale, woody_scale : float
+        Multipliers on FM100 for ``live_fm_source="dead_fm"``.
+    season_only : bool
+        Restrict to April–October before computing ERC quantiles (default True).
+        The percentile edges are meaningless if the off-season is included.
     spotting : list of list, optional
-        Override default spotting parameters. Must be ``n_classes`` rows of
-        ``[spot_dist_ft, spot_prob, spot2]``. Ordered highest-to-lowest ERC.
-        Defaults to :data:`_DEFAULT_SPOTTING`.
-    lat_deg : float, optional
-        Site latitude in decimal degrees. Required for GSI-based live FM
-        (enables :func:`calc_daylength`). When None, live FM falls back to
-        DOY-based phenology.
+        Deprecated alias for ``class_behavior``.
 
     Returns
     -------
     dict[str, np.ndarray]
         ``{pyrome_id: ndarray(n_classes, 10)}``.
+
+    Raises
+    ------
+    ValueError
+        If ``dead_fm_source``/``live_fm_source`` is unrecognized, if the
+        percentile or behaviour tables are the wrong length, or if
+        ``live_fm_source="gsi"`` is requested without an RTMA cache.
     """
-    if spotting is None:
-        spotting = _DEFAULT_SPOTTING
-    if len(spotting) != n_classes:
-        raise ValueError(f"len(spotting)={len(spotting)} must equal n_classes={n_classes}")
+    if dead_fm_source not in {"rtma", "gridmet"}:
+        raise ValueError(
+            f"dead_fm_source={dead_fm_source!r} must be 'rtma' or 'gridmet'"
+        )
+    if live_fm_source not in {"dead_fm", "gsi", "doy"}:
+        raise ValueError(
+            f"live_fm_source={live_fm_source!r} must be 'dead_fm', 'gsi', or 'doy'"
+        )
+
+    if spotting is not None and class_behavior is None:
+        class_behavior = spotting
+    if class_behavior is None:
+        class_behavior = _DEFAULT_ERC_CLASS_BEHAVIOR
+    if len(class_behavior) != n_classes:
+        raise ValueError(
+            f"len(class_behavior)={len(class_behavior)} must equal n_classes={n_classes}"
+        )
+    if burn_periods_min is not None:
+        if len(burn_periods_min) != n_classes:
+            raise ValueError(
+                f"len(burn_periods_min)={len(burn_periods_min)} must equal "
+                f"n_classes={n_classes}"
+            )
+        class_behavior = [
+            [float(bp), row[1], row[2]]
+            for bp, row in zip(burn_periods_min, class_behavior)
+        ]
+
+    if class_percentiles is None:
+        class_percentiles = _DEFAULT_CLASS_PERCENTILES
+    class_percentiles = [float(q) for q in class_percentiles]
+    if len(class_percentiles) != n_classes + 1:
+        raise ValueError(
+            f"len(class_percentiles)={len(class_percentiles)} must equal "
+            f"n_classes+1={n_classes + 1}"
+        )
+    if any(b <= a for a, b in zip(class_percentiles, class_percentiles[1:])):
+        raise ValueError(f"class_percentiles must be strictly ascending: {class_percentiles}")
+
+    rtma = load_rtma_daily_fm(rtma_daily, weather_dir=weather_dir)
+    if rtma is None and (dead_fm_source == "rtma" or live_fm_source == "gsi"):
+        if live_fm_source == "gsi":
+            raise ValueError(
+                "live_fm_source='gsi' requires the RTMA daily cache. Pass "
+                "rtma_daily= or weather_dir=, or choose live_fm_source='dead_fm'."
+            )
+        print(
+            "  [build_erc_classes] RTMA daily cache not found — "
+            "falling back to dead_fm_source='gridmet'"
+        )
+        dead_fm_source = "gridmet"
 
     result: dict[str, np.ndarray] = {}
 
     for pyrome_id, group in df.groupby(pyrome_col):
-        erc = group[erc_col].dropna().values
+        pid = str(pyrome_id)
+        if season_only:
+            group = group[_season_mask(group)]
+        group = group.dropna(subset=[erc_col])
+        if group.empty:
+            print(f"  [build_erc_classes] pyrome {pid}: no ERC observations — skipped")
+            continue
 
-        # Quintile bin edges (0%, 20%, 40%, 60%, 80%, 100%)
-        quantiles = np.linspace(0, 100, n_classes + 1)
-        edges = np.percentile(erc, quantiles)
+        erc = group[erc_col].values
+        edges = np.percentile(erc, class_percentiles)
 
-        # Run the NFDRS78 lag once over this pyrome's full record so
-        # per-bin medians draw from time-integrated FM10/FM100 rather than
-        # from independent Fosberg/GridMET snapshots (which produced the
-        # non-monotonic ordering documented in plan
-        # `a-couple-things-first-synthetic-grove.md`).
+        # Widen the outer bounds so the written (:.0f) table still covers the
+        # full observed range once rounding is applied.  Interior edges are
+        # shared between adjacent rows, which keeps the table gapless.
+        edges[0] = np.floor(edges[0])
+        edges[-1] = np.ceil(edges[-1])
+
+        if np.any(np.diff(np.rint(edges)) < 1):
+            print(
+                f"  [build_erc_classes] pyrome {pid}: ERC percentile edges "
+                f"{np.rint(edges).astype(int).tolist()} collapse after rounding — "
+                "classes will not be strictly descending. Widen class_percentiles."
+            )
+
+        # NFDRS78 lag over this pyrome's full record, so per-bin medians draw
+        # from time-integrated FM10/FM100 rather than independent snapshots.
+        # Always computed: it is the fallback when RTMA lacks this pyrome.
         precip_col = "pr" if "pr" in group.columns else None
         ts = build_fm_timeseries(
             group,
@@ -462,97 +680,322 @@ def build_erc_classes(
             precip_col=precip_col,
         )
 
-        # Build one row per class (highest ERC class first)
+        rtma_p = None
+        if rtma is not None:
+            sel = rtma[rtma["pyrome_id"] == pid]
+            if not sel.empty:
+                rtma_p = sel.set_index("date")
+        use_rtma = dead_fm_source == "rtma" and rtma_p is not None
+        if dead_fm_source == "rtma" and rtma_p is None:
+            print(
+                f"  [build_erc_classes] pyrome {pid}: absent from RTMA cache — "
+                "using dead_fm_source='gridmet' for this pyrome"
+            )
+        if live_fm_source == "gsi" and rtma_p is None:
+            raise ValueError(
+                f"live_fm_source='gsi' but pyrome {pid} is absent from the RTMA cache"
+            )
+
         rows = []
-        for i in range(n_classes - 1, -1, -1):
-            lower = edges[i]
-            upper = edges[i + 1]
+        for i in range(n_classes - 1, -1, -1):   # highest ERC class first
+            lower, upper = edges[i], edges[i + 1]
 
-            # Mask observations in this ERC bin
-            mask = (ts[erc_col] >= lower) & (ts[erc_col] <= upper)
+            # Half-open bins so an observation lands in exactly one class; the
+            # top class is closed so the maximum is not dropped.
+            if i == n_classes - 1:
+                mask = (ts[erc_col] >= lower) & (ts[erc_col] <= upper)
+            else:
+                mask = (ts[erc_col] >= lower) & (ts[erc_col] < upper)
             sub = ts[mask]
-
             if len(sub) == 0:
-                # Fall back to all observations if bin is empty
+                print(
+                    f"  [build_erc_classes] pyrome {pid}: ERC class "
+                    f"{lower:.0f}-{upper:.0f} is empty — using the full record"
+                )
                 sub = ts
 
-            fm1 = float(np.nanmedian(sub["FM1"].values))
-            fm10 = float(np.nanmedian(sub["FM10"].values))
-            fm100 = float(np.nanmedian(sub["FM100"].values))
-            if "tmmn_f" in sub.columns and lat_deg is not None:
-                vpd = calc_vpd_pa(sub[tmmx_col].values, sub[rmin_col].values)
-                dl  = calc_daylength(sub["doy"].values, lat_deg)
-                gsi = float(np.nanmedian(calc_gsi(sub["tmmn_f"].values, vpd, dl)))
-                fm_herb  = float(calc_herb_fm_gsi(gsi))
-                fm_woody = float(calc_woody_fm_gsi(gsi))
+            # Matching RTMA rows for this band's dates
+            band = None
+            if rtma_p is not None and "date" in sub.columns:
+                wanted = pd.to_datetime(sub["date"].values)
+                band = rtma_p.reindex(wanted).dropna(how="all")
+                if band.empty:
+                    band = None
+
+            if use_rtma and band is not None:
+                fm1 = float(np.nanmedian(band["FM1"].values))
+                fm10 = float(np.nanmedian(band["FM10"].values))
+                fm100 = float(np.nanmedian(band["FM100"].values))
             else:
-                median_doy = float(np.nanmedian(sub["doy"].values)) if "doy" in sub.columns else 182.0
-                fm_herb  = float(calc_herb_fm(median_doy))
+                fm1 = float(np.nanmedian(sub["FM1"].values))
+                fm10 = float(np.nanmedian(sub["FM10"].values))
+                fm100 = float(np.nanmedian(sub["FM100"].values))
+
+            if live_fm_source == "dead_fm":
+                _h, _w = calc_live_fm_from_dead(
+                    fm100, herb_scale=herb_scale, woody_scale=woody_scale
+                )
+                fm_herb, fm_woody = float(_h), float(_w)
+            elif live_fm_source == "gsi":
+                if band is None:
+                    raise ValueError(
+                        f"live_fm_source='gsi' but pyrome {pid} ERC class "
+                        f"{lower:.0f}-{upper:.0f} has no matching RTMA dates"
+                    )
+                fm_herb = float(np.nanmedian(band["FM_herb"].values))
+                fm_woody = float(np.nanmedian(band["FM_woody"].values))
+            else:  # "doy"
+                median_doy = (
+                    float(np.nanmedian(sub["doy"].values))
+                    if "doy" in sub.columns else 182.0
+                )
+                fm_herb = float(calc_herb_fm(median_doy))
                 fm_woody = float(calc_woody_fm(median_doy))
 
-            spot = spotting[n_classes - 1 - i]  # highest ERC → spotting[0]
+            behavior = class_behavior[n_classes - 1 - i]  # highest ERC → row 0
             rows.append([
-                round(lower, 1), round(upper, 1),
+                round(float(lower), 1), round(float(upper), 1),
                 round(fm1, 1), round(fm10, 1), round(fm100, 1),
                 round(fm_herb, 1), round(fm_woody, 1),
-                float(spot[0]), float(spot[1]), float(spot[2]),
+                float(behavior[0]), float(behavior[1]), float(behavior[2]),
             ])
 
-        result[str(pyrome_id)] = np.array(rows)
+        result[pid] = np.array(rows)
 
-    print(f"  [build_erc_classes] {len(result)} pyromes × {n_classes} ERC classes")
+    print(
+        f"  [build_erc_classes] {len(result)} pyromes × {n_classes} ERC classes "
+        f"(dead_fm={dead_fm_source}, live_fm={live_fm_source}, "
+        f"percentiles={[f'{q:g}' for q in class_percentiles]})"
+    )
     return result
 
 
 def build_current_erc_values(
     historic_dict: dict[str, np.ndarray],
-    start_doy: int,
-    n_days: int = 79,
-) -> dict[str, np.ndarray]:
+    ignition_season_day: int | None = None,
+    mode: str = "analog_year",
+    years: "dict[str, list[int]] | list[int] | None" = None,
+    analog_year: int | None = None,
+    percentile: float = 80.0,
+    observed: "dict[str, np.ndarray] | np.ndarray | None" = None,
+    max_lag: int = 30,
+    duration: int = 7,
+    validate: bool = True,
+    return_meta: bool = False,
+    start_doy: int | None = None,
+    n_days: int | None = None,
+) -> dict:
     """
-    Build ``CurrentERCValues`` from the historic-median approach.
+    Build ``CurrentERCValues`` — the season-to-date ERC stream before ignition.
 
-    Computes the column-wise median across all years for a consecutive
-    ``n_days`` window starting at ``start_doy`` in the fire season.  The
-    DOY index is relative to the fire season (DOY 1 = April 1).
+    Spec p.5 defines this as *"the number of ERC values for the current year
+    leading up to ignition"*: **day 1 of the array is fire-season day 1
+    (April 1)** and the last value is the day before ignition.  FSPro reads the
+    array positionally, so the slice must always start at season day 1.
 
-    For scenario-based (non-operational) FSPro runs this provides a
-    climatologically representative current-season ERC sequence without
-    requiring a real-time GEE fetch.
+    The pre-P1.2 signature took ``start_doy`` and ``n_days`` and sliced an
+    arbitrary interior window (defect #3).  Passing ``start_doy=91,
+    n_days=79`` handed FSPro season days 91–169 while it read them as days
+    1–79 — for pyrome 47 that meant conditioning the ERC generator on the
+    monsoon *decline* (day 91 = 67.3 falling to day 169 = 43.4) and then
+    igniting at day 80.  Those keywords are still accepted but deprecated;
+    ``start_doy`` other than 1 raises.
+
+    Modes
+    -----
+    ``"analog_year"`` *(default)*
+        The observed sequence from a single high-ERC year.  Preserves
+        variance and day-to-day autocorrelation, which the cross-year median
+        strips out, and makes the scenario nameable in a writeup
+        ("conditions like 2018").  The year is chosen by season-to-date ERC
+        accumulation over days 1..``n_days`` unless ``analog_year`` is given.
+    ``"percentile"``
+        Per-day quantile across years.  Smooth but severe — no realistic
+        autocorrelation.
+    ``"median"``
+        Per-day median across years.  The pre-P1.2 behaviour; a mild
+        reference case.
+    ``"observed"``
+        A real event's actual stream, supplied via ``observed``.  For
+        retrospective validation.
 
     Parameters
     ----------
     historic_dict : dict
         Output of :func:`build_historic_erc_arrays` —
-        ``{pyrome_id: ndarray(n_years, 214)}``.
-    start_doy : int
-        1-based fire-season DOY (1 = April 1) at which the current-year
-        window begins.
-    n_days : int
-        Length of the current-year ERC sequence (default 79, matching the
-        416 example file).
+        ``{pyrome_id: ndarray(n_years, 214)}``.  Rows must be chronological.
+    ignition_season_day : int
+        1-based fire-season day of ignition (1 = April 1).  The returned array
+        has ``ignition_season_day - 1`` values, covering days 1 … ignition-1.
+    mode : {"analog_year", "percentile", "median", "observed"}
+        Stream construction, see above.
+    years : dict or list, optional
+        Calendar years matching the rows of each historic array — the
+        ``"years"`` key of the pyrome cache.  Enables ``analog_year`` selection
+        by name and is reported in the metadata.  A bare list applies to every
+        pyrome.
+    analog_year : int, optional
+        Force a specific calendar year for ``mode="analog_year"``.  Requires
+        ``years``.  When None the wettest-to-driest ranking picks the year with
+        the highest season-to-date ERC accumulation.
+    percentile : float
+        Quantile (0–100) for ``mode="percentile"``.  Default 80.
+    observed : ndarray or dict, optional
+        Required for ``mode="observed"``.  Either one array applied to every
+        pyrome or ``{pyrome_id: ndarray}``.  Truncated or validated to length
+        ``ignition_season_day - 1``.
+    max_lag : int
+        The run's ``MaxLag``.  Used only for the spec-window check.
+    duration : int
+        The run's ``Duration`` (fire days).  Used only for the spec-window check.
+    validate : bool
+        Enforce ``MaxLag <= NumWxCurrYear < NumWxPerYear - Duration`` (spec
+        p.5).  At ``Duration=21`` and the default 214-day season this admits
+        ignition season days 31–193, roughly May 1 – October 11.
+    return_meta : bool
+        When True, return ``{pyrome_id: {"values": ndarray, "mode": str,
+        "analog_year": int | None, "ignition_season_day": int}}`` instead of
+        bare arrays, so the scenario's provenance can be written to a manifest.
+    start_doy, n_days : int, optional
+        Deprecated.  ``start_doy`` must be 1 or None; ``n_days`` is accepted as
+        a synonym for ``ignition_season_day - 1``.
 
     Returns
     -------
-    dict[str, np.ndarray]
-        ``{pyrome_id: ndarray(n_days)}`` of median ERC values.
+    dict
+        ``{pyrome_id: ndarray(n_days)}`` of integer ERC values, or the
+        metadata form when ``return_meta=True``.
 
     Raises
     ------
     ValueError
-        If ``start_doy + n_days - 1`` exceeds the fire season length (214).
+        On an unknown mode, a deprecated ``start_doy`` other than 1, a length
+        outside the spec window, or a missing/short ``observed`` stream.
     """
-    end_idx = start_doy - 1 + n_days
-    if end_idx > _N_SEASON_DAYS:
+    if mode not in {"analog_year", "percentile", "median", "observed"}:
         raise ValueError(
-            f"start_doy={start_doy} + n_days={n_days} - 1 = {end_idx} exceeds "
-            f"fire season length {_N_SEASON_DAYS}"
+            f"mode={mode!r} must be 'analog_year', 'percentile', 'median', or 'observed'"
         )
 
-    result: dict[str, np.ndarray] = {}
+    # ── Resolve the length from the new or deprecated keywords ────────────────
+    if start_doy is not None and start_doy != 1:
+        raise ValueError(
+            f"start_doy={start_doy} is no longer supported. CurrentERCValues must "
+            "start at fire-season day 1 (April 1) because FSPro reads the array "
+            "positionally — see spec p.5. Pass ignition_season_day= instead; "
+            f"the equivalent of your call is ignition_season_day={start_doy + (n_days or 79)}."
+        )
+    if ignition_season_day is None:
+        if n_days is None:
+            raise ValueError("Pass ignition_season_day (1 = April 1)")
+        ignition_season_day = int(n_days) + 1
+    ignition_season_day = int(ignition_season_day)
+    length = ignition_season_day - 1
+    if n_days is not None and int(n_days) != length:
+        raise ValueError(
+            f"n_days={n_days} contradicts ignition_season_day={ignition_season_day} "
+            f"(which implies {length} days). Pass only one."
+        )
+    if length < 1:
+        raise ValueError(
+            f"ignition_season_day={ignition_season_day} leaves no antecedent days; "
+            "it must be at least 2"
+        )
+
+    n_wx_per_year = min(a.shape[1] for a in historic_dict.values()) if historic_dict else _N_SEASON_DAYS
+    if length > n_wx_per_year:
+        raise ValueError(
+            f"ignition_season_day={ignition_season_day} needs {length} antecedent "
+            f"days but the historic record has only {n_wx_per_year} per year"
+        )
+    if validate:
+        # Spec p.5: MaxLag <= NumWxCurrYear < NumWxPerYear - Duration
+        if length < max_lag:
+            raise ValueError(
+                f"NumWxCurrYear={length} < MaxLag={max_lag} (spec p.5). "
+                f"Ignite no earlier than season day {max_lag + 1}."
+            )
+        if length >= n_wx_per_year - duration:
+            raise ValueError(
+                f"NumWxCurrYear={length} must be < NumWxPerYear - Duration = "
+                f"{n_wx_per_year} - {duration} = {n_wx_per_year - duration} "
+                f"(spec p.5). Ignite no later than season day "
+                f"{n_wx_per_year - duration}."
+            )
+
+    def _years_for(pid: str, n_rows: int) -> list[int] | None:
+        if years is None:
+            return None
+        seq = years.get(pid) if isinstance(years, dict) else years
+        if seq is None or len(seq) != n_rows:
+            return None
+        return [int(y) for y in seq]
+
+    def _observed_for(pid: str) -> np.ndarray:
+        if observed is None:
+            raise ValueError("mode='observed' requires observed=")
+        arr = observed.get(pid) if isinstance(observed, dict) else observed
+        if arr is None:
+            raise ValueError(f"mode='observed' but no stream supplied for pyrome {pid}")
+        arr = np.asarray(arr, dtype=float).ravel()
+        if len(arr) < length:
+            raise ValueError(
+                f"observed stream for pyrome {pid} has {len(arr)} days, "
+                f"need {length} (ignition_season_day={ignition_season_day})"
+            )
+        return arr[:length]
+
+    result: dict = {}
     for pyrome_id, arr in historic_dict.items():
-        window = arr[:, start_doy - 1 : start_doy - 1 + n_days]
-        result[str(pyrome_id)] = np.round(np.nanmedian(window, axis=0)).astype(int)
+        pid = str(pyrome_id)
+        window = np.asarray(arr, dtype=float)[:, :length]   # always from day 1
+        chosen_year: int | None = None
+
+        if mode == "median":
+            values = np.nanmedian(window, axis=0)
+        elif mode == "percentile":
+            values = np.nanpercentile(window, percentile, axis=0)
+        elif mode == "observed":
+            values = _observed_for(pid)
+        else:  # analog_year
+            row_years = _years_for(pid, window.shape[0])
+            if analog_year is not None:
+                if row_years is None:
+                    raise ValueError(
+                        f"analog_year={analog_year} requires years= matching the "
+                        f"{window.shape[0]} rows of pyrome {pid}"
+                    )
+                if analog_year not in row_years:
+                    raise ValueError(
+                        f"analog_year={analog_year} not in the record for pyrome "
+                        f"{pid}: {row_years}"
+                    )
+                idx = row_years.index(analog_year)
+            else:
+                # Season-to-date ERC accumulation — the driest antecedent year.
+                idx = int(np.nanargmax(np.nansum(window, axis=1)))
+            values = window[idx]
+            chosen_year = row_years[idx] if row_years else None
+
+        values = np.round(values).astype(int)
+        if return_meta:
+            result[pid] = {
+                "values": values,
+                "mode": mode,
+                "analog_year": chosen_year,
+                "ignition_season_day": ignition_season_day,
+                "NumWxCurrYear": length,
+            }
+        else:
+            result[pid] = values
+
+    label = f"mode={mode}"
+    if mode == "percentile":
+        label += f" p{percentile:g}"
+    print(
+        f"  [build_current_erc_values] {len(result)} pyromes × {length} days "
+        f"(season day 1 → {length}, ignition on day {ignition_season_day}, {label})"
+    )
     return result
 
 
@@ -1332,6 +1775,7 @@ def save_erc_classes_to_cache(
     pyrome_col: str = "pyrome",
     n_classes: int = 5,
     prefix: str = "pyrome",
+    **erc_class_kwargs,
 ) -> list[str]:
     """
     Enrich existing ``pyrome_{id}_gridmet.json`` cache files with ERC classes.
@@ -1357,6 +1801,11 @@ def save_erc_classes_to_cache(
         Column in the CSV identifying the pyrome (default ``"pyrome"``).
     n_classes : int
         Number of ERC quantile classes (default 5).
+    **erc_class_kwargs
+        Forwarded to :func:`build_erc_classes` — ``dead_fm_source``,
+        ``live_fm_source``, ``class_percentiles``, ``burn_periods_min``, etc.
+        ``weather_dir`` defaults to the parent of ``cache_dir`` so the RTMA
+        daily cache is found without being named explicitly.
 
     Returns
     -------
@@ -1373,7 +1822,12 @@ def save_erc_classes_to_cache(
     """
     cache_dir = Path(cache_dir)
     df = load_gridmet_csv(gridmet_csv, aoi_col=pyrome_col)
-    classes_dict = build_erc_classes(df, pyrome_col=pyrome_col, n_classes=n_classes)
+    # Default the RTMA lookup to the cache root, so the enriched classes use the
+    # same dead-FM source the FSPro builders expect (pyrome_erc/ sits under it).
+    erc_class_kwargs.setdefault("weather_dir", cache_dir.parent)
+    classes_dict = build_erc_classes(
+        df, pyrome_col=pyrome_col, n_classes=n_classes, **erc_class_kwargs
+    )
 
     updated: list[str] = []
     for pid, classes_arr in classes_dict.items():

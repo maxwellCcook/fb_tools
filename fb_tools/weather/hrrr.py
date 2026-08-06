@@ -11,8 +11,10 @@ and builds a NumWindSpeeds × NumWindDirs frequency table per group.
 **FSPro wind semantics:** ``WindCellValues`` is a stochastic climatology
 distribution — FSPro independently draws a wind speed/direction from this
 table for each simulated fire. It is *not* a schedule of daily wind values.
-``CalmValue`` is the complementary percentage of historically-calm
-observations and is stored separately in the FSPro input file.
+``CalmValue`` is the percentage of historically-calm observations. It is a
+**separate** field, not a share of the table: ``WindCellValues`` normalizes to
+~100 over non-calm observations on its own, and FSPro does not subtract
+``CalmValue`` from it (vendor 416: matrix 99.74, ``CalmValue`` 10.25).
 
 **Generality:** The grouping key (``pyrome_col`` parameter) can be any
 categorical column — pyrome ID, watershed ID, a constant string for a
@@ -160,7 +162,7 @@ def fetch_hrrr_winds_at_fires(
         - ``pyrome_col``: Pyrome identifier (str or int).
     fire_hours_utc : list of int, optional
         UTC hours to extract. Defaults to ``[19, 20, 21, 22]``
-        (≈ 13:00–16:00 MDT / 14:00–17:00 MST — peak fire-spread window).
+        (13:00–16:00 MDT / 12:00–15:00 MST — peak fire-spread window).
     n_days : int
         Consecutive days to sample per fire (ignition day + n_days-1
         following days). Default 2 captures ignition and early spread.
@@ -376,12 +378,23 @@ def build_wind_cells(
     -------
     wind_cells : np.ndarray
         Shape ``(NumWindSpeeds, NumWindDirs)``. Values are % frequencies of
-        non-calm observations (sum ≈ 100). Row order = ascending speed bin;
-        column order = ascending direction azimuth bin.
+        non-calm observations, so the table **sums to ≈ 100 on its own**. Row
+        order = ascending speed bin; column order = ascending direction
+        azimuth bin.
     calm_pct : float
-        Percentage of *all* observations (including calm) below
-        ``calm_threshold_mph``. Corresponds to ``CalmValue`` in FSPro input
-        files. ``wind_cells.sum() + calm_pct ≈ 100``.
+        Percentage of valid observations below ``calm_threshold_mph``.
+        Corresponds to ``CalmValue`` in FSPro input files, which is a
+        **separate** field — it is not subtracted from the table. The vendor's
+        416 sample has a matrix summing to 99.74 with ``CalmValue: 10.25``,
+        confirming the two are independent.
+
+    Notes
+    -----
+    Observations with a non-finite speed or direction are **missing**, not
+    calm, and are excluded from both the table and the ``calm_pct``
+    denominator. Treating them as calm (which ``ws >= threshold`` does
+    silently, since any comparison against NaN is False) inflated
+    ``CalmValue`` by the HRRR gap rate.
 
     Raises
     ------
@@ -397,17 +410,29 @@ def build_wind_cells(
     wd = np.asarray(wd_deg, dtype=float)
 
     n_total = len(ws)
-    # Remove calm / near-calm observations; track count for CalmValue
-    active = ws >= calm_threshold_mph
-    n_calm = int((~active).sum())
-    calm_pct = 100.0 * n_calm / n_total if n_total > 0 else 0.0
+    # Missing is not calm.  A NaN speed or direction means HRRR had no value
+    # there; folding those into CalmValue would report a gap in the archive as
+    # a meteorological calm.
+    valid = np.isfinite(ws) & np.isfinite(wd)
+    n_missing = int((~valid).sum())
+    n_valid = int(valid.sum())
+    if n_missing:
+        print(
+            f"  [build_wind_cells] dropped {n_missing:,} of {n_total:,} "
+            "observations with missing speed/direction"
+        )
+
+    active = valid & (ws >= calm_threshold_mph)
+    n_calm = n_valid - int(active.sum())
+    calm_pct = 100.0 * n_calm / n_valid if n_valid > 0 else 0.0
 
     ws = ws[active]
     wd = wd[active]
 
     if len(ws) == 0:
         raise ValueError(
-            f"All {n_total} observations have ws_mph < {calm_threshold_mph}; "
+            f"No usable observations: {n_total} total, {n_missing} missing, "
+            f"{n_calm} below ws_mph {calm_threshold_mph}; "
             "cannot build wind cell table."
         )
 
@@ -446,6 +471,7 @@ def build_pyrome_wind_cells(
     out_dir: "Path | str | None" = None,
     min_obs_warn: int = 100,
     prefix: str = "pyrome",
+    season_months: "tuple[int, int] | None" = (4, 10),
 ) -> "dict[str, np.ndarray]":
     """
     Build per-area wind frequency tables from HRRR data at fire occurrence locations.
@@ -493,11 +519,24 @@ def build_pyrome_wind_cells(
         If provided, writes ``pyrome_{id}_wind.json`` per group to this
         directory. Load with ``load_pyrome_wind_cells()``.
     min_obs_warn : int
-        Print a warning for any group whose non-calm observation count is
-        below this threshold. Default 100. A well-populated 6×8 FSPro table
-        typically requires 200+ non-calm observations; fewer than 100 will
-        produce a sparse distribution unreliable for probabilistic runs.
+        Print a warning for any group whose **effective** non-calm observation
+        count is below this threshold. Default 100. A well-populated 6×8 FSPro
+        table typically requires 200+ effective observations; fewer than 100
+        produces a sparse distribution unreliable for probabilistic runs.
         Set to 0 to suppress.
+
+        The threshold is applied to ``n_noncalm / k_neighbors``, not the raw
+        count. The ``k_neighbors`` samples drawn per fire-hour come from a
+        3×3 HRRR neighbourhood spanning ~9 km, which is far inside the
+        synoptic decorrelation length — they are pseudo-replicates of one
+        wind observation, not independent draws. At ``k_neighbors=9``, 200 raw
+        observations are ≈ 22 independent fire-hours.
+    season_months : tuple of int, optional
+        Inclusive ``(first_month, last_month)`` filter applied to the sampled
+        observations. Default ``(4, 10)`` — April through October, matching
+        the fire season the ERC arrays are built on. Pass None to keep every
+        month. Without this the only temporal filter is ``year >= 2016``, so
+        winter fire-hours entered a climatology used to draw fire-season winds.
 
     Returns
     -------
@@ -521,6 +560,23 @@ def build_pyrome_wind_cells(
         k_neighbors=k_neighbors,
     )
 
+    if season_months is not None:
+        first, last = season_months
+        months = pd.to_datetime(wind_df["date"]).dt.month
+        in_season = (months >= first) & (months <= last)
+        n_dropped = int((~in_season).sum())
+        if n_dropped:
+            print(
+                f"  Season filter (months {first}–{last}): dropped {n_dropped:,} "
+                f"of {len(wind_df):,} observations"
+            )
+        wind_df = wind_df[in_season]
+        if wind_df.empty:
+            raise ValueError(
+                f"No observations remain after the months {first}–{last} season "
+                "filter. Pass season_months=None to disable it."
+            )
+
     years = pd.to_datetime(wind_df["date"]).dt.year
     year_range = f"{years.min()}–{years.max()}"
 
@@ -534,16 +590,22 @@ def build_pyrome_wind_cells(
             dir_breaks=dir_breaks,
         )
         n_noncalm = int(round(len(grp) * (1.0 - calm_pct / 100.0)))
-        if min_obs_warn > 0 and n_noncalm < min_obs_warn:
+        # The k_neighbors samples per fire-hour are pseudo-replicates: a 3x3
+        # HRRR neighbourhood spans ~9 km, well inside the synoptic
+        # decorrelation length. Judge sample size on independent fire-hours.
+        n_effective = int(n_noncalm / max(k_neighbors, 1))
+        if min_obs_warn > 0 and n_effective < min_obs_warn:
             print(
-                f"  Warning: group '{pid}' has only {n_noncalm} non-calm observations "
-                f"(calm={calm_pct:.1f}%). "
+                f"  Warning: group '{pid}' has only {n_effective} effective non-calm "
+                f"observations ({n_noncalm} raw / k_neighbors={k_neighbors}, "
+                f"calm={calm_pct:.1f}%). "
                 f"Recommend ≥{min_obs_warn} for a reliable FSPro climatology table."
             )
         result[pid] = cells
         print(
             f"  Group {pid}: {len(grp):,} obs "
-            f"({n_noncalm} non-calm, calm={calm_pct:.1f}%) "
+            f"({n_noncalm} non-calm ≈ {n_effective} independent, "
+            f"calm={calm_pct:.1f}%) "
             f"→ {cells.shape} wind cell table"
         )
 

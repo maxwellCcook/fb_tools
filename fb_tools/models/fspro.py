@@ -57,6 +57,9 @@ _FSPRO_DEFAULTS: dict = {
 _DEFAULT_SPEED_BREAKS_MPH: list[float] = [5, 10, 15, 20, 25, 30]
 _DEFAULT_DIR_BREAKS_DEG: list[float] = [45, 90, 135, 180, 225, 270, 315, 360]
 
+# Spec p.2.  Note the spelling: FSPro rejects the intuitive "Scott/Reinhardt".
+_CROWN_FIRE_METHODS: frozenset = frozenset({"Finney", "ScottRheinhardt"})
+
 
 # ── Input file builder ────────────────────────────────────────────────────────
 
@@ -73,6 +76,7 @@ def build_fspro_inputs(
     speed_breaks: list[float] | None = None,
     dir_breaks: list[float] | None = None,
     forecast: list[tuple] | None = None,
+    validate: bool = True,
     **kwargs,
 ) -> Path:
     """
@@ -92,11 +96,13 @@ def build_fspro_inputs(
         Wind frequency table, shape ``(NumWindSpeeds, NumWindDirs)``.
         Produced by :func:`~fb_tools.weather.hrrr.build_wind_cells` or
         :func:`~fb_tools.weather.hrrr.load_pyrome_wind_cells`.
-        Values are percentage frequencies; rows sum to ~100 after subtracting
-        ``calm_value``.
+        Values are percentage frequencies of **non-calm** observations, so the
+        whole table sums to ~100 on its own — ``calm_value`` is not subtracted
+        from it.
     calm_value : float
-        Percentage of calm observations (wind speed below threshold).
-        Stored as ``CalmValue`` in the FSPro input.
+        Percentage of calm observations (wind speed below threshold), written
+        as the separate ``CalmValue`` field.  The vendor's 416 sample pairs a
+        matrix summing to 99.74 with ``CalmValue: 10.25``.
     erc_historic : np.ndarray
         Historic daily ERC values, shape ``(NumERCYears, 214)``.
         Produced by :func:`~fb_tools.weather.gridmet.build_historic_erc_arrays`.
@@ -108,9 +114,18 @@ def build_fspro_inputs(
         Produced by :func:`~fb_tools.weather.gridmet.build_erc_stats`.
     erc_classes : np.ndarray
         ERC class table, shape ``(5, 10)`` — one row per class (highest ERC
-        first).  Row format:
-        ``[lower, upper, fm1, fm10, fm100, fm_herb, fm_woody, spot_dist, spot_prob, spot2]``
-        Produced by :func:`~fb_tools.weather.gridmet.build_erc_classes`.
+        first).  Row format (spec p.4):
+        ``[min_erc, max_erc, fm1, fm10, fm100, fm_herb, fm_woody,
+        burn_period_min, spot_probability, spot_delay]``
+
+        Column 8 is the **daily burn period in minutes**; the spec names the
+        field ``Duration``, which is distinct from the run-level ``Duration``
+        key that sets the number of fire days.  FSPro echoes it back as
+        ``burnPeriod`` in ``_DayTypes.txt``.
+
+        Fuel moisture must fall as ERC rises — every FM column non-decreasing
+        down the rows.  Produced by
+        :func:`~fb_tools.weather.gridmet.build_erc_classes`.
     current_erc : np.ndarray
         Current-season ERC sequence, shape ``(n_days,)``.
         Produced by :func:`~fb_tools.weather.gridmet.build_current_erc_values`.
@@ -124,8 +139,15 @@ def build_fspro_inputs(
         Upper bounds of wind direction bins in degrees (meteorological FROM).
         Defaults to ``[45, 90, 135, 180, 225, 270, 315, 360]``.
     forecast : list of tuple, optional
-        Forecast rows, each ``(erc, wind_dir_deg, wind_spd_mph)``.
-        Overrides ``NumForecast`` in *kwargs* to ``len(forecast)``.
+        Forecast rows, each ``(erc, wind_speed_mph, wind_direction_deg)`` —
+        spec p.5 order is ``ERC WindSpeed WindDirection``.  ``NumForecast`` is
+        always synced to ``len(forecast)``, and to 0 when this is None or
+        empty; any value passed in *kwargs* is overridden.  The spec also
+        requires ``NumForecast <= Duration - 1``.
+    validate : bool
+        Validate the written file with
+        :func:`~fb_tools.models.fspro_validate.assert_valid_fspro_input` before
+        returning, raising on any spec violation.  Default True.
     **kwargs
         Override any key in :data:`_FSPRO_DEFAULTS`, e.g.
         ``NumFires=2000``, ``Duration=14``, ``SPOTTING_SEED=99999``.
@@ -134,6 +156,13 @@ def build_fspro_inputs(
     -------
     Path
         Absolute path to the written file.
+
+    Raises
+    ------
+    ValueError
+        If any input array holds non-finite values, ``CROWN_FIRE_METHOD`` is
+        not one of ``{"Finney", "ScottRheinhardt"}``, or — when ``validate`` is
+        True — the written file violates the vendor spec.
 
     Examples
     --------
@@ -168,8 +197,19 @@ def build_fspro_inputs(
     params = dict(_FSPRO_DEFAULTS)
     params.update(kwargs)
 
-    if forecast is not None:
-        params["NumForecast"] = len(forecast)
+    # NumForecast must always match the rows actually written.  Syncing only
+    # when forecast is not None let a stray NumForecast=N in kwargs survive
+    # with no rows behind it, and FSPro then read BarrierFill / SavePerimeters
+    # / IgnitionFile as forecast records (defect #8).
+    params["NumForecast"] = len(forecast) if forecast else 0
+
+    crown_method = params["CROWN_FIRE_METHOD"]
+    if crown_method not in _CROWN_FIRE_METHODS:
+        raise ValueError(
+            f"CROWN_FIRE_METHOD={crown_method!r} is invalid; FSPro accepts "
+            f"{sorted(_CROWN_FIRE_METHODS)}. Note the spec spelling is "
+            "'ScottRheinhardt' — not 'Scott/Reinhardt'."
+        )
 
     n_speed = wind_cells.shape[0]
     n_dir = wind_cells.shape[1]
@@ -180,6 +220,28 @@ def build_fspro_inputs(
 
     def _fmt_row(values, fmt="{:.2f}"):
         return " ".join(fmt.format(v) for v in values)
+
+    # int(round(nan)) raises ValueError with no indication of which array is at
+    # fault.  An all-NaN day-of-season column reaches here whenever a pyrome has
+    # no observations on some season day, so name the array instead of crashing.
+    for _name, _arr in (
+        ("erc_historic", erc_historic),
+        ("erc_avg", erc_avg),
+        ("erc_std", erc_std),
+        ("erc_classes", erc_classes),
+        ("current_erc", current_erc),
+        ("wind_cells", wind_cells),
+    ):
+        _a = np.asarray(_arr, dtype=float)
+        if not np.all(np.isfinite(_a)):
+            n_bad = int((~np.isfinite(_a)).sum())
+            raise ValueError(
+                f"{_name} contains {n_bad} non-finite value(s); FSPro input "
+                "fields must all be finite. This usually means a day-of-season "
+                "column had no observations in the source climatology."
+            )
+    if not np.isfinite(calm_value):
+        raise ValueError("calm_value must be finite")
 
     with open(output_path, "w") as f:
         # ── Header block ──────────────────────────────────────────────────────
@@ -208,7 +270,9 @@ def build_fspro_inputs(
         # ── ERC classes ───────────────────────────────────────────────────────
         f.write(f"NumERCClasses: {n_erc_classes}\n")
         for row in erc_classes:
-            # lower upper fm1 fm10 fm100 fm_herb fm_woody spot_dist spot_prob spot2
+            # min_erc max_erc fm1 fm10 fm100 fm_herb fm_woody
+            # burn_period_min spot_probability spot_delay   (spec p.4;
+            # column 8 is the daily burn period, not a spotting distance)
             f.write(
                 f"{row[0]:.0f} {row[1]:.0f} "
                 f"{row[2]:.1f} {row[3]:.1f} {row[4]:.1f} "
@@ -244,6 +308,26 @@ def build_fspro_inputs(
         f.write(f"BarrierFill: {params['BarrierFill']}\n")
         f.write(f"SavePerimeters: {params['SavePerimeters']}\n")
         f.write(f"IgnitionFile: {ignition_file}\n")
+
+    if validate:
+        # Validate what was actually written, not the arguments — the file is
+        # what FSPro reads, and the :.0f / :.1f formatting is part of the
+        # contract (ERC class bounds, for one, are checked as rounded).
+        from fb_tools.models.fspro_validate import assert_valid_fspro_input
+
+        try:
+            assert_valid_fspro_input(output_path, warn=True)
+        except ValueError:
+            # Move the rejected file aside. Leaving a spec-violating .input in
+            # place invites someone to run it anyway — FSPro does not validate,
+            # it just misreads.
+            quarantined = output_path.with_suffix(output_path.suffix + ".invalid")
+            output_path.replace(quarantined)
+            print(
+                f"  [build_fspro_inputs] validation failed — wrote the rejected "
+                f"file to {quarantined.name} for inspection"
+            )
+            raise
 
     print(f"  [build_fspro_inputs] Wrote {output_path.name} "
           f"(NumFires={params['NumFires']}, {n_erc_years}yr ERC, "

@@ -392,20 +392,25 @@ def test_assert_passes_on_vendor_file(vendor_input):
 PYROME_IDS = ["42", "43", "45", "46", "47", "52", "53", "56", "128"]
 
 
-@pytest.mark.xfail(
-    reason="P1.1 — build_erc_classes derives live FM from the bin-median DOY, "
-           "so the extreme-ERC class gets the greenest fuels. Expected to pass "
-           "once live FM comes from RTMA or calc_live_fm_from_dead.",
-    strict=False,
-)
-@pytest.mark.parametrize("pyrome_id", PYROME_IDS)
-def test_cached_erc_classes_have_monotonic_live_fm(pyrome_id):
-    """Live herb/woody FM in the cached class tables must fall as ERC rises."""
+def _cached_classes(pyrome_id):
+    """Cached ERC class table for a pyrome, or skip when absent."""
     cache = PYROME_ERC_DIR / f"pyrome_{pyrome_id}_gridmet.json"
     if not cache.exists():
         pytest.skip(f"no cached ERC climatology for pyrome {pyrome_id}")
+    meta = json.loads(cache.read_text())
+    if "ERCClasses" not in meta:
+        pytest.skip(f"cache for pyrome {pyrome_id} has no ERCClasses block")
+    return np.asarray(meta["ERCClasses"], dtype=float)
 
-    classes = np.asarray(json.loads(cache.read_text())["ERCClasses"], dtype=float)
+
+# P1.1 closed this: live FM now scales from RTMA-sourced FM100 rather than the
+# bin-median DOY, so the inversion that made the extreme class the greenest is
+# gone.  This was a non-strict xfail through Phase 0; it is a hard requirement
+# now and must never regress.
+@pytest.mark.parametrize("pyrome_id", PYROME_IDS)
+def test_cached_erc_classes_have_monotonic_live_fm(pyrome_id):
+    """Live herb/woody FM in the cached class tables must fall as ERC rises."""
+    classes = _cached_classes(pyrome_id)
     for name, col in (("fm_herb", 5), ("fm_woody", 6)):
         diffs = np.diff(classes[:, col])
         assert np.all(diffs >= -1e-9), (
@@ -413,3 +418,52 @@ def test_cached_erc_classes_have_monotonic_live_fm(pyrome_id):
             f"top class (ERC {classes[0, 0]:.0f}-{classes[0, 1]:.0f}) has "
             f"{classes[0, col]:.1f}, bottom class has {classes[-1, col]:.1f}"
         )
+
+
+@pytest.mark.parametrize("pyrome_id", PYROME_IDS)
+def test_cached_erc_classes_have_monotonic_dead_fm(pyrome_id):
+    """Dead FM must fall as ERC rises too — the same physics as live FM."""
+    classes = _cached_classes(pyrome_id)
+    for name, col in (("fm1", 2), ("fm10", 3), ("fm100", 4)):
+        assert np.all(np.diff(classes[:, col]) >= -1e-9), (
+            f"pyrome {pyrome_id}: {name} rises with ERC"
+        )
+
+
+@pytest.mark.parametrize("pyrome_id", PYROME_IDS)
+def test_cached_erc_classes_are_gapless_as_written(pyrome_id):
+    """
+    Adjacent classes share an edge, so the table has no gap once FSPro reads
+    the ``:.0f``-rounded bounds.  Rows run highest ERC first.
+    """
+    classes = _cached_classes(pyrome_id)
+    lo, hi = np.rint(classes[:, 0]).astype(int), np.rint(classes[:, 1]).astype(int)
+    assert np.all(np.diff(lo) < 0), f"pyrome {pyrome_id}: classes not descending"
+    assert np.all(lo[:-1] == hi[1:]), (
+        f"pyrome {pyrome_id}: class bounds leave a gap — lo={lo.tolist()}, hi={hi.tolist()}"
+    )
+
+
+@pytest.mark.parametrize("pyrome_id", PYROME_IDS)
+def test_cached_extreme_class_live_fm_is_plausible(pyrome_id):
+    """
+    The extreme-ERC class should sit near Ager et al. (2014, Table 7) — live
+    herbaceous 40–60%, live woody 60–90%.  The pre-P1.1 tables wrote 142/193.
+    Bounds are loose; this is a guard against another order-of-magnitude slip,
+    not a calibration assertion.
+    """
+    classes = _cached_classes(pyrome_id)
+    herb, woody = classes[0, 5], classes[0, 6]
+    assert 25.0 <= herb <= 90.0, f"pyrome {pyrome_id}: extreme-class fm_herb={herb}"
+    assert 55.0 <= woody <= 110.0, f"pyrome {pyrome_id}: extreme-class fm_woody={woody}"
+
+
+def test_cached_erc_classes_use_default_burn_period_ladder():
+    """
+    Column 8 is the daily burn period in minutes (spec ``Duration``), not a
+    spotting distance.  The cached tables should carry the 6 h → 2 h ladder.
+    """
+    classes = _cached_classes("47")
+    assert classes[:, 7].tolist() == [360.0, 300.0, 240.0, 180.0, 120.0]
+    # Column 9 is spot probability — a probability, so bounded by 1.
+    assert np.all((classes[:, 8] >= 0.0) & (classes[:, 8] <= 1.0))

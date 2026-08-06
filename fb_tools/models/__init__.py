@@ -2,6 +2,7 @@ from .flammap import run_flammap_scenarios
 from .scenarios import (
     load_scenarios,
     build_scenarios,
+    scenario_cache_to_conditions,
     run_batch,
     stacked_output_path,
     build_mtt_scenarios,
@@ -20,6 +21,7 @@ __all__ = [
     "run_flammap_scenarios",
     "load_scenarios",
     "build_scenarios",
+    "scenario_cache_to_conditions",
     "run_batch",
     "stacked_output_path",
     "build_mtt_scenarios",

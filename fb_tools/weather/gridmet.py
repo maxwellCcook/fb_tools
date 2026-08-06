@@ -92,6 +92,7 @@ _NEUTRAL_VARS = ("pr", "th")
 def load_gridmet_csv(
     csv_path: str | Path,
     tail_percentile: int = 50,
+    aoi_col: str = "pyrome",
 ) -> pd.DataFrame:
     """
     Load and normalize the GEE-exported GridMET fire-season CSV.
@@ -125,6 +126,10 @@ def load_gridmet_csv(
 
         Must be one of ``{10, 25, 50, 75, 90}`` (the set exported by the
         GEE reducer).  Legacy flat CSVs ignore this parameter.
+    aoi_col : str
+        Name of the spatial grouping column in the CSV (default ``"pyrome"``).
+        Set to the AOI id column (e.g. ``"forest_id"``) when the export was
+        aggregated over a non-pyrome unit.
 
     Returns
     -------
@@ -162,12 +167,12 @@ def load_gridmet_csv(
     ) or any(f"erc_p{p}" in df.columns for p in allowed_pctiles)
 
     if is_percentile_format:
-        df = _select_percentile_columns(df, tail_percentile)
+        df = _select_percentile_columns(df, tail_percentile, aoi_col=aoi_col)
         fmt_label = f"percentile-suffix (tail={tail_percentile})"
     else:
         fmt_label = "legacy flat"
 
-    required = {"pyrome", "date", "erc", "fm100", "fm1000", "tmmx", "rmin"}
+    required = {aoi_col, "date", "erc", "fm100", "fm1000", "tmmx", "rmin"}
     missing = required - set(df.columns)
     if missing:
         raise KeyError(f"Missing required columns: {missing}")
@@ -208,16 +213,18 @@ def load_gridmet_csv(
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     n_before = len(df)
-    df = df.dropna(subset=["erc", "pyrome"]).reset_index(drop=True)
+    df = df.dropna(subset=["erc", aoi_col]).reset_index(drop=True)
     if len(df) < n_before:
-        print(f"  [load_gridmet_csv] Dropped {n_before - len(df)} rows with missing erc/PYROME")
+        print(f"  [load_gridmet_csv] Dropped {n_before - len(df)} rows with missing erc/{aoi_col}")
 
-    print(f"  [load_gridmet_csv] {len(df):,} rows, {df['pyrome'].nunique()} pyromes, "
+    print(f"  [load_gridmet_csv] {len(df):,} rows, {df[aoi_col].nunique()} {aoi_col}s, "
           f"years {df['year'].min()}–{df['year'].max()}  [{fmt_label}]")
     return df
 
 
-def _select_percentile_columns(df: pd.DataFrame, tail_percentile: int) -> pd.DataFrame:
+def _select_percentile_columns(
+    df: pd.DataFrame, tail_percentile: int, aoi_col: str = "pyrome"
+) -> pd.DataFrame:
     """
     Collapse a multi-percentile GridMET DataFrame to flat columns.
 
@@ -246,7 +253,7 @@ def _select_percentile_columns(df: pd.DataFrame, tail_percentile: int) -> pd.Dat
             renames[src] = v
 
     # Start with meta columns + renamed tail selections; drop everything else.
-    keep_meta = [c for c in ("pyrome", "date", "year", "doy", "system:index") if c in df.columns]
+    keep_meta = [c for c in (aoi_col, "date", "year", "doy", "system:index") if c in df.columns]
     keep = keep_meta + list(renames.keys())
     out = df[keep].rename(columns=renames).copy()
     return out
@@ -257,6 +264,7 @@ def build_historic_erc_arrays(
     pyrome_col: str = "pyrome",
     n_years: int = 15,
     out_dir: str | Path | None = None,
+    prefix: str = "pyrome",
 ) -> dict[str, np.ndarray]:
     """
     Build per-pyrome historic ERC arrays for FSPro ``HistoricERCValues``.
@@ -282,7 +290,10 @@ def build_historic_erc_arrays(
         Expected number of years in the record (default 15 for 2008–2022).
         Used only for the warning message; does not truncate data.
     out_dir : str or Path, optional
-        If provided, write ``pyrome_{id}_gridmet.json`` cache files here.
+        If provided, write ``{prefix}_{id}_gridmet.json`` cache files here.
+    prefix : str
+        Cache filename prefix (default ``"pyrome"``).  Set to the AOI kind
+        (e.g. ``"forest"``) to namespace non-pyrome caches.
 
     Returns
     -------
@@ -335,7 +346,7 @@ def build_historic_erc_arrays(
                 "NumWxPerYear": int(arr.shape[1]),
                 "HistoricERCValues": arr.tolist(),
             }
-            _write_json(cache, out_dir / f"pyrome_{pyrome_id}_gridmet.json")
+            _write_json(cache, out_dir / f"{prefix}_{pyrome_id}_gridmet.json")
 
     print(f"  [build_historic_erc_arrays] {len(result)} pyromes → "
           f"arrays shape ({n_years}, {_N_SEASON_DAYS})")
@@ -909,6 +920,7 @@ def build_flammap_scenario_cache(
     rtma_daily_df: pd.DataFrame | None = None,
     rtma_pyrome_col: str = "pyrome_id",
     rtma_date_col: str = "date",
+    prefix: str = "pyrome",
 ) -> dict[str, dict]:
     """
     Build per-pyrome FlamMap scenario caches at multiple ERC percentiles.
@@ -1221,7 +1233,7 @@ def build_flammap_scenario_cache(
         result[pid_str] = cache
 
         if out_dir is not None:
-            _write_json(cache, out_dir / f"pyrome_{pyrome_id}_flammap.json")
+            _write_json(cache, out_dir / f"{prefix}_{pyrome_id}_flammap.json")
 
     print(f"  [build_flammap_scenario_cache] {len(result)} pyromes × {len(percentiles)} scenarios "
           f"(±{erc_band:.3f} ERC band, wind={ws_source_label}, "
@@ -1232,6 +1244,7 @@ def build_flammap_scenario_cache(
 def load_flammap_scenario_cache(
     pyrome_id: str | int,
     cache_dir: str | Path,
+    prefix: str = "pyrome",
 ) -> dict:
     """
     Load a cached FlamMap scenario FM table from JSON.
@@ -1239,9 +1252,11 @@ def load_flammap_scenario_cache(
     Parameters
     ----------
     pyrome_id : str or int
-        Pyrome identifier matching the ``pyrome_{id}_flammap.json`` filename.
+        Identifier matching the ``{prefix}_{id}_flammap.json`` filename.
     cache_dir : str or Path
         Directory containing the JSON cache files.
+    prefix : str
+        Cache filename prefix (default ``"pyrome"``).
 
     Returns
     -------
@@ -1262,7 +1277,7 @@ def load_flammap_scenario_cache(
     >>> fm_params = cache["scenarios"]["p97"]
     >>> fm_params["FM_herb"]  # live herbaceous FM at 97th percentile ERC
     """
-    path = Path(cache_dir) / f"pyrome_{pyrome_id}_flammap.json"
+    path = Path(cache_dir) / f"{prefix}_{pyrome_id}_flammap.json"
     if not path.exists():
         raise FileNotFoundError(
             f"No FlamMap scenario cache for '{pyrome_id}' in {cache_dir}.\n"
@@ -1276,6 +1291,7 @@ def load_gridmet_pyrome_cache(
     pyrome_id: str | int,
     cache_dir: str | Path,
     return_meta: bool = False,
+    prefix: str = "pyrome",
 ) -> np.ndarray | dict:
     """
     Load cached GridMET historic ERC array from JSON.
@@ -1283,7 +1299,7 @@ def load_gridmet_pyrome_cache(
     Parameters
     ----------
     pyrome_id : str or int
-        Pyrome identifier matching the ``pyrome_{id}_gridmet.json`` filename.
+        Identifier matching the ``{prefix}_{id}_gridmet.json`` filename.
     cache_dir : str or Path
         Directory containing the JSON cache files.
     return_meta : bool
@@ -1300,7 +1316,7 @@ def load_gridmet_pyrome_cache(
     FileNotFoundError
         If the cache file does not exist.
     """
-    cache_path = Path(cache_dir) / f"pyrome_{pyrome_id}_gridmet.json"
+    cache_path = Path(cache_dir) / f"{prefix}_{pyrome_id}_gridmet.json"
     if not cache_path.exists():
         raise FileNotFoundError(f"GridMET cache not found: {cache_path}")
     with open(cache_path) as f:
@@ -1315,6 +1331,7 @@ def save_erc_classes_to_cache(
     cache_dir: str | Path,
     pyrome_col: str = "pyrome",
     n_classes: int = 5,
+    prefix: str = "pyrome",
 ) -> list[str]:
     """
     Enrich existing ``pyrome_{id}_gridmet.json`` cache files with ERC classes.
@@ -1355,12 +1372,12 @@ def save_erc_classes_to_cache(
     ... )
     """
     cache_dir = Path(cache_dir)
-    df = load_gridmet_csv(gridmet_csv)
+    df = load_gridmet_csv(gridmet_csv, aoi_col=pyrome_col)
     classes_dict = build_erc_classes(df, pyrome_col=pyrome_col, n_classes=n_classes)
 
     updated: list[str] = []
     for pid, classes_arr in classes_dict.items():
-        cache_path = cache_dir / f"pyrome_{pid}_gridmet.json"
+        cache_path = cache_dir / f"{prefix}_{pid}_gridmet.json"
         if not cache_path.exists():
             print(f"  [save_erc_classes_to_cache] Skipping pyrome {pid} — "
                   f"cache file not found: {cache_path.name}")

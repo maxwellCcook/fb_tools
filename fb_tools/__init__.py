@@ -57,6 +57,7 @@ from .models import (
     run_flammap_scenarios,
     load_scenarios,
     build_scenarios,
+    scenario_cache_to_conditions,
     run_batch,
     stacked_output_path,
     build_mtt_scenarios,
@@ -89,6 +90,8 @@ from .utils import (
     clip_raster_inplace,
     lookup_pyrome,
     get_pyrome_id,
+    pyrome_centroids,
+    pyrome_tz_offsets,
     list_files,
     plot_bands,
 )
@@ -141,6 +144,7 @@ __all__ = [
     "run_flammap_scenarios",
     "load_scenarios",
     "build_scenarios",
+    "scenario_cache_to_conditions",
     "run_batch",
     "stacked_output_path",
     "build_mtt_scenarios",
@@ -171,6 +175,8 @@ __all__ = [
     "clip_raster_inplace",
     "lookup_pyrome",
     "get_pyrome_id",
+    "pyrome_centroids",
+    "pyrome_tz_offsets",
     "list_files",
     "plot_bands",
     # weather — hrrr

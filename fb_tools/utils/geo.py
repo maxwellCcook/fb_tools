@@ -166,6 +166,88 @@ def lookup_pyrome(container_geom, pyromes_gdf, pyrome_col="Pyrome_ID"):
     return clipped.loc[clipped["_area"].idxmax(), pyrome_col]
 
 
+def pyrome_centroids(
+    pyromes,
+    ids=None,
+    id_col: str = "Pyrome_ID",
+    proj_crs: str = "EPSG:5070",
+):
+    """
+    Return per-AOI centroid latitude/longitude for weather parameterization.
+
+    Centroids are computed in a projected CRS (default CONUS Albers,
+    ``EPSG:5070``) to avoid the geometric distortion of centroids taken in a
+    geographic CRS, then converted back to WGS84 lon/lat.  The result feeds the
+    per-AOI ``lat_deg`` (daylength/GSI) and ``tz_offset_hours`` arguments of the
+    RTMA fuel-moisture builders — the timezone offset is estimated as
+    ``round(lon / 15)`` (nominal 15°-per-hour solar time; verify against the
+    civil time zone for AOIs near a boundary).
+
+    Parameters
+    ----------
+    pyromes : geopandas.GeoDataFrame or str or Path
+        Pyrome (or other AOI) polygons, or a path readable by
+        ``geopandas.read_file``.
+    ids : iterable, optional
+        Subset of ``id_col`` values to return.  If omitted, all features are
+        returned.  Matched as strings so ``42`` and ``"42"`` are equivalent.
+    id_col : str
+        Column holding the AOI identifier (default ``"Pyrome_ID"``).
+    proj_crs : str
+        Projected CRS used for the centroid computation (default ``"EPSG:5070"``).
+
+    Returns
+    -------
+    dict
+        ``{aoi_id_str: (lat_deg, lon_deg)}`` for each requested feature.
+
+    Raises
+    ------
+    KeyError
+        If any requested id in *ids* is not present in *pyromes*.
+    """
+    import geopandas as gpd
+
+    gdf = pyromes if hasattr(pyromes, "geometry") else gpd.read_file(pyromes)
+    if id_col not in gdf.columns:
+        raise KeyError(f"id_col {id_col!r} not in pyromes columns: {list(gdf.columns)}")
+
+    sub = gdf[[id_col, "geometry"]].copy()
+    if ids is not None:
+        wanted = {str(i) for i in ids}
+        sub = sub[sub[id_col].astype(str).isin(wanted)]
+        missing = sorted(wanted - set(sub[id_col].astype(str)))
+        if missing:
+            raise KeyError(f"ids not found in pyromes: {missing}")
+
+    cent_ll = sub.to_crs(proj_crs).geometry.centroid.to_crs("EPSG:4326")
+    return {
+        str(aoi_id): (float(pt.y), float(pt.x))
+        for aoi_id, pt in zip(sub[id_col].values, cent_ll)
+    }
+
+
+def pyrome_tz_offsets(centroids: dict) -> dict:
+    """
+    Estimate UTC offsets (hours) from a ``{aoi_id: (lat, lon)}`` centroid dict.
+
+    Uses nominal solar time (``round(lon / 15)``).  This is a convenience for
+    the ``tz_offset_hours`` mapping accepted by the RTMA builders; confirm the
+    civil time zone for any AOI whose longitude sits near a 7.5° boundary.
+
+    Parameters
+    ----------
+    centroids : dict
+        Output of :func:`pyrome_centroids` (``{aoi_id: (lat, lon)}``).
+
+    Returns
+    -------
+    dict
+        ``{aoi_id: utc_offset_hours}``.
+    """
+    return {aoi_id: int(round(lon / 15.0)) for aoi_id, (lat, lon) in centroids.items()}
+
+
 def get_pyrome_id(
     location,
     pyromes,

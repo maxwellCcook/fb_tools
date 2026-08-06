@@ -445,6 +445,7 @@ def build_pyrome_wind_cells(
     k_neighbors: int = 9,
     out_dir: "Path | str | None" = None,
     min_obs_warn: int = 100,
+    prefix: str = "pyrome",
 ) -> "dict[str, np.ndarray]":
     """
     Build per-area wind frequency tables from HRRR data at fire occurrence locations.
@@ -556,6 +557,7 @@ def build_pyrome_wind_cells(
                 n_obs=len(grp),
                 years_covered=year_range,
                 out_dir=Path(out_dir),
+                prefix=prefix,
             )
             print(f"    → {out_path.name}")
 
@@ -571,6 +573,7 @@ def _write_wind_cells_json(
     n_obs: int,
     years_covered: str,
     out_dir: Path,
+    prefix: str = "pyrome",
 ) -> Path:
     """Write per-area wind cells to JSON cache file."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -585,7 +588,7 @@ def _write_wind_cells_json(
         "n_observations": n_obs,
         "years_covered": years_covered,
     }
-    out_path = out_dir / f"pyrome_{pyrome_id}_wind.json"
+    out_path = out_dir / f"{prefix}_{pyrome_id}_wind.json"
     with open(out_path, "w") as f:
         json.dump(data, f, indent=2)
     return out_path
@@ -595,6 +598,7 @@ def load_pyrome_wind_cells(
     pyrome_id: "str | int",
     cache_dir: "Path | str",
     return_meta: bool = False,
+    prefix: str = "pyrome",
 ) -> "np.ndarray | dict":
     """
     Load a cached wind frequency table from JSON.
@@ -625,7 +629,7 @@ def load_pyrome_wind_cells(
     FileNotFoundError
         If no cached file exists for this group.
     """
-    path = Path(cache_dir) / f"pyrome_{pyrome_id}_wind.json"
+    path = Path(cache_dir) / f"{prefix}_{pyrome_id}_wind.json"
     if not path.exists():
         raise FileNotFoundError(
             f"No wind cells cache for '{pyrome_id}' in {cache_dir}.\n"

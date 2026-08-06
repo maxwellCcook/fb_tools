@@ -207,6 +207,92 @@ def build_scenarios(conditions, lcps, outputs=None, **defaults):
     return df
 
 
+# Fuel-moisture / wind keys copied verbatim from a scenario cache entry into a
+# conditions row.  Names match both the cache entry (gridmet.build_flammap_
+# scenario_cache) and the conditions columns build_scenarios expects.
+_CACHE_CONDITION_KEYS = (
+    "WIND_SPEED",
+    "WIND_DIRECTION",
+    "FM_1hr",
+    "FM_10hr",
+    "FM_100hr",
+    "FM_herb",
+    "FM_woody",
+)
+
+
+def scenario_cache_to_conditions(cache, percentiles=None, scenario_prefix="Pct"):
+    """
+    Convert a loaded FlamMap scenario cache into a ``build_scenarios`` table.
+
+    Closes the manual glue step between the weather layer and the run layer:
+    :func:`~fb_tools.weather.gridmet.load_flammap_scenario_cache` returns a
+    nested dict, and this turns its ``"scenarios"`` block into a flat
+    ``conditions`` DataFrame ready to pass to :func:`build_scenarios`.
+
+    Parameters
+    ----------
+    cache : dict
+        A cache dict as returned by
+        :func:`~fb_tools.weather.gridmet.load_flammap_scenario_cache` (must
+        contain a ``"scenarios"`` mapping keyed by percentile, e.g. ``"p97"``).
+    percentiles : iterable, optional
+        Subset / ordering of percentile bands to emit.  Items may be ints
+        (``97``) or cache keys (``"p97"``).  Defaults to every scenario in the
+        cache, in its stored order.
+    scenario_prefix : str
+        Prefix for the generated ``Scenario`` name; ``"p97"`` → ``"Pct97"``
+        (default prefix ``"Pct"``).
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per percentile with columns ``Scenario`` + the fuel-moisture /
+        wind fields consumed by :func:`build_scenarios`.
+
+    Raises
+    ------
+    KeyError
+        If *cache* lacks a ``"scenarios"`` block, a requested percentile is
+        absent, or a scenario entry is missing a required field (e.g.
+        ``WIND_SPEED`` was ``None`` because no wind source was supplied when
+        the cache was built).
+
+    Examples
+    --------
+    >>> from fb_tools import load_flammap_scenario_cache, scenario_cache_to_conditions
+    >>> cache = load_flammap_scenario_cache(42, "data/weather/pyrome_flammap/")
+    >>> conditions = scenario_cache_to_conditions(cache, percentiles=[50, 90, 97])
+    >>> scenarios = build_scenarios(conditions, ["baseline.tif", "treated.tif"])
+    """
+    if "scenarios" not in cache:
+        raise KeyError("cache has no 'scenarios' block — pass a FlamMap scenario cache dict")
+    scenarios = cache["scenarios"]
+
+    if percentiles is None:
+        keys = list(scenarios.keys())
+    else:
+        keys = [f"p{p}" if not str(p).startswith("p") else str(p) for p in percentiles]
+
+    rows = []
+    for key in keys:
+        if key not in scenarios:
+            raise KeyError(f"percentile {key!r} not in cache scenarios ({list(scenarios)})")
+        entry = scenarios[key]
+        name = f"{scenario_prefix}{key[1:]}" if key.startswith("p") else key
+        row = {"Scenario": name}
+        for k in _CACHE_CONDITION_KEYS:
+            if k not in entry or entry[k] is None:
+                raise KeyError(
+                    f"scenario {key!r} is missing {k!r} (value None?). "
+                    "Rebuild the cache with a wind source / FM source that populates it."
+                )
+            row[k] = entry[k]
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
 def run_batch(
     fm_exe,
     scenarios_df,

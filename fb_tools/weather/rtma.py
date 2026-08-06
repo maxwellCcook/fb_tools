@@ -35,7 +35,7 @@ dead-FM and (optionally) live-FM legs of the FlamMap percentile scenarios.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Mapping
 
 import numpy as np
 import pandas as pd
@@ -255,14 +255,39 @@ def build_rtma_dead_fm(
     return out
 
 
+def _resolve_by_aoi(aoi_series: pd.Series, value, param_name: str):
+    """
+    Resolve a scalar-or-mapping parameter to a per-row value.
+
+    A scalar is returned unchanged (callers broadcast it, preserving the
+    original single-value behaviour).  A mapping keyed by AOI id (e.g. pyrome
+    centroids → latitude, or → UTC offset) is aligned to ``aoi_series`` and
+    returned as a float ndarray.  Keys are matched as strings so ``42`` and
+    ``"42"`` are interchangeable.
+
+    Raises
+    ------
+    KeyError
+        If any AOI id in ``aoi_series`` is absent from the mapping.
+    """
+    if isinstance(value, Mapping):
+        lut = {str(k): float(v) for k, v in value.items()}
+        keys = aoi_series.astype(str)
+        missing = sorted(set(keys) - set(lut))
+        if missing:
+            raise KeyError(f"{param_name} mapping missing entries for AOI ids: {missing}")
+        return keys.map(lut).to_numpy(dtype=float)
+    return value
+
+
 def build_rtma_live_fm(
     df: pd.DataFrame,
-    lat_deg: float,
+    lat_deg: float | Mapping[str, float],
     pyrome_col: str = "pyrome_id",
     datetime_col: str = "datetime_utc",
     tmp_col: str = "tmp_f",
     vpd_col: str = "vpd_pa",
-    tz_offset_hours: float = -7.0,
+    tz_offset_hours: float | Mapping[str, float] = -7.0,
     vpd_local_start: int = 13,
     vpd_local_end: int = 16,
 ) -> pd.DataFrame:
@@ -304,12 +329,18 @@ def build_rtma_live_fm(
     ----------
     df : pd.DataFrame
         Hourly RTMA frame (output of :func:`load_rtma_csv`).
-    lat_deg : float
-        Site latitude (decimal degrees) for the daylength calculation.
+    lat_deg : float or mapping
+        Site latitude (decimal degrees) for the daylength calculation.  Pass a
+        scalar to apply one latitude to every AOI (original behaviour), or a
+        ``{aoi_id: latitude}`` mapping (e.g. from
+        :func:`~fb_tools.utils.geo.pyrome_centroids`) to use each AOI's own
+        latitude — recommended when AOIs span a wide latitude range (e.g.
+        Colorado ~39°N vs. Idaho ~45°N), since daylength drives GSI.
     pyrome_col, datetime_col, tmp_col, vpd_col : str
         Column names.
-    tz_offset_hours : float
-        UTC offset of the local time zone.  Default -7 (MST).
+    tz_offset_hours : float or mapping
+        UTC offset of the local time zone.  Scalar (default -7, MST) or a
+        ``{aoi_id: offset}`` mapping for AOIs in different time zones.
     vpd_local_start, vpd_local_end : int
         Half-open local-hour window for VPD averaging used in the GSI
         calculation.  Defaults ``[13, 16)`` (1300–1600 LST), matching the
@@ -327,7 +358,8 @@ def build_rtma_live_fm(
 
     work = df[[pyrome_col, datetime_col, tmp_col, vpd_col]].copy()
     work[datetime_col] = pd.to_datetime(work[datetime_col])
-    local = work[datetime_col] + pd.to_timedelta(tz_offset_hours, unit="h")
+    tz = _resolve_by_aoi(work[pyrome_col], tz_offset_hours, "tz_offset_hours")
+    local = work[datetime_col] + pd.to_timedelta(tz, unit="h")
     work["date"] = local.dt.normalize()
     work["doy"] = local.dt.dayofyear
     work["hour_local"] = local.dt.hour
@@ -360,7 +392,8 @@ def build_rtma_live_fm(
         doy, on=[pyrome_col, "date"], how="left"
     )
 
-    daylength_hr = calc_daylength(daily["doy"].values, lat_deg)
+    lat = _resolve_by_aoi(daily[pyrome_col], lat_deg, "lat_deg")
+    daylength_hr = calc_daylength(daily["doy"].values, lat)
     daily["gsi"] = calc_gsi(
         tmin_f=daily["tmin_f"].values,
         vpd_pa=daily["vpd_firewindow_pa"].values,
@@ -375,7 +408,7 @@ def build_rtma_live_fm(
 def collapse_to_peak_hour(
     df: pd.DataFrame,
     peak_hour_local: int = 14,
-    tz_offset_hours: float = -7.0,
+    tz_offset_hours: float | Mapping[str, float] = -7.0,
     pyrome_col: str = "pyrome_id",
     datetime_col: str = "datetime_utc",
     value_cols: Iterable[str] = ("FM1", "FM10", "FM100", "tmp_f", "rh_pct", "pcp_mm_hr"),
@@ -396,8 +429,9 @@ def collapse_to_peak_hour(
         of :func:`build_rtma_dead_fm`).
     peak_hour_local : int
         Local hour (0–23) to sample.  Default 14.
-    tz_offset_hours : float
-        UTC offset.  Default -7 (MST).
+    tz_offset_hours : float or mapping
+        UTC offset (scalar, default -7 MST) or a ``{aoi_id: offset}`` mapping
+        for AOIs spanning multiple time zones.
     pyrome_col, datetime_col : str
         Column names.
     value_cols : iterable of str
@@ -414,7 +448,8 @@ def collapse_to_peak_hour(
 
     work = df.copy()
     work[datetime_col] = pd.to_datetime(work[datetime_col])
-    local = work[datetime_col] + pd.to_timedelta(tz_offset_hours, unit="h")
+    tz = _resolve_by_aoi(work[pyrome_col], tz_offset_hours, "tz_offset_hours")
+    local = work[datetime_col] + pd.to_timedelta(tz, unit="h")
     work["date"] = local.dt.normalize()
     work["doy"] = local.dt.dayofyear
     work["hour_local"] = local.dt.hour

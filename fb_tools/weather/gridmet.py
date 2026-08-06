@@ -1716,9 +1716,6 @@ def load_flammap_scenario_cache(
 
     Examples
     --------
-    >>> cache = load_flammap_scenario_cache(42, "cache/")
-    >>> fm_params = cache["scenarios"]["p97"]
-    >>> fm_params["FM_herb"]  # live herbaceous FM at 97th percentile ERC
     """
     path = Path(cache_dir) / f"{prefix}_{pyrome_id}_flammap.json"
     if not path.exists():

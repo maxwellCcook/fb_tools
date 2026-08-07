@@ -293,6 +293,86 @@ def scenario_cache_to_conditions(cache, percentiles=None, scenario_prefix="Pct")
     return pd.DataFrame(rows)
 
 
+def build_wind_sweep_conditions(
+    cache,
+    wind_speeds,
+    percentile=97,
+    wind_direction=None,
+    scenario_fmt="{pct}_W{ws:g}",
+):
+    """
+    Hold fuel moisture at one percentile and sweep wind speed.
+
+    Answers "under fixed hot/dry conditions, how does wind speed drive fire
+    behaviour?".  Every returned row carries the *same* fuel moistures — the
+    ones cached for *percentile* — and differs only in ``WIND_SPEED``, so any
+    difference in the resulting FlamMap surfaces is attributable to wind alone.
+
+    Parameters
+    ----------
+    cache : dict
+        A FlamMap scenario cache from
+        :func:`~fb_tools.weather.gridmet.load_flammap_scenario_cache`.
+    wind_speeds : iterable of float
+        20-ft wind speeds (mph) to run.  Duplicates are dropped and the values
+        are sorted ascending.
+    percentile : int or str
+        Which cached percentile supplies the fuel moistures (default ``97``).
+        Accepts ``97`` or ``"p97"``.
+    wind_direction : int or float, optional
+        Overrides the cached ``WIND_DIRECTION`` for every row.  FlamMap reads
+        ``-1`` as upslope and ``-2`` as downslope; a value in ``[0, 360)`` is a
+        fixed azimuth.  Defaults to whatever the cache stored.
+    scenario_fmt : str
+        Format string for the ``Scenario`` name, given ``pct`` (e.g. ``"Pct97"``)
+        and ``ws`` (the wind speed).  The default yields ``"Pct97_W20"``.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per wind speed, with the columns
+        :func:`build_scenarios` expects plus a ``WIND_SPEED_baseline`` column
+        recording the cached wind speed the percentile was derived with.
+
+    Raises
+    ------
+    ValueError
+        If *wind_speeds* is empty or holds a negative value.
+    KeyError
+        If *percentile* is not in the cache (raised by
+        :func:`scenario_cache_to_conditions`).
+
+    Examples
+    --------
+    >>> cache = load_flammap_scenario_cache(46, cache_dir)
+    >>> conditions = build_wind_sweep_conditions(cache, [5, 10, 15, 20, 25, 30, 35, 40])
+    >>> scenarios = build_scenarios(conditions, [lcp])
+    >>> len(scenarios)
+    8
+    """
+    speeds = sorted({float(w) for w in wind_speeds})
+    if not speeds:
+        raise ValueError("wind_speeds is empty — pass at least one wind speed.")
+    if any(w < 0 for w in speeds):
+        raise ValueError(f"wind_speeds must be non-negative, got {speeds}.")
+
+    # One clean row of cached fuel moistures for the requested percentile.
+    base = scenario_cache_to_conditions(cache, percentiles=[percentile]).iloc[0]
+    pct_name = base["Scenario"]
+
+    rows = []
+    for ws in speeds:
+        row = base.to_dict()
+        row["WIND_SPEED_baseline"] = base["WIND_SPEED"]
+        row["WIND_SPEED"] = ws
+        if wind_direction is not None:
+            row["WIND_DIRECTION"] = wind_direction
+        row["Scenario"] = scenario_fmt.format(pct=pct_name, ws=ws)
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
 def run_batch(
     fm_exe,
     scenarios_df,

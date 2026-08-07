@@ -21,7 +21,7 @@ from .ignitions import (
     downwind_cone,
     select_design_ignitions,
 )
-from .adjust import adjust_lcp, apply_treatment, build_surface_lut
+from .adjust import adjust_lcp, apply_treatment, build_surface_lut, mask_lcp
 from .synthetic import create_synthetic_lcp
 
 __all__ = [
@@ -48,5 +48,6 @@ __all__ = [
     "adjust_lcp",
     "apply_treatment",
     "build_surface_lut",
+    "mask_lcp",
     "create_synthetic_lcp",
 ]

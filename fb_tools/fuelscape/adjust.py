@@ -217,3 +217,119 @@ def apply_treatment(lcp, canopy_df, surface_df, scenario, band_map=None, mask=No
     out.loc[dict(band=fidx)] = fm_new
 
     return out
+
+
+def mask_lcp(lcp, mask, nodata=None, out_path=None, compress="lzw", tiled=True):
+    """
+    Restrict an LCP to an analysis area by masking every band outside it.
+
+    All bands — topography, fuel, and canopy — are set to *nodata* wherever
+    *mask* is false.  FlamMap evaluates fire behaviour per pixel, so it does
+    not need continuous terrain across the extent and simply returns NoData
+    for masked cells.  (WindNinja-generated gridded winds are the exception:
+    those solve over the terrain surface and do need it continuous.)
+
+    Parameters
+    ----------
+    lcp : xarray.DataArray or str or Path
+        Multi-band landscape raster with a ``long_name`` attribute naming the
+        bands (as written by :func:`~fb_tools.fuelscape.lfps.lfps_request`).
+        Opened unmasked when a path is given, to keep the integer dtype.
+    mask : xarray.DataArray
+        Boolean (or 0/1) DataArray aligned to a single band of *lcp*.  Pixels
+        that are true are **kept**; everything else becomes *nodata*.
+    nodata : int or float, optional
+        Fill value written outside the mask.  Defaults to the raster's own
+        NoData value, falling back to ``-9999``.  An integer fill keeps the
+        LCP in its native integer dtype; passing ``np.nan`` forces the array
+        to ``float32``, which doubles it in memory.
+    out_path : str or Path, optional
+        If given, write the result to GeoTIFF at this path, preserving band
+        names and dtype.
+    compress : str or None
+        GeoTIFF compression passed through to ``rio.to_raster`` (default
+        ``"lzw"``, matching what LFPS ships).  Masking sets most of the grid
+        to a single constant, which compresses hard — leaving this unset
+        writes a file several times *larger* than the source.  ``None``
+        writes uncompressed.
+    tiled : bool
+        Write a tiled GeoTIFF (default ``True``).  Ignored when *compress*
+        is ``None``.
+
+    Returns
+    -------
+    xarray.DataArray
+        A masked copy of *lcp*.  Same shape as the input; same dtype unless
+        *nodata* is NaN.
+
+    Raises
+    ------
+    ValueError
+        If *lcp* has no ``long_name`` band metadata.
+
+    Notes
+    -----
+    This does not shrink the grid — FlamMap still walks the full rectangle,
+    it just skips masked cells.  Crop beforehand if the analysis area sits in
+    one corner of the extent, but check the mask's bounding box first: a mask
+    scattered across the landscape crops to nothing.
+
+    Examples
+    --------
+    >>> keep = bps_band.isin(analysis_values)
+    >>> masked = mask_lcp(baseline_lcp, keep, out_path="LF2016_LCP_bpsmask.tif")
+    """
+    if isinstance(lcp, (str, Path)):
+        # masked=False keeps the native integer dtype; masked=True would give
+        # float + NaN before we have decided what the fill should be.
+        lcp = rxr.open_rasterio(Path(lcp), masked=False)
+
+    long_names = lcp.attrs.get("long_name", [])
+    if isinstance(long_names, str):
+        long_names = [long_names]
+    if not long_names:
+        raise ValueError(
+            "lcp has no 'long_name' band metadata — refusing to write a "
+            "landscape whose bands cannot be identified."
+        )
+
+    if nodata is None:
+        nodata = lcp.rio.nodata
+        if nodata is None:
+            nodata = -9999
+
+    keep = mask.astype(bool)
+    if "band" in keep.dims:
+        keep = keep.squeeze("band", drop=True)
+
+    # NaN cannot live in an integer array; everything else keeps the dtype.
+    dtype = np.float32 if np.isnan(np.array(nodata, dtype="float64")) else lcp.dtype
+
+    out = xr.where(keep, lcp, nodata).astype(dtype)
+    out = out.transpose(*lcp.dims)
+    out.attrs = dict(lcp.attrs)
+    out.attrs["long_name"] = tuple(long_names)
+    out.rio.write_crs(lcp.rio.crs, inplace=True)
+    out.rio.write_transform(lcp.rio.transform(), inplace=True)
+    out.rio.write_nodata(nodata, inplace=True)
+
+    if out_path is not None:
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        write_kwargs = {}
+        if compress is not None:
+            write_kwargs["compress"] = compress
+            write_kwargs["tiled"] = tiled
+        out.rio.to_raster(out_path, dtype=str(np.dtype(dtype)), **write_kwargs)
+        # rioxarray drops per-band descriptions; write them back so the file
+        # round-trips through get_band_by_longname and plot_bands.
+        import rasterio
+        with rasterio.open(out_path, "r+") as dst:
+            dst.descriptions = tuple(long_names)
+        size_gb = out_path.stat().st_size / 1e9
+        print(
+            f"[mask_lcp] wrote {out_path} ({np.dtype(dtype)}, {out.shape}, "
+            f"nodata={nodata}, compress={compress}, {size_gb:.2f} GB)"
+        )
+
+    return out

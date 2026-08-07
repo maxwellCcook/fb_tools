@@ -62,6 +62,7 @@ from .fuelscape import (
     adjust_lcp,
     apply_treatment,
     build_surface_lut,
+    mask_lcp,
     create_synthetic_lcp,
 )
 from .models import (
@@ -69,6 +70,7 @@ from .models import (
     load_scenarios,
     build_scenarios,
     scenario_cache_to_conditions,
+    build_wind_sweep_conditions,
     run_batch,
     stacked_output_path,
     build_mtt_scenarios,
@@ -162,12 +164,14 @@ __all__ = [
     "adjust_lcp",
     "apply_treatment",
     "build_surface_lut",
+    "mask_lcp",
     "create_synthetic_lcp",
     # models
     "run_flammap_scenarios",
     "load_scenarios",
     "build_scenarios",
     "scenario_cache_to_conditions",
+    "build_wind_sweep_conditions",
     "run_batch",
     "stacked_output_path",
     "build_mtt_scenarios",

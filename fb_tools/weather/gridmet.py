@@ -1354,7 +1354,7 @@ def build_flammap_scenario_cache(
     tmmx_col: str = "tmmx_f",
     rmin_col: str = "rmin",
     lat_deg: float | None = None,
-    wind_direction: int = -2,
+    wind_direction: int = -1,
     wind_speed_source: str = "gridmet",
     wind_percentiles: dict[str, dict] | None = None,
     erc_band: float = 0.025,
@@ -1389,12 +1389,12 @@ def build_flammap_scenario_cache(
         {
           "pyrome_id": "42",
           "percentiles": [0.25, 0.50, 0.75, 0.90, 0.97],
-          "wind_direction": -2,
+          "wind_direction": -1,
           "scenarios": {
             "p25": {
               "FM_1hr": 12.3, "FM_10hr": 13.1, "FM_100hr": 11.2,
               "FM_herb": 198.3, "FM_woody": 191.2,
-              "WIND_SPEED": 8, "WIND_DIRECTION": -2,
+              "WIND_SPEED": 8, "WIND_DIRECTION": -1,
               "erc_quantile_band": [0.225, 0.275],
               "erc_center": 22.1, "scenario_doy": 162
             },
@@ -1414,9 +1414,10 @@ def build_flammap_scenario_cache(
     - Else ``WIND_SPEED`` is omitted (supply at run time).
 
     **Wind direction** (``WIND_DIRECTION``): controlled by ``wind_direction``.
-    FlamMap convention: ``-2`` = downhill (default), ``-1`` = uphill, or an
-    explicit azimuth (0–360).  For FSPro, wind is derived separately via HRRR
-    wind cells.
+    FlamMap convention: ``-1`` = uphill (default), ``-2`` = downhill, or an
+    explicit azimuth (0–360).  Upslope-aligned wind is the worst-case spread
+    condition, so it is the default.  For FSPro, wind is derived separately
+    via HRRR wind cells.
 
     FM derivation:
     - ``FM_1hr``, ``FM_10hr`` : NFDRS dead FM at peak-fire-hour conditions
@@ -1444,7 +1445,9 @@ def build_flammap_scenario_cache(
         Site latitude (decimal degrees). When provided with ``tmmn_f``
         present, live FM uses the NFDRS GSI model.
     wind_direction : int
-        Wind direction written to every scenario entry.
+        Wind direction written to every scenario entry.  ``-1`` (uphill,
+        default) is the worst-case upslope run; ``-2`` is downhill; ``0-360``
+        is a fixed azimuth.
     wind_speed_source : str
         ``"gridmet"`` (default): median GridMET ``ws_mph`` on the sampled band.
         ``"none"``: omit ``WIND_SPEED`` from cache.

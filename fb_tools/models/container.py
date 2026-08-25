@@ -43,6 +43,8 @@ from pathlib import Path
 
 import numpy as np
 
+from ..utils.io import raster_write_kwargs
+
 # ── Module-level constants ─────────────────────────────────────────────────────
 
 # Primary FSPro ASC output suffixes (from TestFSPro.exe)
@@ -1081,7 +1083,7 @@ def postprocess_fspro_outputs(
             stacked = xr.concat(bands, dim=xr.Variable("band", band_names_written))
             stacked.attrs["long_name"] = band_names_written
             stacked_path = output_dir / f"{output_basename}_FSProGrids.tif"
-            stacked.rio.to_raster(stacked_path, compress="deflate")
+            stacked.rio.to_raster(stacked_path, **raster_write_kwargs())
             print(f"[postprocess_fspro_outputs] Stacked ({len(bands)} bands) → "
                   f"{stacked_path.name}")
 

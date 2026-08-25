@@ -76,13 +76,11 @@ def clip_raster_inplace(path, mask_gdf):
     Clip a GeoTIFF to the union of *mask_gdf* geometries, overwriting the
     file in place.
 
-    The source profile is preserved, including its compression.  When the
-    source is compressed, horizontal-differencing ``predictor=2`` (integer
-    dtypes only) and internal tiling are added if absent — these are not
-    carried in ``rasterio``'s profile and shrink the output for smooth
-    integer fields (e.g. int16 SDI).  No predictor is applied to float
-    dtypes: empirically, the floating-point predictor enlarges typical
-    FlamMap output rather than shrinking it.
+    The source profile is preserved, including its compression.  Internal
+    tiling is added if absent, since ``rasterio``'s profile does not carry it.
+    No predictor is applied, for integer or float dtypes: these grids are
+    dominated by long nodata runs that RLE well, and horizontal differencing
+    destroys them (measured ~35% larger on a Pyrome 46 LCP).
 
     Parameters
     ----------
@@ -111,12 +109,8 @@ def clip_raster_inplace(path, mask_gdf):
     )
 
     # Strengthen compression metadata that the profile copy does not carry.
-    if profile.get("compress"):
-        kind = np.dtype(profile["dtype"]).kind
-        if kind in ("i", "u"):
-            profile.setdefault("predictor", 2)  # helps smooth integer fields
-        if not profile.get("tiled"):
-            profile.update(tiled=True, blockxsize=256, blockysize=256)
+    if profile.get("compress") and not profile.get("tiled"):
+        profile.update(tiled=True, blockxsize=512, blockysize=512)
 
     with rio.open(path, "w", **profile) as dst:
         dst.write(clipped)

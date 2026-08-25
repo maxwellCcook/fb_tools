@@ -15,6 +15,8 @@ import pandas as pd
 import rioxarray as rxr
 import xarray as xr
 
+from ..utils.io import raster_write_kwargs
+
 
 def get_band_by_longname(da, long_name_value):
     """
@@ -94,7 +96,7 @@ def stack_rasters(in_dir, tag=None, out_dir=None, cleanup=True):
     stack = xr.concat(bands, dim=xr.Variable("band", band_names))
     stack.attrs["long_name"] = band_names
     print(out_fp)
-    stack.rio.to_raster(out_fp, compress="deflate")
+    stack.rio.to_raster(out_fp, **raster_write_kwargs())
     print(f"Stacked {len(tifs)} rasters → {out_fp}")
 
     del stack, bands

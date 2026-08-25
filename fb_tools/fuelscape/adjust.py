@@ -12,6 +12,8 @@ import numpy as np
 import rioxarray as rxr  # noqa: F401 — required for .rio accessor
 import xarray as xr
 
+from ..utils.io import raster_write_kwargs
+
 
 def _normalize_band_name(name):
     """Normalize an LFPS product code to a short canonical band name.
@@ -219,7 +221,7 @@ def apply_treatment(lcp, canopy_df, surface_df, scenario, band_map=None, mask=No
     return out
 
 
-def mask_lcp(lcp, mask, nodata=None, out_path=None, compress="lzw", tiled=True):
+def mask_lcp(lcp, mask, nodata=None, out_path=None, compress="deflate", tiled=True):
     """
     Restrict an LCP to an analysis area by masking every band outside it.
 
@@ -248,7 +250,8 @@ def mask_lcp(lcp, mask, nodata=None, out_path=None, compress="lzw", tiled=True):
         names and dtype.
     compress : str or None
         GeoTIFF compression passed through to ``rio.to_raster`` (default
-        ``"lzw"``, matching what LFPS ships).  Masking sets most of the grid
+        ``"deflate"`` + tiling, which every GDAL can read; ``"zstd"`` is
+        smaller but QGIS cannot open it).  Masking sets most of the grid
         to a single constant, which compresses hard — leaving this unset
         writes a file several times *larger* than the source.  ``None``
         writes uncompressed.
@@ -318,7 +321,7 @@ def mask_lcp(lcp, mask, nodata=None, out_path=None, compress="lzw", tiled=True):
         out_path.parent.mkdir(parents=True, exist_ok=True)
         write_kwargs = {}
         if compress is not None:
-            write_kwargs["compress"] = compress
+            write_kwargs = raster_write_kwargs(compress=compress)
             write_kwargs["tiled"] = tiled
         out.rio.to_raster(out_path, dtype=str(np.dtype(dtype)), **write_kwargs)
         # rioxarray drops per-band descriptions; write them back so the file

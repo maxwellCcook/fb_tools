@@ -18,11 +18,46 @@ Three entry points
     Returns a summary DataFrame with run status for each row.
 """
 
+import re
+import threading
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pandas as pd
 
 from .flammap import run_flammap_scenarios
+
+# FlamMap writes "FlamMap 1: 47.300 complete" to stdout as it works, and
+# run_cli redirects that into the run log.  Tailing the log is the only
+# progress signal available without changing how the executable is invoked.
+_PCT_RE = re.compile(r"(\d+\.\d+)\s+complete")
+
+
+@contextmanager
+def _progress(log_path, label, every=30):
+    """Echo percent-complete from a model's run log while it executes.
+
+    Prints are flushed because batch runs are usually driven from a notebook
+    or a pipe, where Python block-buffers stdout and nothing would appear
+    until the process exits.
+    """
+    stop = threading.Event()
+
+    def tail():
+        while not stop.wait(every):
+            try:
+                hits = _PCT_RE.findall(Path(log_path).read_text(errors="ignore"))
+            except OSError:
+                continue
+            pct = f"{float(hits[-1]):.0f}%" if hits else "starting"
+            print(f"    {label} {pct}", flush=True)
+
+    threading.Thread(target=tail, daemon=True).start()
+    try:
+        yield
+    finally:
+        stop.set()
 
 
 # Columns that must be present in a valid scenarios DataFrame.
@@ -434,8 +469,9 @@ def run_batch(
         lcp_dir = Path(lcp_dir)
 
     summary_rows = []
+    n_runs = len(scenarios_df)
 
-    for _, row in scenarios_df.iterrows():
+    for i, (_, row) in enumerate(scenarios_df.iterrows(), start=1):
         lcp_path = Path(row["LCP"])
         if lcp_dir and not lcp_path.is_absolute():
             lcp_path = lcp_dir / lcp_path
@@ -449,7 +485,7 @@ def run_batch(
         log_path = out_dir / "TestFlamMap_run.log"
 
         if skip_existing and any(out_dir.glob("*.tif")):
-            print(f"[skip] {lcp_stem} / {scenario_name}")
+            print(f"[skip] {lcp_stem} / {scenario_name}", flush=True)
             summary_rows.append({
                 "Scenario":   scenario_name,
                 "LCP":        str(lcp_path),
@@ -460,18 +496,22 @@ def run_batch(
             continue
 
         status = "success"
+        label = f"[{i}/{n_runs}] {lcp_stem} / {scenario_name}"
+        print(f"{label} starting", flush=True)
+        t0 = time.time()
 
         try:
-            run_flammap_scenarios(
-                fm_exe=fm_exe,
-                lcp_fp=lcp_path,
-                fm_params=row.to_dict(),
-                output_directory=out_dir,
-                n_process=n_process,
-                stack_out=stack_out,
-                cleanup=cleanup,
-                mask=mask,
-            )
+            with _progress(log_path, label):
+                run_flammap_scenarios(
+                    fm_exe=fm_exe,
+                    lcp_fp=lcp_path,
+                    fm_params=row.to_dict(),
+                    output_directory=out_dir,
+                    n_process=n_process,
+                    stack_out=stack_out,
+                    cleanup=cleanup,
+                    mask=mask,
+                )
         except Exception as exc:
             status = f"error: {exc}"
 
@@ -483,7 +523,7 @@ def run_batch(
             "log_path":   str(log_path),
         })
 
-        print(f"[{status}] {lcp_stem} / {scenario_name}")
+        print(f"{label} {status} in {time.time() - t0:.0f}s", flush=True)
 
     return pd.DataFrame(summary_rows)
 

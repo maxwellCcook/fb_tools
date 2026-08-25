@@ -33,6 +33,8 @@ import numpy as np
 import rioxarray  # noqa: F401 — activates .rio accessor
 import xarray as xr
 
+from ..utils.io import raster_write_kwargs
+
 
 # ---------------------------------------------------------------------------
 # Named preset scenarios
@@ -184,7 +186,8 @@ def create_synthetic_lcp(
     # --- Write to disk
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    stack.rio.to_raster(str(out_path), dtype="int16", compress="deflate", nodata=-9999)
+    stack.rio.to_raster(str(out_path), dtype="int16", nodata=-9999,
+                        **raster_write_kwargs())
 
     print(f"  [create_synthetic_lcp] Wrote {n_pixels}×{n_pixels} LCP → {out_path.name}")
     return out_path.resolve()

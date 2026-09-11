@@ -402,6 +402,47 @@ should shrink fires materially.
 any production campaign, and G4's fire-size validation against FPA-FOD must state that simulated
 sizes are domain-bounded until that check passes.**
 
+### Spotting is a HEAVY TAIL, not an increment — and never quote a single realization
+`code/dev/pyre/{b2_spot_variance,b3_buffer_diagnosis}.py`. The knob sweep first looked like solver
+fragility: at 30 m / 21 d / gate 0.0 the "+83% spotting effect" appeared only at `buf 3, cfl <= 0.4`
+and 32,550 ha (the spotting-off answer) everywhere else. It is not. Holding the solver fixed and
+varying **only the seed**, pooled over 10 seeds per buffer:
+
+| | spotting off | on, mean | breakouts | CV of burned area |
+|---|---|---|---|---|
+| buf 3 | 32,463 ha | 41,655 ha (+28%) | **4/10** | 30.1% |
+| buf 6 | 32,546 ha | 44,915 ha (+38%) | **2/10** | 41.0% |
+
+Fisher exact on 4/10 vs 2/10 gives **p = 0.63 — indistinguishable**, and spotting-off agrees between
+buffers to 0.26%. So **`buffer_width` is innocent**; the knob-sweep pattern was small-sample noise in
+a bimodal outcome, not a solver effect.
+
+**The shape of the distribution is the finding.** Per realization, spotting adds **+0.01% to +1.4%**
+in the common case and **+83% to +145%** in the tail (32.5k / 59.4k / 79.8k ha are distinct modes —
+one ember reaching a new fuel-connected basin, or two). The *mean* effect is therefore entirely a
+function of **breakout frequency**, and the mean of a bimodal variable is not a typical outcome.
+Consequences that bind the analysis:
+- **Report a breakout RATE plus the conditional magnitudes, never a mean area alone.**
+- **Breakout-rate precision**: +/-16 pp at 30 episodes (one ignition), +/-5 pp at 360 (pooled per arm
+  per condition). So **per-ignition breakout rates are too noisy to report** — the plan's "per-ignition
+  effects as primary" guidance holds for paired Δ but NOT for the breakout rate, which needs pooling.
+- Breakout runs cost 270–437 s vs 165–245 s, so campaign wall-clock depends on breakout frequency too;
+  the ~252 s/realization G2 figure already averages over it.
+- `paired_effect_interval` (Stage 5) must cluster on ignition **and** cope with a bimodal outcome —
+  a bootstrap of a heavy-tailed mean needs the clustered resample, not a normal approximation.
+
+**Two process lessons, both mine.** (1) My first verdict function concluded "the solver is innocent"
+from buf-3 bimodality alone while ignoring buf 6's 0.1% CV; it now requires *both* buffers to show
+seed variance. (2) Four seeds was underpowered and I read a systematic effect into it — buf 6's 0/4
+with CV 0.1% was chance, and six more seeds reversed it outright. **n=4 is not enough to characterise
+a ~30% tail; nothing in Stage 2 is settled from four runs.**
+
+**Pin and stamp the solver knobs.** `max_cells_per_timestep` and `buffer_width` must go into every
+manifest beside `crown_cover_threshold`. Production: **cfl 0.4, buf 3** (the pyretechnics defaults),
+chosen because they are the defaults and the evidence does not distinguish them, not because they were
+tuned. `cfl 0.8` is 3.1x faster and is NOT free — it suppressed the tail in the one knob run, which on
+this evidence is small-sample noise but is untested at n=10.
+
 ## Model CLI invocation
 - **FlamMap**: command file approach via `run_cli()`
 - **MTT command file**: `{lcp} {input_file} {ignition_shp} {barrier_or_0} {output_base_path} {output_type}`

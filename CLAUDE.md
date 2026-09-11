@@ -66,7 +66,7 @@ weather/
 
 ## In progress: pyretechnics replaces FSPro for transmission
 `docs/pyretechnics_transmission_plan.md` — approved 2026-09-10, scope-revised to **v2** the same day.
-**Stages 0 and 1 complete (2026-09-10); Stage 1b / 2 next.** Moves the COSWAP transmission analysis off FSPro onto `pyretechnics` (native
+**Stages 0, 1 and 2 complete; G2 decided (30 m). Stage 1b / 3 next.** Moves the COSWAP transmission analysis off FSPro onto `pyretechnics` (native
 Python/Cython, EPL-2.0, pinned 2026.8.10) for three reasons FSPro cannot fix: **mechanistic
 ember/spotting physics** replaces a scalar `spot_probability` (the primary motivation), arms become
 **exactly paired** (in-process RNG + explicit weather cubes, vs P0.1's finding that `SPOTTING_SEED`
@@ -267,8 +267,29 @@ spotting deliverable:
 gate ON   too little crown fire  -> too little fireline intensity -> UNDER-states embers
 gate OFF  right crown extent, all classed active -> too much intensity -> OVER-states embers
 ```
-**Neither setting is simply correct.** DECIDED 2026-09-10: **carry the gate as a sweep axis** beside
-firebrand flux, reporting the treatment effect at both ends rather than picking one.
+**Neither setting is simply correct.** DECIDED 2026-09-11, superseding the 09-10 "balanced sweep axis"
+decision:
+
+- **Production runs at gate 0.0** — crowning allowed below CC 0.4. Err extreme: for a
+  treatment-effectiveness claim, overstating ember production is the conservative direction, and the
+  71% of this landscape below CC 0.4 must be allowed to crown at all.
+- **The stock 0.4 gate is an UNBALANCED sensitivity subset**, not a second full axis. Balanced would
+  double the campaign to 6,480. Instead: 3 arms x 12 ignitions x **10** episodes x **central flux
+  only** = 360, i.e. **3,240 + 360 = 3,600, +11% not +100%**. Episodes are the axis to cut (the
+  plan's own rule is `flux >= ignitions > episodes > severity`) because CRN already collapses
+  per-pixel noise, while 12 design fires stay the limiting inferential unit — so a paired,
+  clustered-by-ignition statement survives at both settings.
+
+**Correction to the 09-10 framing, which matters when writing this up.** Gate-off does **not** buy a
+torching regime — passive crown (`fire_type == 2`) stays at or below **0.5% at every threshold**
+(0.4 / 0.2 / 0.1 / 0.0). What it allows below CC 0.4 is full **active** crown fire. And the absence of
+passive is probably not a defect: at p97 the Cruz active rate (~107 m/min) clears van Wagner's
+`3/CBD` (~27–60 m/min), so pyretechnics is saying these canopies *can* carry an active fire at this
+severity. FlamMap's ScottReinhardt splits more into passive because it uses a crown-fraction-burned
+formulation — a genuine model difference, not one side being broken. So: gate-off overshoots
+intensity (active where torching belongs), gate-on undershoots (nothing where torching belongs), and
+the subset brackets it. **Open check:** whether passive appears at p75/p90, where the Cruz rate no
+longer dominates.
 
 ### The patched engine: `pyretechnics 2026.8.10+cfri1`
 `code/dev/pyre/build_patched_engine.py` builds the pinned sdist with the gate exposed as a runtime
@@ -330,6 +351,56 @@ the process onto pyretechnics' pure-Python modules. Two uses, both load-bearing:
 - **Constants can be patched for an experiment** without shipping a fork.
 Diagnostic only: nothing under `fb_tools/` imports it, and production runs use the compiled, pinned,
 version-stamped engine. `import_pure_python()` is irreversible in-process — do compiled work first.
+
+### Stage 2 / G2 — DONE. Produce at **30 m**. And the domain is too small.
+`code/dev/pyre/b1_benchmark.py`; CSVs in `$FB_PYRE_SCRATCH/benchmark/`. Every run is its own
+**`spawn` subprocess** (so `ru_maxrss` is per-run, and the Stage 3 parallelism mechanism is exercised
+early), weather is a **1D hourly cube** (constant p97 values but `days*24` bands, so per-band
+cube-refresh cost is measured rather than skipped), and the ignition is a **real Phase 2 design fire**
+(`ign_000`, cell 737,639).
+
+| res | days | spot | gate | grid | wall s | RSS | burned ha | %dom | crown |
+|---|---|---|---|---|---|---|---|---|---|
+| 90 | 21 | on | 0.4 | 580×577 | 41.2 | 0.26 GB | 122,521 | 45.2% | 20.1% |
+| 90 | 21 | on | 0.0 | 580×577 | 42.5 | 0.26 GB | 123,371 | 45.5% | 48.2% |
+| 30 | 21 | on | 0.4 | 1738×1730 | 159.6 | 0.53 GB | 32,484 | 12.0% | 30.7% |
+| 30 | 21 | on | 0.0 | 1738×1730 | **252.2** | 0.57 GB | **59,389** | 21.9% | 47.3% |
+
+**G2: 30 m.** The 3,600-realization design costs ~30 h on 8 workers at 30 m vs ~5 h at 90 m — both
+affordable, so cost stopped being the deciding factor. **The plan's "30–120 s @ 90 m → produce at
+90 m" branch is deliberately overridden**, because the measurement it existed to inform showed
+something the plan did not anticipate: **90 m burns 3.8x the area of 30 m** (123,371 vs 32,484 ha).
+That is resampling artifact, not physics — mode-resampling FBFM40 to 90 m destroys the fuel-break
+structure (roads, riparian, rock) that stops fires at 30 m. 90 m also has worse edge contact and
+36 km max spread vs 28 km. RSS is only ~0.55 GB/worker at 30 m, so 8 workers is comfortable.
+
+**Spotting only fires when crown fire supplies the intensity** — a clean internal-consistency result
+that also justifies the gate-0.0 production choice. At gate 0.4, spotting adds **14 ha**
+(32,470 → 32,484, i.e. nothing). At gate 0.0 it adds **27,000 ha (+83%)**: spotting is what breaks
+the fire out of its fuel-connected basin. **At the stock gate the primary deliverable would have been
+approximately nil.**
+
+### OPEN GATE — the 52 km domain fails `check_domain_adequacy` on all 16 configs
+It was never called in the FSPro era (`spread/fspro_outputs.py:235`). It should have been.
+- `edge_ok` and `headroom_ok` **fail in every configuration**. Spread headroom 0.535–0.856 (needs
+  `> 1`), so fires run past the nearest boundary every time. Max spread **22.4–27.7 km** at 30 m,
+  34–36 km at 90 m.
+- **The downwind corridor from the treatment centroid exits the domain after 22.7 km** — the same
+  scale as the spread. Treated pixels are a median 11.9 km from the edge, but p5 is 4.5 km and the
+  minimum is **0.0 km**.
+- Final-day growth share is ~0.0000, so **duration is not what binds these fires — the domain is.**
+
+Mitigating: edge BP mass is only 0.3–0.7%, and the planned reporting zones are near-field
+(in-treatment, 500 m collar, ~5 km downwind), which sits well inside the window.
+
+**DECIDED 2026-09-11: defer, do not enlarge the domain yet.** This benchmark used **constant p97 with
+no diurnal cycle** — conservative for runtime, but simultaneously the worst possible case for domain
+adequacy. Stage 4's real hourly episodes bring overnight wind drop and fuel-moisture recovery and
+should shrink fires materially.
+
+**Gate, not a note — Stage 4 must re-run `check_domain_adequacy` on the first real episodes before
+any production campaign, and G4's fire-size validation against FPA-FOD must state that simulated
+sizes are domain-bounded until that check passes.**
 
 ## Model CLI invocation
 - **FlamMap**: command file approach via `run_cli()`

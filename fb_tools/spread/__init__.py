@@ -30,8 +30,11 @@ from .fspro_outputs import (
     read_daily_acres,
     check_domain_adequacy,
 )
+from .convert import destack_lcp, PYRE_LAYERS
 
 __all__ = [
+    "destack_lcp",
+    "PYRE_LAYERS",
     "read_daily_acres",
     "check_domain_adequacy",
     "delta_burn_probability",

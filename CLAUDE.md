@@ -66,7 +66,7 @@ weather/
 
 ## In progress: pyretechnics replaces FSPro for transmission
 `docs/pyretechnics_transmission_plan.md` — approved 2026-09-10, scope-revised to **v2** the same day.
-**Stage 0 complete (G0 PASS, 2026-09-10); Stage 1 next.** Moves the COSWAP transmission analysis off FSPro onto `pyretechnics` (native
+**Stages 0 and 1 complete (2026-09-10); Stage 1b / 2 next.** Moves the COSWAP transmission analysis off FSPro onto `pyretechnics` (native
 Python/Cython, EPL-2.0, pinned 2026.8.10) for three reasons FSPro cannot fix: **mechanistic
 ember/spotting physics** replaces a scalar `spot_probability` (the primary motivation), arms become
 **exactly paired** (in-process RNG + explicit weather cubes, vs P0.1's finding that `SPOTTING_SEED`
@@ -146,6 +146,54 @@ plausible wrong answer, so they are listed here and each gets a unit test:
   Only `firebrand_flight_survival_probability` and `schroeder_ignition_probability` are exported.
 - `spread_fire_with_phi_field` returns `random_generator` only when spotting is used — a cheap
   assertion that the spotting path was actually exercised.
+
+### Stage 1 — DONE. `spread/convert.py` is the de-stacker; G1 demoted to a diagnostic
+`destack_lcp(lcp_fp, out_dir, ...)` + `PYRE_LAYERS` write the eight pyretechnics inputs in the units
+the engine documents. Cell2Fire stubs kept. Exported from `fb_tools` and `fb_tools.spread`.
+Outputs are float32 (`fuel_model` int16), so `SpaceTimeCube` does not copy; units, source band and
+resolved slope units are written to each file's tags.
+
+**`tests/test_pyre_destack.py` — 38 tests, no engine import**, so they run in the `fb_tools` env.
+They pin every conversion exactly: `SLPD 20 deg -> tan(20) = 0.3640` (**not** 0.20), `CC 45 -> 0.45`,
+`CH 150 -> 15.0 m`, `CBH 15 -> 1.5 m`, `CBD 10 -> 0.10`, aspect `-1 -> flat_aspect`, nodata `-> 91`,
+plus raises on a missing band, an unresolvable slope unit, a fabricated FBFM40 code (94-97 are
+unassigned), an out-of-range conversion, and bilinear resampling inventing fuel codes. Two arms
+de-stacked separately at the same `resolution` are asserted byte-congruent — resampling is done
+**once per arm here**, never per realization.
+
+**G1 was deliberately demoted from the plan's no-go gate to a one-shot diagnostic** (decision
+2026-09-10): the unit tests above are a *stronger* check for the silent-units class of bug than a
+raster comparison, because they are exact rather than "within 20%". What the FlamMap run still buys
+is separating adapter error from weather-sampler error at G4. `code/dev/pyre/g1_flammap_diagnostic.py`,
+North Cottonwood, p97 pyrome 45, 3.0 M cells, 1.4 s per arm:
+
+| arm | FL median pyre / FlamMap | ratio | r | crown frac pyre / FlamMap | agree |
+|---|---|---|---|---|---|
+| untreated  | 1.80 / 3.75 m | 0.71 | 0.913 | 21.4% / 51.3% | 70.0% |
+| background | 1.79 / 3.49 m | 0.71 | 0.914 | 21.1% / 50.7% | 70.4% |
+| coswap     | 1.79 / 3.42 m | 0.71 | 0.914 | 21.1% / 50.6% | 70.5% |
+
+Flame length correlates at r = 0.91 and runs ~29% below FlamMap. **Crown fire is the real divergence**
+— pyretechnics calls 21% of burnable pixels crown where FlamMap (ScottReinhardt) calls 51%. Recorded,
+not chased, per the timebox. **Revisit it if Stage 4's simulated fire sizes come in low against
+FPA-FOD**: less crown fire means less fireline intensity, which means shorter ember jumps, and
+spotting is the primary deliverable.
+
+Two traps hit while building it, both worth knowing:
+- **FlamMap `CROWNSTATE` is coded 0/1/2/3 — identical to pyretechnics `fire_type`** (measured:
+  median FL 0.00 / 0.85 / 5.78 / 27.24 m). Assuming FlamMap's 0/1/2 produced a fake "78% vs 22%"
+  crown disagreement out of nothing but a lookup table.
+- **Load the p97 scenario from `data/weather/flammap_rtma/pyrome_<id>_flammap.json`, never transcribe
+  it.** Hardcoding it once silently picked up pyrome 128 (`FM_herb` 30) instead of 45 (59.3).
+
+**A finding about the in-situ Phase 1 FlamMap results, not about this port**: the scenario cache fills
+`WIND_SPEED` from HRRR's **10 m** `ws_mph` and FlamMap reads that field as a **20-ft** wind. The true
+20-ft equivalent of a 23.1 mph 10 m observation is 20.1 mph, so the published FlamMap runs are ~15%
+hot on wind. G1 reproduces what FlamMap actually ran (`wind_speed_10m = mph x 1.15 x 1.609` km/hr, so
+pyretechnics' internal `/1.15` lands back on 23.1 mph at 20 ft) rather than correcting it.
+
+Scratch root is **`~/fb_scratch/coswap_pyre`** (`$FB_PYRE_SCRATCH`), outside Box: only aggregated
+ensemble products belong in `data/spatial/mod/transmission/`.
 
 ## Model CLI invocation
 - **FlamMap**: command file approach via `run_cli()`

@@ -88,6 +88,7 @@ from .models import (
     patch_fspro_input_paths,
 )
 from .spread import (
+    destack_lcp,
     delta_burn_probability,
     aggregate_ignition_bp,
     summarize_bp_treatments,
@@ -109,7 +110,8 @@ from .utils import (
     list_files,
     plot_bands,
 )
-from .suppression import calculate_sdi, calculate_delta_sdi, fetch_osm_roads, fetch_counties
+from .suppression import (calculate_sdi, calculate_delta_sdi, sdi_static_layers,
+                          SDI_NODATA, fetch_osm_roads, fetch_counties)
 from .weather import (
     fetch_hrrr_winds_at_fires,
     build_wind_cells,
@@ -188,6 +190,7 @@ __all__ = [
     "prepare_fspro_experiment",
     "patch_fspro_input_paths",
     # spread
+    "destack_lcp",
     "delta_burn_probability",
     "aggregate_ignition_bp",
     "summarize_bp_treatments",
@@ -233,6 +236,8 @@ __all__ = [
     # suppression
     "calculate_sdi",
     "calculate_delta_sdi",
+    "sdi_static_layers",
+    "SDI_NODATA",
     "fetch_osm_roads",
     "fetch_counties",
     # plotting

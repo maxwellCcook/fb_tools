@@ -195,6 +195,45 @@ pyretechnics' internal `/1.15` lands back on 23.1 mph at 20 ft) rather than corr
 Scratch root is **`~/fb_scratch/coswap_pyre`** (`$FB_PYRE_SCRATCH`), outside Box: only aggregated
 ensemble products belong in `data/spatial/mod/transmission/`.
 
+### The crown-fire divergence is a hard-coded `canopy_cover > 0.4` gate — OPEN DECISION
+`code/dev/pyre/g1b_crown_divergence.py`. G1's 21%-vs-51% crown gap is **not an adapter bug**.
+`crown_fire.van_wagner_crown_fire_initiation` requires `canopy_cover > 0.4` — a term Van Wagner (1977)
+does not have and FlamMap's ScottReinhardt path does not apply:
+```
+surface_fireline_intensity > 0.0  and  canopy_cover > 0.4  and  I >= I0
+```
+| | cells | pyre crown | FlamMap crown |
+|---|---|---|---|
+| **above** CC 0.4 | 405,011 (28.7%) | 74.6% | 75.2% |
+| **below** CC 0.4 | 1,007,975 (71.3%) | **0.0%** | 41.8% |
+
+**Where the gate lets them, the two crown modules agree to within 0.6 pp.** Below it, pyretechnics
+returns zero crown fire although the *intensity* criterion is satisfied on **82.3%** of those cells.
+North Cottonwood is 71.3% below the threshold.
+
+Three consequences, all of which land on the spotting deliverable (firebrand production scales with
+fireline intensity, jump distance with `I^0.3`):
+
+1. **There is no passive-crown regime anywhere** — `fire_type == 2` is zero over all 3.0 M cells.
+   Below the gate crowning is blocked; above it, at p97 (42.8 km/hr, 4% 1-hr FM) the Cruz active rate
+   (median 107.8 m/min) clears van Wagner's `3/CBD` (median 27.3) on 90.8% of cells, so it goes
+   straight to ACTIVE. **Torching in open ponderosa / dry mixed conifer is the characteristic crown
+   behaviour of this forest type and the dominant short-range ember source, and the model does not
+   produce it at all.**
+2. **The modelled COSWAP canopy effect is a threshold artifact.** Of the 2,330 pixels COSWAP changes
+   (background → coswap): **89.0%** are already below 0.4 in *both* arms, so the canopy work is
+   invisible to the crown model; **10.7%** cross 0.4 downward as a step function; and **0.3% — eight
+   pixels — stay above 0.4 in both arms**, the only place the treatment acts as the continuous canopy
+   reduction it physically is. Nearly the whole modelled crown effect would ride on pixels tipping
+   over one hard-coded constant.
+3. It also explains most of G1's flame-length gap: FL = f(I), and suppressed crown fire suppresses I.
+
+**Not yet decided.** Options are (a) accept the default and declare it, (b) patch the constant into a
+parameter and rebuild from the sdist — we already build from sdist, and "inspectable, configurable
+physics" is the stated reason for preferring pyretechnics to ELMFIRE, but it makes us "modified
+pyretechnics", (c) carry the gate as a `ConditionId` sensitivity axis alongside firebrand flux and
+report the treatment effect across both. **Resolve before Stage 7.**
+
 ## Model CLI invocation
 - **FlamMap**: command file approach via `run_cli()`
 - **MTT command file**: `{lcp} {input_file} {ignition_shp} {barrier_or_0} {output_base_path} {output_type}`

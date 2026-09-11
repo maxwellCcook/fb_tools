@@ -1,0 +1,94 @@
+# =============================================================================
+# fb_pyre — conda environment for the pyretechnics transmission engine
+# =============================================================================
+# WHY A SECOND ENVIRONMENT
+# ------------------------
+# pyretechnics 2026.8.10 ships as an sdist only (no wheels, not on conda-forge)
+# and must be compiled locally. Its build is pinned to numpy~=1.26.2 and
+# Cython~=3.0.11, and both pins are real, not cosmetic:
+#
+#   Cython 3.1+ / 3.2+ / 3.3  -> cythonization FAILS
+#       "Function signature does not match previous declaration"
+#       (burn_cells.py:39, :257, :357 — stricter @cy.ccall / .pxd matching)
+#   Cython 3.0.x + numpy 2.x headers -> C COMPILE FAILS
+#       "no member named 'subarray' in 'struct _PyArray_Descr'"
+#       (Cython 3.0's bundled numpy.pxd PyDataType_SHAPE touches a field
+#        numpy 2 moved to _PyArray_LegacyDescr)
+#
+# So there is no (Cython, numpy) pair inside the `fb_tools` env — python 3.12,
+# numpy 2.4.3 — that builds it. Measured 2026-09-10 on this machine; this is
+# Stage 0 Option 2 of docs/pyretechnics_transmission_plan.md, and it was the
+# anticipated outcome (Risk 4).
+#
+# `fb_tools` is NEVER downgraded. It keeps serving FlamMap / FSPro / FSim / MTT
+# and every notebook. Only the transmission driver runs in `fb_pyre`.
+#
+# The conda pins below are chosen to SATISFY pyretechnics' declared constraints,
+# so `pip install --no-deps` is not a lie — pip compiles one package against an
+# environment that already meets its requirements and touches nothing else.
+#
+# --- Create (from the repo root) ---
+#
+#   conda env create -f environment-pyre.yml
+#   conda activate fb_pyre
+#   pip install -e . --no-deps
+#   pip install "pyretechnics==2026.8.10" --no-deps --no-build-isolation
+#
+# --no-build-isolation is load-bearing: with isolation pip would honour the
+# build-system numpy~=1.26.2 pin in a throwaway env and we would lose control of
+# which headers the extension is compiled against.
+#
+# Verify:  python -c "import pyretechnics.eulerian_level_set"
+# =============================================================================
+
+name: fb_pyre
+
+channels:
+  - conda-forge
+  - nodefaults
+
+dependencies:
+
+  # ── Python — pyretechnics declares requires-python ~=3.11 ─────────────────
+  - python=3.11.*
+
+  # ── Build toolchain for the pyretechnics extension modules ────────────────
+  # Both pins are hard constraints; see the header for the measured failures.
+  - cython=3.0.*
+  - sortedcontainers=2.4.*
+
+  # ── Core numerical — pinned to pyretechnics' declared requirements ─────────
+  - numpy=1.26.*
+  - scipy=1.12.*
+  - pandas>=2.0,<2.3
+
+  # ── Geospatial stack — same GDAL/PROJ discipline as environment.yml ───────
+  - gdal>=3.6,<3.10
+  - proj>=9.1
+  - libgdal>=3.6,<3.10
+  - rasterio=1.4.*
+  - geopandas>=0.14
+  - shapely>=2.0
+  - pyproj>=3.6
+  - pyogrio>=0.7
+  - rioxarray>=0.15
+  - xarray>=2023.6
+  - geocube>=0.4
+
+  # ── HTTP / I-O ────────────────────────────────────────────────────────────
+  - requests>=2.28
+
+  # ── Visualization ─────────────────────────────────────────────────────────
+  - matplotlib>=3.7
+
+  # ── Jupyter (so 03b_Transmitted_Pyre.ipynb can run in this env) ───────────
+  - ipykernel>=6.25
+
+  # ── Test runner (the pyre test files run here, not in fb_tools) ───────────
+  - pytest>=8.0
+
+  - pip
+
+# NOTE: osmnx and herbie-data are deliberately absent. fb_tools defers both
+# imports to call time, so `import fb_tools` succeeds without them; the
+# suppression (osmnx) and HRRR-fetch (herbie) paths are run from `fb_tools`.

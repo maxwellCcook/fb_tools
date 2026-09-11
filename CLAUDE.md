@@ -64,6 +64,89 @@ weather/
 - `print()` for progress; no `logging` module
 - Deferred imports for heavy/optional deps (`osmnx`, `herbie`) so `import fb_tools` never fails
 
+## In progress: pyretechnics replaces FSPro for transmission
+`docs/pyretechnics_transmission_plan.md` — approved 2026-09-10, scope-revised to **v2** the same day.
+**Stage 0 complete (G0 PASS, 2026-09-10); Stage 1 next.** Moves the COSWAP transmission analysis off FSPro onto `pyretechnics` (native
+Python/Cython, EPL-2.0, pinned 2026.8.10) for three reasons FSPro cannot fix: **mechanistic
+ember/spotting physics** replaces a scalar `spot_probability` (the primary motivation), arms become
+**exactly paired** (in-process RNG + explicit weather cubes, vs P0.1's finding that `SPOTTING_SEED`
+buys no variance reduction), and `time_of_arrival` is a native raster so the dead
+`spread/perimeters.py` branch becomes a real product. The `fb_tools` design-fire / aggregation /
+zonal layers are reused unchanged — that is the point. New code goes in `models/pyre.py` +
+`spread/{cubes,episodes,pyre_outputs,growth,spotting}.py`; `spread/convert.py` becomes the LCP
+de-stacker. **Nothing is deleted**: FSPro's wrapper, the ERC/wind/FM builders, the HRRR fire-hour
+rose and the Cell2Fire stubs all stay, because FlamMap/FSim/MTT/Cell2Fire consume them.
+
+**Gotcha the plan exists to prevent**: our LCP carries LANDFIRE `SLPD` (degrees) while
+`pyretechnics.load_landfire` expects `SLPP` (percent), so that loader must not be used — it silently
+flattens a 20° slope to 11.3°. `destack_lcp` reads the band description and raises unless it says
+`SlpD` or `SlpP`.
+
+v2 scope decisions (in the plan's header comment; do not re-litigate):
+- Firebrand flux (`firebrands_per_unit_heat` low/central/high) is the **reported sweep axis**;
+  hourly HRRR is critical path because spotting rides the wind tail. Severity (p75/p90/p97) ships as
+  an API but v1 production runs **p97 only**; the sweep is a v2 re-run on the same machinery.
+- Campaign: 3 arms × **12 ignitions × 30 episodes** × p97 × 3 flux = 3,240 realizations. Allocation
+  rule: flux ≥ ignitions > episodes > severity. CRN collapses per-pixel noise but 12 design fires are
+  still 12 independent units, so ignitions beat episodes.
+- Episodes restricted to **2016+** (first reliable HRRR year) so every episode carries real hourly
+  wind — no synthetic-wind fallback, no `wind_source` column. Excludes 2012; accepted.
+- Install is two tiers (`fb_tools` env, else a `fb_pyre` env), **no subprocess/IPC fallback** — it
+  would duplicate the `multiprocessing.Pool` path for no gain.
+- `delta_firebrand_production` is pulled forward to Stage 1b: `burn_cells` only, no spread run, so a
+  real spotting deliverable lands in week 1.
+
+### Stage 0 — DONE. pyretechnics runs in a second env, `fb_pyre`, not in `fb_tools`
+**Option 1 of the plan failed, as Risk 4 predicted.** There is no (Cython, numpy) pair that builds
+pyretechnics 2026.8.10 inside `fb_tools` (python 3.12, numpy 2.4.3) — measured, both directions:
+- **Cython 3.1.8 / 3.2 / 3.3 → cythonization fails**: `Function signature does not match previous
+  declaration` at `burn_cells.py:39,257,357` (stricter `@cy.ccall` vs `.pxd` matching).
+- **Cython 3.0.12 + numpy 2 headers → C compile fails**: `no member named 'subarray' in
+  'struct _PyArray_Descr'` — Cython 3.0's bundled `numpy.pxd` `PyDataType_SHAPE` touches a field
+  numpy 2 moved to `_PyArray_LegacyDescr`.
+
+So `environment-pyre.yml` (Option 2) is the install: **`fb_pyre`** = python 3.11, numpy 1.26.4,
+scipy 1.12.0, rasterio 1.4.2, Cython 3.0.12, sortedcontainers 2.4. `fb_tools` is untouched and is
+**never downgraded**; it keeps serving FlamMap/FSPro/FSim/MTT and every notebook. Only the
+transmission driver runs in `fb_pyre`.
+```
+conda env create -f environment-pyre.yml && conda activate fb_pyre
+pip install -e . --no-deps
+pip install "pyretechnics==2026.8.10" --no-deps --no-build-isolation
+```
+`--no-build-isolation` is load-bearing: with isolation pip builds against a throwaway numpy-1.26 env
+and we lose control of which headers the extension compiles against.
+
+`models/pyre.py` holds `PYRETECHNICS_VERSION`, `require_pyretechnics()` and `pyre_version_info()`
+(stamped into every campaign manifest: engine, python, **numpy and scipy** — the engine is compiled
+against the numpy C-API present at build time, so the same pinned source yields different binaries in
+different envs). `import fb_tools` still succeeds where the engine is absent; the import is deferred.
+
+**G0 PASS** — `code/dev/pyre/g0_smoke.py`, 200×200 @ 30 m, 5 h:
+- runs to completion, 7,544 cells with spotting off;
+- **bitwise reproducible** at a fixed seed (`time_of_arrival` incl. the NaN mask, and `fire_type`) —
+  the property the entire Stage 3 CRN design rests on, and the one FSPro does not have;
+- **spotting is mechanically active**: a 180 m non-burnable barrier stops the head fire dead at the
+  barrier edge with spotting off (`max_x = 99`, barrier at 100), and is crossed with spotting on;
+- a different seed changes the run, so the determinism test can actually fail.
+
+**Engine facts measured at Stage 0 that contradict the plan's draft tables** — each would produce a
+plausible wrong answer, so they are listed here and each gets a unit test:
+- `wind_speed_10m` is **km/hr** (not m/s, not mph). HRRR gives m/s.
+- `temperature` is **degrees Celsius** (not °F). The RTMA cache is `tmp_f`.
+- `upwind_direction` is degrees clockwise from North, meteorological **FROM** — matches
+  `hrrr.py`'s `wd_deg` convention directly.
+- `time_of_arrival` is in **minutes**; `AvgTime.tif` must be written in **days** (Stage 5) to keep
+  `03_Transmitted.ipynb` cell 15's `* 24.0` valid.
+- `SpaceTimeCube` warns and **copies** unless the array is float32 — build cubes as float32.
+- `spot_fire.expected_firebrand_production` is a **`@cy.cfunc`, not callable from Python** in the
+  compiled build. Stage 1b cannot call it; it must be reimplemented vectorized in
+  `spread/spotting.py` and cross-checked against the sdist's pure-Python-mode source (pyretechnics is
+  pure-Python-mode Cython, so `spot_fire.py` runs as plain Python with the `cython` shadow module).
+  Only `firebrand_flight_survival_probability` and `schroeder_ignition_probability` are exported.
+- `spread_fire_with_phi_field` returns `random_generator` only when spotting is used — a cheap
+  assertion that the spotting path was actually exercised.
+
 ## Model CLI invocation
 - **FlamMap**: command file approach via `run_cli()`
 - **MTT command file**: `{lcp} {input_file} {ignition_shp} {barrier_or_0} {output_base_path} {output_type}`

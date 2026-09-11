@@ -228,11 +228,56 @@ fireline intensity, jump distance with `I^0.3`):
    over one hard-coded constant.
 3. It also explains most of G1's flame-length gap: FL = f(I), and suppressed crown fire suppresses I.
 
-**Not yet decided.** Options are (a) accept the default and declare it, (b) patch the constant into a
-parameter and rebuild from the sdist — we already build from sdist, and "inspectable, configurable
-physics" is the stated reason for preferring pyretechnics to ELMFIRE, but it makes us "modified
-pyretechnics", (c) carry the gate as a `ConditionId` sensitivity axis alongside firebrand flux and
-report the treatment effect across both. **Resolve before Stage 7.**
+**It is not a units problem** — checked three ways. pyretechnics' own `load_landfire.py` applies
+`canopy_cover * 0.01 -> [0-0.95]`, "canopy area / total area", so a **fraction** is what the engine
+wants and `destack_lcp`'s `CC 45 -> 0.45` matches it (same table confirms `CH x0.10`, `CBH x0.10`,
+`CBD x0.01`, and `slope x0.01` — the SLPP trap). Deliberately passing CC in percent *looks* like a
+fix (crown 21.4% -> 42.8%) but only because `45 > 0.4` makes every canopied pixel clear the gate; it
+degrades above-gate agreement with FlamMap from **99.4% -> 94.6%**, because CC also drives the
+wind-adjustment factor. A units error is not a physics knob.
+
+### Gate sweep — and the second, opposite problem
+`code/dev/pyre/g1c_crown_gate_sweep.py`, 40,000-cell sample, threshold patched in pyretechnics'
+**pure-Python-mode source** (CC correct everywhere else). FlamMap on the same cells: crown 51.6%
+(passive 29.8%, active 21.8%).
+
+| gate | crown | passive | active | FL median | agree w/ FlamMap |
+|---|---|---|---|---|---|
+| CC > 0.4 (default) | 21.3% | 0.0% | 21.3% | 1.81 m | 69.7% |
+| CC > 0.3 | 26.6% | 0.0% | 26.6% | 1.93 m | 74.9% |
+| CC > 0.2 | 36.3% | 0.1% | 36.1% | 2.50 m | 84.6% |
+| CC > 0.1 | 51.1% | 0.5% | 50.7% | 4.97 m | **99.5%** |
+| CC > 0.0 | 51.1% | 0.5% | 50.7% | 4.97 m | 99.5% |
+
+**Removing the gate aligns crown extent almost perfectly** — 99.5% pixel agreement on
+surface-vs-crown and crown fraction to 0.5 pp. Two independently written crown modules do not agree
+at 99.5% by luck; the gate was the entire difference. (0.1 and 0.0 tie because LANDFIRE CC has no
+values in (0, 0.1].)
+
+**But passive crown never exceeds 0.5% at any threshold, against FlamMap's 29.8%.** At p97 the Cruz
+active rate (median 107.8 m/min) clears van Wagner's `3/CBD` (median 27.3) on 90.8% of canopied
+cells, so anything that crowns goes straight to ACTIVE. So flame length **overshoots** with the gate
+off (4.97 vs 3.75 m) exactly as it **undershoots** with it on (1.81 m) — pyretechnics is calling
+torching-grade fire full active crown fire.
+
+That reframes the constant: the CC > 0.4 gate is plausibly a **crude stand-in for the missing passive
+regime**, not an arbitrary number. Removing it trades one bias for its opposite, and both land on the
+spotting deliverable:
+```
+gate ON   too little crown fire  -> too little fireline intensity -> UNDER-states embers
+gate OFF  right crown extent, all classed active -> too much intensity -> OVER-states embers
+```
+**Neither setting is simply correct. Resolve before Stage 7.**
+
+### Diagnostic tooling: `code/dev/pyre/pyre_source.py`
+`ensure_pyre_source()` / `import_pure_python()` fetch the pinned sdist into the scratch root and swap
+the process onto pyretechnics' pure-Python modules. Two uses, both load-bearing:
+- **`cy.cfunc` functions become callable**, including `spot_fire.expected_firebrand_production` —
+  which the compiled build does not export, and which Stage 1b is built on. A vectorized
+  reimplementation can now be checked against the reference implementation rather than a docstring.
+- **Constants can be patched for an experiment** without shipping a fork.
+Diagnostic only: nothing under `fb_tools/` imports it, and production runs use the compiled, pinned,
+version-stamped engine. `import_pure_python()` is irreversible in-process — do compiled work first.
 
 ## Model CLI invocation
 - **FlamMap**: command file approach via `run_cli()`

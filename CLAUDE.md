@@ -267,7 +267,59 @@ spotting deliverable:
 gate ON   too little crown fire  -> too little fireline intensity -> UNDER-states embers
 gate OFF  right crown extent, all classed active -> too much intensity -> OVER-states embers
 ```
-**Neither setting is simply correct. Resolve before Stage 7.**
+**Neither setting is simply correct.** DECIDED 2026-09-10: **carry the gate as a sweep axis** beside
+firebrand flux, reporting the treatment effect at both ends rather than picking one.
+
+### The patched engine: `pyretechnics 2026.8.10+cfri1`
+`code/dev/pyre/build_patched_engine.py` builds the pinned sdist with the gate exposed as a runtime
+parameter and installs it over stock in `fb_pyre`. Running the low end in production needs a compiled
+build — the pure-Python source is ~100x too slow for a campaign.
+
+**The gate is hard-coded TWICE, on two different code paths**, and patching only one does nothing:
+| site | function | consumed by |
+|---|---|---|
+| `crown_fire.py:83` | `canopy_cover > 0.4` in `van_wagner_crown_fire_initiation` | `burn_cells` (what G1 measured) |
+| `crown_fire.py:54` | `if canopy_cover <= 0.4: return inf` in `van_wagner_crowning_spread_rate` | **`spread_fire_with_phi_field` — the campaign path** |
+
+Safety properties, all enforced in the build script:
+- **The patch asserts its target text** and fails loudly if absent — an unpatched build that reports
+  itself as patched is the worst outcome available. It also deletes the sdist's pre-generated `.c`
+  files, which would otherwise be used in preference to re-cythonizing the patched `.py`.
+- **The default is inert.** At threshold 0.4 the patched build reproduces stock **exactly** on all
+  three arms — crown fraction to 4 dp, FL median to 6 dp, fireline-intensity sums over 3.0 M cells,
+  and exact integer active-crown counts (baseline in `$FB_PYRE_SCRATCH/stock_engine_baseline.json`).
+- **The build is identifiable.** PEP 440 local label, so `pyre_version_info()` reports
+  `pyretechnics_version: 2026.8.10+cfri1`, `pyretechnics_patched: true`, and
+  **`crown_cover_threshold`** — recorded on every run because a results table that does not say which
+  end of the sweep produced it cannot be interpreted.
+
+API in `models/pyre.py`: `is_patched_engine()`, `crown_cover_threshold()`,
+`set_crown_cover_threshold(v)`. The setter raises on a stock build naming the remedy;
+`require_pyretechnics` accepts a local label but still pins the base version.
+**It is process-global** — set it once per condition level *before* spawning a worker pool, since a
+`"spawn"` worker re-imports the module and gets the default.
+
+**What the gate is worth, measured.** Uniform CC 0.25 test landscape: 34x area burned, 67x fireline
+intensity. Real North Cottonwood, one 24 h spread run from a central ignition, wind 292.5 FROM,
+spotting off:
+
+| gate | burned ha | crown | FL p95 | I p95 kW/m | wall s | peak RSS |
+|---|---|---|---|---|---|---|
+| 0.4 (stock) | 4,292 | 7.1% | 2.53 m | 1,953 | 3.7 | 0.49 GB |
+| 0.0 (no gate) | 6,033 | 38.8% | 5.62 m | 11,101 | 5.3 | 0.56 GB |
+
+Area brackets at only **1.4x** — narrow enough to report. But **I p95 brackets at 5.7x**, and that is
+the quantity spotting rides on: firebrand production scales with `I`, jump distance with `I^0.3`
+(≈1.7x). Wide, but that is what the sweep is for.
+
+**Incidental Stage 2 preview**: 3.7–5.3 s per 24 h realization at **30 m** on 3.0 M cells, 0.5 GB peak
+RSS, single process, spotting off. G2's best branch is "≤30 s at 90 m → produce at 30 m". Not yet a
+benchmark — 21 days and spotting on both cost more — but 30 m production looks reachable.
+
+`tests/test_pyre_engine.py` — 18 tests. The engine-free half runs in `fb_tools`; the rest skip there
+and skip on a stock build. The keystone drives a **real spread run** at both thresholds, because the
+campaign-path site is a `cy.cfunc` unreachable from Python, so end-to-end is the only assertion
+available and the one that matters.
 
 ### Diagnostic tooling: `code/dev/pyre/pyre_source.py`
 `ensure_pyre_source()` / `import_pure_python()` fetch the pinned sdist into the scratch root and swap

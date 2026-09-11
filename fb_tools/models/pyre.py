@@ -32,6 +32,17 @@ import sys
 #: Changing it invalidates every campaign manifest stamped with the old value.
 PYRETECHNICS_VERSION = "2026.8.10"
 
+#: Local patch label (PEP 440) of the CFRI build, which exposes pyretechnics'
+#: hard-coded crown canopy-cover gate as a runtime parameter. Stock pyretechnics
+#: has no local label, and both are accepted — but the *full* version string is
+#: what gets stamped into a manifest, so a patched result can never be mistaken
+#: for a stock one. See code/dev/pyre/build_patched_engine.py.
+PYRETECHNICS_PATCH_LABEL = "cfri1"
+
+#: Stock pyretechnics' crown gate: crown fire cannot occur at or below this
+#: canopy-cover fraction. Hard-coded in stock; settable in the CFRI build.
+STOCK_CROWN_COVER_THRESHOLD = 0.4
+
 
 def require_pyretechnics(version=PYRETECHNICS_VERSION):
     """
@@ -69,7 +80,11 @@ def require_pyretechnics(version=PYRETECHNICS_VERSION):
         ) from exc
 
     installed = _installed_version()
-    if version is not None and installed != version:
+    # A local version label (2026.8.10+cfri1) is the CFRI patched build and is
+    # accepted: it is the same upstream release with one constant exposed as a
+    # parameter, verified inert at its default against the stock engine on the
+    # real landscape. The base version must still match exactly.
+    if version is not None and _base_version(installed) != _base_version(version):
         raise RuntimeError(
             f"pyretechnics {installed!r} is installed but this analysis is pinned to "
             f"{version!r}. Crown-fire physics and the spotting API have both changed "
@@ -77,6 +92,75 @@ def require_pyretechnics(version=PYRETECHNICS_VERSION):
             "install the pinned version or pass version=None deliberately."
         )
     return pyretechnics
+
+
+def _base_version(v):
+    """Strip a PEP 440 local label: ``"2026.8.10+cfri1" -> "2026.8.10"``."""
+    return str(v).split("+", 1)[0]
+
+
+def is_patched_engine():
+    """True when the installed pyretechnics is the CFRI patched build."""
+    return _installed_version().endswith(f"+{PYRETECHNICS_PATCH_LABEL}")
+
+
+def crown_cover_threshold():
+    """
+    The canopy-cover fraction above which the engine allows crown fire.
+
+    Returns
+    -------
+    float
+        The live value on the patched build; ``STOCK_CROWN_COVER_THRESHOLD``
+        (0.4, hard-coded and unchangeable) on stock pyretechnics.
+    """
+    if not is_patched_engine():
+        return STOCK_CROWN_COVER_THRESHOLD
+    import pyretechnics.crown_fire as cf
+    return float(cf.get_crown_cover_threshold())
+
+
+def set_crown_cover_threshold(value):
+    """
+    Set the engine's crown canopy-cover gate — one level of the sweep axis.
+
+    Parameters
+    ----------
+    value : float
+        Canopy-cover fraction in [0, 1]. ``0.4`` is stock pyretechnics; ``0.0``
+        disables the gate, reproducing Van Wagner (1977) as published.
+
+    Raises
+    ------
+    RuntimeError
+        On stock pyretechnics, where the constant is compiled in. Install the
+        CFRI build (``code/dev/pyre/build_patched_engine.py``).
+
+    Notes
+    -----
+    **Why this is a sweep axis and not a tuned constant.** Stock's 0.4 blocks
+    crown fire on 71% of North Cottonwood, where the *intensity* criterion is
+    satisfied on 82% of the blocked cells; setting it to 0 brings crown extent to
+    within 0.5 pp of FlamMap at 99.5% pixel agreement. But pyretechnics has no
+    passive-crown regime at all (``fire_type == 2`` is ~0 everywhere at p97), so
+    with the gate off it classes torching-grade fire as full active crown fire and
+    flame length overshoots as far as it undershoots at 0.4. Neither end is
+    correct; both are reported.
+
+    **Process-global.** Seeds and weather are per realization, this is not. Set it
+    once per condition level *before* spawning a worker pool — a "spawn" worker
+    re-imports the module and gets the default, so a value set after the pool
+    exists will not reach the workers.
+    """
+    if not is_patched_engine():
+        raise RuntimeError(
+            f"pyretechnics {_installed_version()} hard-codes the crown canopy-cover "
+            "gate at 0.4 in two places (van_wagner_crowning_spread_rate and "
+            "van_wagner_crown_fire_initiation). Build the CFRI engine to make it "
+            "settable:\n    python code/dev/pyre/build_patched_engine.py"
+        )
+    import pyretechnics.crown_fire as cf
+    cf.set_crown_cover_threshold(float(value))
 
 
 def _installed_version():
@@ -106,14 +190,19 @@ def pyre_version_info(strict=True):
     Returns
     -------
     dict
-        ``pyretechnics_version``, ``pyretechnics_pinned``, ``python_version``,
-        ``numpy_version``, ``scipy_version``, ``platform``, ``conda_env``.
+        ``pyretechnics_version``, ``pyretechnics_pinned``, ``pyretechnics_patched``,
+        ``crown_cover_threshold``, ``python_version``, ``numpy_version``,
+        ``scipy_version``, ``platform``, ``conda_env``.
 
     Notes
     -----
     numpy and scipy are recorded because pyretechnics is compiled against the
     numpy C-API present at build time: the same source pinned to the same
     version can produce different binaries in different envs.
+
+    ``crown_cover_threshold`` is recorded because it is a swept physics setting
+    (see ``set_crown_cover_threshold``), and a results table that does not say
+    which end of that sweep produced it cannot be interpreted.
     """
     if strict:
         require_pyretechnics()
@@ -129,6 +218,11 @@ def pyre_version_info(strict=True):
     return {
         "pyretechnics_version": _installed_version(),
         "pyretechnics_pinned": PYRETECHNICS_VERSION,
+        "pyretechnics_patched": is_patched_engine(),
+        # Recorded on every run, patched or not: it is a physics setting, and a
+        # results table that does not say which end of the sweep it came from
+        # cannot be interpreted.
+        "crown_cover_threshold": crown_cover_threshold(),
         "python_version": platform.python_version(),
         "numpy_version": np.__version__,
         "scipy_version": scipy_version,

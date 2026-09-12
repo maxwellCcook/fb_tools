@@ -565,3 +565,110 @@ def test_design_ignitions_without_values(synth_lcp, design_geometry, tmp_path):
     )
     assert len(res["ignitions_gdf"]) == 4
     assert res["n_after_ordering"] == res["n_after_cone"]
+
+
+# ── Wildfire-scar exclusion from the ignition sampling frame ──────────────────
+# A design fire ignited inside a recent wildfire scar stays small because that
+# stand's fuels are depleted — an effect unrelated to the treatment under test.
+# `exclude_gdf` removes such ground from the sampling frame.
+
+@pytest.fixture
+def upwind_scar(synth_lcp, design_geometry):
+    """A polygon covering the near half of the upwind placement wedge."""
+    import rasterio
+
+    trt, _ = design_geometry
+    with rasterio.open(synth_lcp) as src:
+        crs = src.crs
+    c = trt.geometry.union_all().centroid
+    # Wind is FROM 270, so candidates lie west of the treatment centroid.
+    return gpd.GeoDataFrame(
+        geometry=[box(c.x - 1300, c.y - 2000, c.x - 700, c.y + 2000)], crs=crs
+    )
+
+
+def test_exclusion_keeps_ignitions_out_of_the_scar(synth_lcp, design_geometry,
+                                                   upwind_scar, tmp_path):
+    trt, val = design_geometry
+    res = select_design_ignitions(
+        trt, val, synth_lcp, tmp_path, wind_from_deg=270.0,
+        n_ignitions=6, dist_band_km=(0.5, 2.0), cone_half_angle_deg=30.0,
+        exclude_gdf=upwind_scar, seed=1,
+    )
+    scar = upwind_scar.geometry.union_all()
+    pts = res["ignition_points_gdf"].to_crs(upwind_scar.crs)
+    assert len(pts) == 6
+    assert not pts.geometry.intersects(scar).any()
+
+
+def test_exclusion_reports_the_cells_it_removed(synth_lcp, design_geometry,
+                                                upwind_scar, tmp_path):
+    trt, val = design_geometry
+    kw = dict(wind_from_deg=270.0, n_ignitions=6, dist_band_km=(0.5, 2.0),
+              cone_half_angle_deg=30.0, seed=1)
+    plain = select_design_ignitions(trt, val, synth_lcp, tmp_path / "p", **kw)
+    masked = select_design_ignitions(trt, val, synth_lcp, tmp_path / "m",
+                                     exclude_gdf=upwind_scar, **kw)
+    assert plain["n_excluded_cells"] == 0
+    assert masked["n_excluded_cells"] > 0
+    assert masked["n_candidates"] < plain["n_candidates"]
+
+
+def test_exclusion_none_is_a_no_op(synth_lcp, design_geometry, tmp_path):
+    """Passing no exclusion must not perturb the draw."""
+    trt, val = design_geometry
+    kw = dict(wind_from_deg=270.0, n_ignitions=6, dist_band_km=(0.5, 2.0),
+              cone_half_angle_deg=30.0, seed=1)
+    a = select_design_ignitions(trt, val, synth_lcp, tmp_path / "a", **kw)
+    b = select_design_ignitions(trt, val, synth_lcp, tmp_path / "b",
+                                exclude_gdf=None, **kw)
+    assert a["n_candidates"] == b["n_candidates"]
+    assert a["n_excluded_cells"] == 0
+    np.testing.assert_allclose(a["ignitions_gdf"].w_i.values,
+                               b["ignitions_gdf"].w_i.values)
+
+
+def test_exclusion_reprojects_from_a_different_crs(synth_lcp, design_geometry,
+                                                   upwind_scar, tmp_path):
+    """A scar layer in geographic coordinates still masks the right ground."""
+    trt, val = design_geometry
+    kw = dict(wind_from_deg=270.0, n_ignitions=6, dist_band_km=(0.5, 2.0),
+              cone_half_angle_deg=30.0, seed=1)
+    native = select_design_ignitions(trt, val, synth_lcp, tmp_path / "n",
+                                     exclude_gdf=upwind_scar, **kw)
+    wgs84 = select_design_ignitions(trt, val, synth_lcp, tmp_path / "w",
+                                    exclude_gdf=upwind_scar.to_crs(4326), **kw)
+    assert wgs84["n_excluded_cells"] > 0
+    assert wgs84["n_candidates"] == native["n_candidates"]
+
+
+def test_exclusion_covering_the_wedge_raises(synth_lcp, design_geometry,
+                                             tmp_path):
+    """An over-aggressive mask fails loudly, and says the exclusion did it."""
+    import rasterio
+
+    trt, val = design_geometry
+    with rasterio.open(synth_lcp) as src:
+        crs, b = src.crs, src.bounds
+    everything = gpd.GeoDataFrame(
+        geometry=[box(b.left, b.bottom, b.right, b.top)], crs=crs
+    )
+    with pytest.raises(ValueError, match="exclusion may be"):
+        select_design_ignitions(
+            trt, val, synth_lcp, tmp_path, wind_from_deg=270.0,
+            n_ignitions=6, dist_band_km=(0.5, 2.0), cone_half_angle_deg=30.0,
+            exclude_gdf=everything, seed=1,
+        )
+
+
+def test_exclusion_empty_frame_is_a_no_op(synth_lcp, design_geometry, tmp_path):
+    """An empty GeoDataFrame (no recent scars in range) must not raise."""
+    trt, val = design_geometry
+    empty = gpd.GeoDataFrame(geometry=[], crs=trt.crs)
+    res = select_design_ignitions(
+        trt, val, synth_lcp, tmp_path, wind_from_deg=270.0,
+        n_ignitions=6, dist_band_km=(0.5, 2.0), cone_half_angle_deg=30.0,
+        exclude_gdf=empty, seed=1,
+    )
+    assert len(res["ignitions_gdf"]) == 6
+    assert res["n_excluded_cells"] == 0

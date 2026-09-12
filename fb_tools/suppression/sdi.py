@@ -406,10 +406,122 @@ def _trail_density_grid(trails_gdf, reference_da, radius_m=56.42):
 
 # ── Public API ───────────────────────────────────────────────────────────────
 
+SDI_NODATA = -9999
+
+
+def _sdi_reference_grid(lcp):
+    """Resolve the single-band (y, x) grid that SDI is computed on.
+
+    SDI is written on the *slope* band of the LCP.  Both :func:`calculate_sdi`
+    and :func:`sdi_static_layers` must resolve it identically, or a cached
+    static layer would be silently misaligned against the scenario it is
+    reused for.
+
+    Parameters
+    ----------
+    lcp : str, Path, or xarray.DataArray
+
+    Returns
+    -------
+    xarray.DataArray
+        2-D reference grid.
+    dict
+        Normalised band name -> band index.
+    """
+    from ..fuelscape.adjust import _normalize_band_name
+
+    if isinstance(lcp, (str, Path)):
+        lcp = rxr.open_rasterio(Path(lcp), masked=True)
+
+    long_names = lcp.attrs.get("long_name")
+    if not long_names:
+        raise ValueError(
+            "lcp DataArray has no 'long_name' attribute. "
+            "Load the LCP via stack_rasters or rxr.open_rasterio to preserve band names."
+        )
+    if isinstance(long_names, str):
+        long_names = [long_names]
+
+    band_map = {
+        _normalize_band_name(n): int(b)
+        for n, b in zip(long_names, lcp.band.values)
+    }
+    required = {"SlpD", "Asp", "FBFM40"}
+    missing = required - band_map.keys()
+    if missing:
+        raise ValueError(
+            f"Required band(s) not found in lcp: {sorted(missing)}. "
+            f"Available (normalised): {sorted(band_map.keys())}"
+        )
+    return lcp.sel(band=band_map["SlpD"]).squeeze(), band_map
+
+
+def sdi_static_layers(lcp, roads_gdf, trails_gdf, cache_path=None):
+    """Compute (or load) the treatment-invariant SDI inputs.
+
+    Road distance and trail density depend only on the OSM geometry and the
+    grid — no treatment scenario touches either — so they are identical across
+    every LCP variant and can be computed once and reused.  Pass the result
+    into :func:`calculate_sdi` as ``road_dist=`` / ``trail_len=``.
+
+    The saving is modest in wall-clock terms (measured ~13 s per scenario on a
+    14783 x 13430 grid with 319k OSM roads); the real benefit is not rebuilding
+    two 0.8 GB float32 arrays per scenario.
+
+    Parameters
+    ----------
+    lcp : str, Path, or xarray.DataArray
+        LCP defining the target grid.  Must already be aligned to the grid the
+        scenarios will be computed on — see the note on `cache_path` below.
+    roads_gdf, trails_gdf : GeoDataFrame
+    cache_path : str or Path, optional
+        ``.npz`` to read from if present, else write to.  The cache stores the
+        grid shape and transform and **refuses to load** against a different
+        grid, since a silently misaligned road-distance surface would corrupt
+        every scenario that reused it.
+
+    Returns
+    -------
+    dict
+        ``{"road_dist": ndarray, "trail_len": ndarray}``, both float32 2-D.
+    """
+    ref, _ = _sdi_reference_grid(lcp)
+    shape = tuple(ref.shape)
+    transform = np.asarray(ref.rio.transform(), dtype="float64")[:6]
+
+    if cache_path is not None:
+        cache_path = Path(cache_path)
+        if cache_path.is_file():
+            with np.load(cache_path) as z:
+                if (tuple(z["shape"]) == shape
+                        and np.allclose(z["transform"], transform)):
+                    print(f"  SDI static layers: cache hit ({cache_path.name})")
+                    return {"road_dist": z["road_dist"], "trail_len": z["trail_len"]}
+                raise ValueError(
+                    f"SDI static cache {cache_path.name} was built on grid "
+                    f"{tuple(z['shape'])} / {z['transform'][:3]}, but this LCP is "
+                    f"{shape} / {transform[:3]}. Delete the cache to rebuild it."
+                )
+
+    print("Computing road distance...")
+    road_dist = _road_distance_m(roads_gdf, ref)
+    print("Computing trail density...")
+    trail_len = _trail_density_grid(trails_gdf, ref)
+
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(cache_path, road_dist=road_dist, trail_len=trail_len,
+                            shape=np.array(shape), transform=transform)
+        print(f"  SDI static layers cached -> {cache_path}")
+
+    return {"road_dist": road_dist, "trail_len": trail_len}
+
+
 def calculate_sdi(lcp, roads_gdf, trails_gdf, rtc_path,
                   flammap_stack=None,
                   flame_length=None, heat_area=None,
-                  out_path=None):
+                  out_path=None, nodata=SDI_NODATA,
+                  road_dist=None, trail_len=None):
     """
     Calculate the Suppression Difficulty Index (SDI) for a landscape.
 
@@ -453,12 +565,18 @@ def calculate_sdi(lcp, roads_gdf, trails_gdf, rtc_path,
         extents differ.
     out_path : str or Path, optional
         If provided, the SDI raster is written to this GeoTIFF path.
+    nodata : int, optional
+        Value written wherever any required input is nodata (default -9999).
+    road_dist, trail_len : numpy.ndarray, optional
+        Precomputed static sub-index inputs from :func:`sdi_static_layers`.
+        Neither depends on the treatment, so they can be built once and reused
+        across every scenario sharing the grid.  Computed here if omitted.
 
     Returns
     -------
     xarray.DataArray
-        SDI values = raw SDI × 100, dtype int16.  CRS and spatial metadata
-        are preserved from *lcp*.
+        SDI values = raw SDI × 100, dtype int16, with *nodata* outside the
+        valid footprint.  CRS and spatial metadata are preserved from *lcp*.
 
     Raises
     ------
@@ -483,9 +601,17 @@ def calculate_sdi(lcp, roads_gdf, trails_gdf, rtc_path,
         sdi_slope   = sdi_base + KO_slope_hazard
         sdi_final   = sdi_base  (where road_distance_m ≤ 100)
                     = sdi_slope (elsewhere)
-        output      = round(sdi_final × 100) as int16
+        output      = round(sdi_final × 100) as int16, `nodata` where invalid
+
+    Nodata is tracked explicitly because every ``_classify_*`` helper is built
+    on ``np.select``, and NaN compares False against every condition — so a
+    nodata pixel silently falls through to the ``default`` branch.  For
+    ``_classify_fl`` and ``_classify_hua`` that default is **10**, the maximum
+    class, so an unmasked FlamMap footprint used to yield ``energy = 10``
+    (a fabricated maximum-energy field) rather than an obvious 0.  ``FBFM40``
+    is worse still: ``np.nan.astype(np.int32)`` is undefined.  The validity
+    mask below is built from the raw inputs, before any classification.
     """
-    from ..fuelscape.adjust import _normalize_band_name
     from ..fuelscape.lcp import get_band_by_longname
 
     # ── Accept stacked FlamMap output as single-file alternative ─────────────
@@ -511,30 +637,8 @@ def calculate_sdi(lcp, roads_gdf, trails_gdf, rtc_path,
 
     rtc_path = Path(rtc_path)
 
-    # ── Validate band names ──────────────────────────────────────────────────
-    long_names = lcp.attrs.get("long_name")
-    if not long_names:
-        raise ValueError(
-            "lcp DataArray has no 'long_name' attribute. "
-            "Load the LCP via stack_rasters or rxr.open_rasterio to preserve band names."
-        )
-    if isinstance(long_names, str):
-        long_names = [long_names]
-
-    band_map = {
-        _normalize_band_name(n): int(b)
-        for n, b in zip(long_names, lcp.band.values)
-    }
-    required = {"SlpD", "Asp", "FBFM40"}
-    missing = required - band_map.keys()
-    if missing:
-        raise ValueError(
-            f"Required band(s) not found in lcp: {sorted(missing)}. "
-            f"Available (normalised): {sorted(band_map.keys())}"
-        )
-
-    # ── Reference grid: single-band 2-D DataArray ───────────────────────────
-    ref = lcp.sel(band=band_map["SlpD"]).squeeze()
+    # ── Validate band names and resolve the reference grid ───────────────────
+    ref, band_map = _sdi_reference_grid(lcp)
 
     # ── Align fire behavior outputs to LCP grid if needed ───────────────────
     flame_length = _align_to_reference(flame_length.squeeze(), ref)
@@ -554,18 +658,52 @@ def calculate_sdi(lcp, roads_gdf, trails_gdf, rtc_path,
     del lcp, flame_length, heat_area
     gc.collect()
 
+    # ── Validity mask ────────────────────────────────────────────────────────
+    # Built from the RAW inputs, before any np.select classification silently
+    # promotes NaN to a `default` class (see Notes).  The FlamMap footprint is
+    # typically far smaller than the LCP extent, so this is what confines SDI
+    # to the modeled area.
+    valid = (np.isfinite(slope) & np.isfinite(aspect)
+             & np.isfinite(fl_arr) & np.isfinite(hu_arr))
+    if fbfm40.dtype.kind == "f":
+        valid &= np.isfinite(fbfm40)
+    if not valid.any():
+        raise ValueError(
+            "No valid pixels: the LCP and FlamMap inputs have no overlapping "
+            "valid data. Check that they cover the same area."
+        )
+
     # ── RTC lookup ───────────────────────────────────────────────────────────
     rtc_lut = _load_rtc_table(rtc_path)
+    # np.nan.astype(int32) is undefined; zero the invalid cells first so the
+    # clip below indexes a defined value. They are masked out at the end.
+    fbfm40 = np.where(valid, fbfm40, 0)
     fbfm40_idx = np.clip(fbfm40.astype(np.int32), 0, len(rtc_lut) - 1)
     fuel_cntrl = rtc_lut[fbfm40_idx].astype(np.float32)
     del fbfm40, fbfm40_idx
 
     # ── Road distance and trail density ──────────────────────────────────────
-    print("Computing road distance...")
-    road_dist = _road_distance_m(roads_gdf, ref)
+    # Both are treatment-invariant; sdi_static_layers() builds them once for a
+    # whole scenario set. Shape is asserted because a mismatched cache would
+    # otherwise broadcast or silently misalign the accessibility sub-index.
+    ref_shape = tuple(np.shape(slope))
+    if road_dist is None:
+        print("Computing road distance...")
+        road_dist = _road_distance_m(roads_gdf, ref)
+    elif tuple(road_dist.shape) != ref_shape:
+        raise ValueError(
+            f"road_dist shape {tuple(road_dist.shape)} != grid {ref_shape}"
+        )
+    road_dist = road_dist.astype(np.float32, copy=False)
 
-    print("Computing trail density...")
-    trail_len = _trail_density_grid(trails_gdf, ref)
+    if trail_len is None:
+        print("Computing trail density...")
+        trail_len = _trail_density_grid(trails_gdf, ref)
+    elif tuple(trail_len.shape) != ref_shape:
+        raise ValueError(
+            f"trail_len shape {tuple(trail_len.shape)} != grid {ref_shape}"
+        )
+    trail_len = trail_len.astype(np.float32, copy=False)
 
     # ── Sub-indices ───────────────────────────────────────────────────────────
     print("Computing sub-indices...")
@@ -608,18 +746,22 @@ def calculate_sdi(lcp, roads_gdf, trails_gdf, rtc_path,
 
     sdi_out = np.round(sdi_final * 100.0).astype(np.int16)
     del sdi_final
+    sdi_out[~valid] = nodata
+    del valid
+    gc.collect()
 
     # ── Wrap in DataArray, preserve CRS/transform ─────────────────────────────
     da_out = xr.DataArray(sdi_out, dims=ref.dims, coords=ref.coords)
     da_out = da_out.rio.write_crs(ref.rio.crs)
     da_out = da_out.rio.write_transform(ref.rio.transform())
+    da_out = da_out.rio.write_nodata(nodata)
     da_out.attrs["long_name"] = "SDI"
 
     if out_path is not None:
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         da_out.rio.to_raster(
-            str(out_path), dtype="int16",
+            str(out_path), dtype="int16", nodata=nodata,
             compress="deflate", predictor=2, zlevel=9,
             tiled=True, blockxsize=256, blockysize=256,
         )
@@ -628,7 +770,8 @@ def calculate_sdi(lcp, roads_gdf, trails_gdf, rtc_path,
     return da_out
 
 
-def calculate_delta_sdi(baseline_sdi, treatment_sdi, out_path=None):
+def calculate_delta_sdi(baseline_sdi, treatment_sdi, out_path=None,
+                        nodata=SDI_NODATA):
     """
     Compute the difference between a baseline and a treatment SDI raster.
 
@@ -644,16 +787,27 @@ def calculate_delta_sdi(baseline_sdi, treatment_sdi, out_path=None):
         grids differ.
     out_path : str or Path, optional
         If provided, write the delta raster as a GeoTIFF.
+    nodata : int, optional
+        Value written where either input is nodata (default -9999).
 
     Returns
     -------
     xarray.DataArray
-        Delta SDI (int16, same ×100 scale as the inputs).
+        Delta SDI (int16, same ×100 scale as the inputs), with *nodata*
+        wherever either input is nodata.
 
     Raises
     ------
     ValueError
         If *baseline_sdi* and *treatment_sdi* have different CRS.
+
+    Notes
+    -----
+    Both inputs are opened with ``masked=True``, so nodata arrives as NaN and
+    ``NaN.astype(np.int32)`` is undefined — the difference must be taken over a
+    validity mask rather than over the raw arrays.  Without it, two nodata
+    pixels would also difference to a plausible-looking 0 ("no change") outside
+    the modeled footprint.
     """
     if isinstance(baseline_sdi, (str, Path)):
         baseline_sdi = rxr.open_rasterio(Path(baseline_sdi), masked=True).squeeze()
@@ -664,13 +818,20 @@ def calculate_delta_sdi(baseline_sdi, treatment_sdi, out_path=None):
     if treatment_sdi.shape != baseline_sdi.shape:
         treatment_sdi = _align_to_reference(treatment_sdi, baseline_sdi)
 
-    delta_arr = (baseline_sdi.values.astype(np.int32)
-                 - treatment_sdi.values.astype(np.int32)).astype(np.int16)
+    b_arr = baseline_sdi.values
+    t_arr = treatment_sdi.values
+    valid = np.isfinite(b_arr) & np.isfinite(t_arr)
     del treatment_sdi
+
+    delta_arr = np.full(b_arr.shape, nodata, dtype=np.int16)
+    np.subtract(b_arr, t_arr, out=delta_arr, where=valid, casting="unsafe")
+    delta_arr[~valid] = nodata
+    del b_arr, t_arr, valid
 
     da_out = xr.DataArray(delta_arr, dims=baseline_sdi.dims, coords=baseline_sdi.coords)
     da_out = da_out.rio.write_crs(baseline_sdi.rio.crs)
     da_out = da_out.rio.write_transform(baseline_sdi.rio.transform())
+    da_out = da_out.rio.write_nodata(nodata)
     da_out.attrs["long_name"] = "Delta SDI"
     del baseline_sdi, delta_arr
     gc.collect()
@@ -679,7 +840,7 @@ def calculate_delta_sdi(baseline_sdi, treatment_sdi, out_path=None):
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         da_out.rio.to_raster(
-            str(out_path), dtype="int16",
+            str(out_path), dtype="int16", nodata=nodata,
             compress="deflate", predictor=2, zlevel=9,
             tiled=True, blockxsize=256, blockysize=256,
         )

@@ -951,6 +951,7 @@ def select_design_ignitions(
     dist_band_km: tuple = (5.0, 25.0),
     cone_half_angle_deg: float = 30.0,
     upwind_sector_deg: "float | None" = None,
+    exclude_gdf=None,
     n_bearing_strata: int = 3,
     n_distance_strata: int = 2,
     footprint_acres: "float | None" = DEFAULT_FOOTPRINT_ACRES,
@@ -1013,6 +1014,23 @@ def select_design_ignitions(
         Angular width of the candidate placement wedge.  Defaults to
         ``2 * cone_half_angle_deg + 30`` so candidates exist slightly outside
         the strict cone geometry and the cone filter does real work.
+    exclude_gdf : geopandas.GeoDataFrame, optional
+        Polygons in which design fires may **not** be placed — in practice,
+        recent *wildfire* scars.  Any CRS; reprojected internally.
+
+        A fire ignited inside a recent scar stays small because that stand's
+        fuels are depleted, which is a real landscape effect but one entirely
+        unrelated to the treatment under test.  Such a design fire spends a
+        draw without informing the contrast and biases the reach distribution
+        low, so the sampling frame should exclude it.
+
+        **Pass wildfire scars only.**  Prescribed-fire footprints are fuel
+        *treatments*; they belong in the treatment arms of the experiment, not
+        in an exclusion mask.  Filtering a perimeter layer on its fire-type
+        attribute is the caller's job — this function excludes whatever it is
+        given.  Note also that scars predating the LCP's LANDFIRE vintage are
+        already reflected in its fuels, while later ones are not; the vintage
+        is what makes a scar "recent" for this purpose.
     n_bearing_strata, n_distance_strata : int
         Stratification grid over approach bearing and distance.  Defaults
         3 × 2 = 6 strata.
@@ -1100,6 +1118,26 @@ def select_design_ignitions(
     )
     in_wedge = ~geometry_mask([wedge], out_shape=grid["shape"],
                               transform=transform, invert=False)
+
+    # ── Drop excluded ground (recent wildfire scars) from the frame ──────────
+    # geometry_mask(invert=False) is True OUTSIDE the geometries, which is
+    # already the "keep" sense we want, so it ANDs straight into the wedge.
+    n_wedge_before_exclude = int(in_wedge.sum())
+    n_excluded_cells = 0
+    if exclude_gdf is not None and len(exclude_gdf):
+        excl_geoms = [g for g in exclude_gdf.to_crs(crs).geometry.values
+                      if g is not None and not g.is_empty]
+        if excl_geoms:
+            outside_excl = geometry_mask(excl_geoms, out_shape=grid["shape"],
+                                         transform=transform, invert=False,
+                                         all_touched=True)
+            in_wedge &= outside_excl
+            n_excluded_cells = n_wedge_before_exclude - int(in_wedge.sum())
+            print(f"  [select_design_ignitions] excluded {len(excl_geoms)} "
+                  f"polygon(s): {n_excluded_cells:,} of "
+                  f"{n_wedge_before_exclude:,} wedge cells removed "
+                  f"({100.0 * n_excluded_cells / max(n_wedge_before_exclude, 1):.1f}%)")
+
     cand, rows, cols = _points_from_mask(grid["mask"], transform, crs,
                                          sub_mask=in_wedge)
     n_candidates = len(cand)
@@ -1107,6 +1145,9 @@ def select_design_ignitions(
         raise ValueError(
             "No burnable pixels in the upwind placement wedge. Check "
             "dist_band_km, upwind_sector_deg, and that the LCP covers the zone."
+            + (f" Note that exclude_gdf removed {n_excluded_cells:,} of "
+               f"{n_wedge_before_exclude:,} wedge cells — the exclusion may be "
+               f"too aggressive." if n_excluded_cells else "")
         )
 
     # Per-candidate ignition-likelihood weight
@@ -1246,6 +1287,7 @@ def select_design_ignitions(
         "downwind_az":          downwind_az,
         "cone_half_angle_deg":  float(cone_half_angle_deg),
         "n_candidates":         int(n_candidates),
+        "n_excluded_cells":     int(n_excluded_cells),
         "n_after_cone":         int(n_after_cone),
         "n_after_ordering":     int(n_after_ordering),
         "uniform_weights":      bool(uniform_weights),

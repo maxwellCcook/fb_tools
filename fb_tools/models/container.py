@@ -1440,6 +1440,7 @@ def prepare_fspro_experiment(
     cone_coverage: float = 0.5,
     n_ignitions: int = 10,
     dist_band_km: tuple = (5.0, 25.0),
+    exclude_gdf=None,
     n_bearing_strata: int = 3,
     n_distance_strata: int = 2,
     footprint_acres: "float | None" = 10.0,
@@ -1553,7 +1554,16 @@ def prepare_fspro_experiment(
         weighted source locations rather than a dense ensemble.
     dist_band_km : tuple of float
         ``(min, max)`` upwind distance from the treatment centroid, km.
-        Default ``(5, 25)``.
+        Default ``(5, 25)``.  Size it against the spread distance the run's
+        ``duration`` and weather conditioning actually produce: design fires
+        placed beyond that reach never touch the treatment, and contribute a
+        structurally zero contrast.
+    exclude_gdf : geopandas.GeoDataFrame, optional
+        Polygons in which design fires may not be placed — recent *wildfire*
+        scars, whose depleted fuels keep a fire small for reasons unrelated to
+        the treatment.  Pass wildfire only: prescribed-fire footprints are
+        treatments and belong in the arms, not the exclusion mask.  See
+        :func:`~fb_tools.fuelscape.ignitions.select_design_ignitions`.
     n_bearing_strata, n_distance_strata : int
         Stratification grid.  Default 3 × 2.
     footprint_acres : float or None
@@ -1726,6 +1736,7 @@ def prepare_fspro_experiment(
         density=density,
         n_ignitions=n_ignitions,
         dist_band_km=dist_band_km,
+        exclude_gdf=exclude_gdf,
         cone_half_angle_deg=cone_half_angle_deg,
         n_bearing_strata=n_bearing_strata,
         n_distance_strata=n_distance_strata,
@@ -1802,6 +1813,8 @@ def prepare_fspro_experiment(
         "fspro_input_paths":  [str(p) for p in input_paths],
         "ignition_weights":   weights,
         "uniform_weights":    ign["uniform_weights"],
+        "n_excluded_cells":   ign.get("n_excluded_cells", 0),
+        "exclude_n_polygons": 0 if exclude_gdf is None else int(len(exclude_gdf)),
         "density_raster":     str(density_raster) if density_raster else None,
         "num_fires":          num_fires,
         "duration":           duration,

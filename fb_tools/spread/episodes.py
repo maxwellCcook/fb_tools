@@ -169,6 +169,9 @@ def select_episodes(pyrome_id, erc_cache_dir, *, severity="p97", n=5, duration_d
 
 
 FAST_FIRE_GROWTH_HA = 1620.0     # Balch et al. (2025, Science): a "fast fire" grows >= 1,620 ha in one day
+#: Fast-fires lookup shipped with the package (FIRED v2025var, CONUS, Oct 2000 – Feb 2026). Rebuild with
+#: :func:`build_fast_fires_table` on a new FIRED release and replace this file.
+FAST_FIRES_CSV = Path(__file__).resolve().parents[1] / "data" / "fast_fires_fired_v2025var.csv"
 
 
 def build_fast_fires_table(fired_events_fp, out_csv, *, min_growth_ha=FAST_FIRE_GROWTH_HA):
@@ -208,14 +211,14 @@ def build_fast_fires_table(fired_events_fp, out_csv, *, min_growth_ha=FAST_FIRE_
     return out
 
 
-def dates_from_fast_fires(table, *, geom=None, bbox=None, days_before=3, min_growth_ha=FAST_FIRE_GROWTH_HA):
+def dates_from_fast_fires(table=FAST_FIRES_CSV, *, geom=None, bbox=None, days_before=3, min_growth_ha=FAST_FIRE_GROWTH_HA):
     """
     Episode start dates that put a fast fire's biggest day inside the window.
 
     Parameters
     ----------
     table : DataFrame or Path
-        From :func:`build_fast_fires_table` (or its CSV).
+        From :func:`build_fast_fires_table` (or its CSV); default the bundled ``FAST_FIRES_CSV``.
     geom : shapely geometry, GeoSeries or GeoDataFrame, optional
         Keep events whose ignition centroid falls inside (any CRS).
     bbox : tuple, optional

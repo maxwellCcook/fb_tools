@@ -344,7 +344,7 @@ records (MTBS/FIRED) as a pool are a later add — the interface is the same (`d
 **2026-09-13 (fast-fire episodes, Max)** — Third episode pool: FIRED events whose maximum single-day growth
 reaches **1,620 ha** (the fast-fire threshold of Balch et al. 2025, Science). `episodes.build_fast_fires_table`
 reads the FIRED *events* GeoPackage once (`MCC/data/wildfire/FIRED/raw/fired_v2025var_…_events.gpkg`, 2000–
-Feb 2026) into a lookup, `data/wildfire/fast_fires_fired_v2025var.csv` (2,169 CONUS events: id, ignition /
+Feb 2026) into a lookup that **ships with the package**, `fb_tools/data/fast_fires_fired_v2025var.csv` (2,169 CONUS events, 188 KB: id, ignition /
 last / max-growth dates, max-day ha, total ha, duration, land cover, ignition centroid lon/lat); rebuild it on a
 new FIRED release. `dates_from_fast_fires(table, geom=|bbox=, days_before=3)` returns window starts
 `days_before` the biggest day, so `duration_days = before + 1 + after` brackets the blow-up. Weather then comes

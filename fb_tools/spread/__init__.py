@@ -32,7 +32,7 @@ from .fspro_outputs import (
 )
 from .convert import destack_lcp, PYRE_LAYERS
 from .episodes import (select_episodes, dates_from_fod, dates_from_fast_fires, build_fast_fires_table,
-                       FAST_FIRE_GROWTH_HA, load_rtma_hourly, episode_hourly_frame,
+                       FAST_FIRE_GROWTH_HA, FAST_FIRES_CSV, load_rtma_hourly, episode_hourly_frame,
                        layer_bounds_lonlat, block_factors, episode_wind_cube, write_wind_cube,
                        load_wind_cube, wind_cube_summary,
                        weather_arrays, write_episode_frames, weather_from_scenario, episode_weather_report)

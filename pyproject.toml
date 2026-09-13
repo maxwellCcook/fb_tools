@@ -33,6 +33,9 @@ dependencies = [
 where = ["."]
 include = ["fb_tools*"]
 
+[tool.setuptools.package-data]
+fb_tools = ["data/*.csv"]        # small lookups that ship with the package (fast-fires table)
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 # Run with the conda env active:  pytest
 # Tests that need model output or cached weather skip when the data is absent.

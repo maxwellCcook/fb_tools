@@ -74,7 +74,8 @@ what is logged there.
   `run_realization`, `build_runs`, `run_batch`), `spread/episodes.py` (`select_episodes`,
   `load_rtma_hourly`, `episode_hourly_frame`, `weather_arrays`, `episode_weather_report`; `select_episodes` takes a
   pool — climatology days at a severity (default), `dates=` from `dates_from_fod`, `dates_from_fast_fires` (FIRED
-  events ≥ 1,620 ha/day via `build_fast_fires_table` → `data/wildfire/fast_fires_fired_<release>.csv`) or a named event — and a
+  events ≥ 1,620 ha/day; the lookup `fb_tools/data/fast_fires_fired_v2025var.csv` ships with the package, rebuild it with
+  `build_fast_fires_table` on a new FIRED release) or a named event — and a
   `rank` — seeded random (default) or top-n by `erc_day1`/`erc_mean`),
   `spread/pyre_outputs.py` (`summarize_realization`, `paired_deltas`, `aggregate_realizations`,
   `firebrand_production`, `edge_contact`), `spread/transmission.py` (`structure_blocks`, `treatment_shadow`,

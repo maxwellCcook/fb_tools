@@ -1,8 +1,9 @@
 # ignore archive folders
 archive/
 
-# ignore data folder
+# ignore data folder (but keep the small lookups that ship inside the package)
 data/
+!fb_tools/data/
 
 # ignore FM library
 FM/

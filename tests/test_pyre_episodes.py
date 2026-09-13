@@ -270,3 +270,9 @@ def test_build_fast_fires_table_from_fired(tmp_path):
     t = ep.build_fast_fires_table(fp, tmp_path / "fast.csv")
     assert (t.mx_grw_ha >= ep.FAST_FIRE_GROWTH_HA).all() and {"fired_id", "mx_grw_dte", "lon", "lat"} <= set(t.columns)
     assert (tmp_path / "fast.csv").exists() and len(t) > 1000
+
+
+def test_bundled_fast_fires_table_is_present():
+    assert ep.FAST_FIRES_CSV.exists()
+    pool = ep.dates_from_fast_fires(bbox=(-109.1, 36.9, -102.0, 41.1), days_before=3)     # Colorado, from the bundled table
+    assert len(pool) > 20 and (pool.mx_grw_ha >= ep.FAST_FIRE_GROWTH_HA).all()

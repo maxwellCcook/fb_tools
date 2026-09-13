@@ -80,7 +80,11 @@ what is logged there.
   `spread/pyre_outputs.py` (`summarize_realization`, `paired_deltas`, `aggregate_realizations`,
   `firebrand_production`, `edge_contact`), `spread/transmission.py` (`structure_blocks`, `treatment_shadow`,
   `realization_transmission`, `summarize_blocks`, `shadow_probability` — the location product: share of the
-  fire reaching each cell that passed through a treatment, MFD-weighted, one triangular solve),
+  fire reaching each cell that passed through a treatment, MFD-weighted, one triangular solve; and the
+  near field: `changed_cells` (the treatment as the engine sees it), `distance_bands`, `near_field_zones`
+  (mask zones — `all_touched` polygons a few cells wide leak into their own collar), `lee_profile` /
+  `lee_profile_batch` / `summarize_lee_profile` / `near_field_headlines` — paired deltas by distance from
+  the treatment, split by the baseline run's shadow; recovery distance, carried delay, hauling-chart classes),
   `spread/convert.py` (`destack_lcp`), `fuelscape/lcp.py::clip_lcp` (SFA + buffer window, 100-cell
   multiples), `fuelscape/ignitions.py::sample_density_ignitions` (FSim-style sites ∝ FOD density, uniform
   `w_i`). A fire that never leaves its footprint is `stop_condition == "no_spread"`, not an error. **Example**: `code/notebooks/01f_PyreBuild.ipynb` on the

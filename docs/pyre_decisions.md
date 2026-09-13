@@ -354,3 +354,18 @@ pyrome 45 has 7 usable fast fires (12 total; largest day 10.9 kha), 46 has 12, 4
 Pass 2016, 3.5 kha/day), so the notebook's default area for this pool is the **pyrome**, consistent with the
 pyrome-mean T/RH/ERC frames. East Troublesome's biggest day (2020-11-01) is outside the RTMA season and is
 dropped with a count. ICS-209-PLUS can feed the same `dates=` interface later.
+
+**2026-09-13 (near field)** — Review of the Upper Arkansas pilot's impact metrics
+(`COSWAP/…/fire_behavior/docs/transmission_nearfield_review.md`):
+- The 500 m collar effect was **zone leakage**: impact zones were `all_touched` polygons, COSWAP atoms are
+  3–4 cells wide, so 50 % of treated cells sat in their own collar mask (6.6 % of collar cells;
+  6.6 % × −2,036 kW/m ≈ the −119 kW/m collar median). Zones are now boolean masks from
+  `changed_cells` + `distance_bands` (`near_field_zones`); `zone_masks` passes dicts through.
+- Zone `_arrival_h` is first arrival = the windward edge, so `d_trt_arrival_h` / `d_collar_arrival_h` ≈ 0
+  by construction. The timing effect lives in the lee: `lee_profile` reads paired deltas by distance band
+  × shadow class (baseline shadow ≥ 0.5). Pilot: intensity/crown effect recovers < 100 m; arrival delay
+  ~+1 h median (p90 3.5–5 h) carried flat to 8 km in the shadow, exactly 0 outside it.
+- Hauling-chart classes (350 / 1,700 / 3,500 kW/m) are reported per band and arm: the bridge to
+  suppression. Next: stepped runner (`SpreadState` continue, per-step `seed_for(seed, step)` in every arm,
+  pending-spot logging), then the paired 2 × 2 {background, coswap} × {none, suppression} with ELMFIRE's
+  area-growth containment (model 0) before direct attack. `fuel_spread_adjustment` vs crown spread is open.

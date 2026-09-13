@@ -39,7 +39,9 @@ from .episodes import (select_episodes, dates_from_fod, dates_from_fast_fires, b
 from .pyre_outputs import (read_realization, summarize_realization, summarize_runs, paired_deltas,
                            aggregate_realizations, firebrand_production, REALIZATION_LAYERS, edge_contact)
 from .transmission import (structure_blocks, zone_id_raster, treatment_shadow, realization_transmission,
-                           transmission_batch, summarize_blocks, shadow_probability)
+                           transmission_batch, summarize_blocks, shadow_probability,
+                           changed_cells, distance_bands, near_field_zones, lee_profile, lee_profile_batch,
+                           summarize_lee_profile, near_field_headlines, INTENSITY_EDGES_KW_M, INTENSITY_LABELS)
 
 __all__ = [
     "destack_lcp",

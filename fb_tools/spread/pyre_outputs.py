@@ -76,7 +76,14 @@ def firebrand_production(fireline_intensity, spread_rate, cell_area_m2, *, slope
 
 
 def zone_masks(zones, transform, shape, id_col="zone"):
-    """Rasterize zone polygons -> ``{zone_id: bool mask}`` (all_touched)."""
+    """
+    Rasterize zone polygons -> ``{zone_id: bool mask}`` (all_touched). A dict of
+    boolean masks is passed through — use masks for features a few cells wide,
+    where an all_touched polygon leaks into its own collar
+    (:func:`~fb_tools.spread.transmission.near_field_zones`).
+    """
+    if isinstance(zones, dict):
+        return {k: np.asarray(v, bool) for k, v in zones.items()}
     return {zid: rasterize_mask(sub.geometry, transform, shape) for zid, sub in zones.groupby(id_col)}
 
 
@@ -88,8 +95,9 @@ def summarize_realization(run_dir, *, zones=None, id_col="zone", day_marks=DAY_M
     Parameters
     ----------
     run_dir : Path
-    zones : GeoDataFrame, optional
-        Reporting polygons in the raster CRS (treatment units, SFAs, collars).
+    zones : GeoDataFrame or dict, optional
+        Reporting polygons in the raster CRS (treatment units, SFAs, collars),
+        or ``{zone_id: 2-D bool mask}`` on the run grid.
     id_col : str
     day_marks : tuple of int
         Days at which burned area is read off ``time_of_arrival``.

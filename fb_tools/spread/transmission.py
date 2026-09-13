@@ -317,3 +317,270 @@ def shadow_probability(run_dirs, out_dir, *, verbose=True):
     if verbose:
         print(f"[shadow_probability] {n} realizations -> {out_dir} ({', '.join(rasters)})")
     return paths
+
+
+# ── near field: zones and the lee profile ─────────────────────────────────────
+#
+# A paired delta can only be read on ground the two arms actually differ on and
+# on the cells around it. Polygons rasterized ``all_touched`` leak into their own
+# collar when the feature is a few cells wide (half of the Upper Arkansas COSWAP
+# cells fell inside their 500 m collar mask), so zones here are built from the
+# cells that differ between the arms and Euclidean distance from them.
+
+CHANGE_LAYERS = ("fuel_model", "canopy_cover", "canopy_height", "canopy_base_height", "canopy_bulk_density")
+DISTANCE_EDGES_M = (100, 250, 500, 1000, 2000, 4000, 8000)
+#: Fireline-intensity classes of the Andrews & Rothermel (1982) hauling chart, kW/m: below 350 hand
+#: crews can work the head; below 1,700 equipment; below 3,500 indirect attack only; above, no control.
+INTENSITY_EDGES_KW_M = (350.0, 1700.0, 3500.0)
+INTENSITY_LABELS = ("hand", "equipment", "indirect", "none")
+
+
+def _static(s, layers):
+    if isinstance(s, dict):
+        return s
+    import rasterio
+    out = {}
+    for k in layers:
+        with rasterio.open(Path(s) / f"{k}.tif") as src:
+            out[k] = src.read(1)
+    return out
+
+
+def changed_cells(static_a, static_b, layers=CHANGE_LAYERS):
+    """
+    Cells whose fuel or canopy differ between two arms — the treatment as the
+    engine sees it, and the only footprint a paired delta can be read on.
+
+    Parameters
+    ----------
+    static_a, static_b : dict or Path
+        ``{layer: 2-D array}`` (:func:`fb_tools.models.pyre.load_static_layers`)
+        or a ``destack_lcp`` output directory.
+    layers : tuple of str
+        Layers compared.
+
+    Returns
+    -------
+    2-D bool array
+    """
+    a, b = _static(static_a, layers), _static(static_b, layers)
+    out = np.zeros(np.shape(a[layers[0]]), bool)
+    for k in layers:
+        if np.shape(a[k]) != np.shape(b[k]):
+            raise ValueError(f"{k}: arms differ in shape {np.shape(a[k])} vs {np.shape(b[k])}")
+        out |= ~np.isclose(a[k], b[k], equal_nan=True)
+    return out
+
+
+def distance_bands(changed, res_m, edges=DISTANCE_EDGES_M):
+    """
+    Band every cell by Euclidean distance from the nearest changed cell.
+
+    Parameters
+    ----------
+    changed : 2-D bool array
+    res_m : float
+        Cell size.
+    edges : tuple of float
+        Increasing outer edges of the bands, metres.
+
+    Returns
+    -------
+    (2-D int16 array, list of str)
+        ``0`` inside the changed cells, ``k`` where ``edges[k-1] < d <= edges[k]``
+        (``edges[-1]`` taken as 0), ``-1`` beyond the last edge; and the band
+        labels (``"in", "0-100", "100-250", ...``).
+    """
+    from scipy.ndimage import distance_transform_edt
+    changed = np.asarray(changed, bool)
+    if not changed.any():
+        raise ValueError("distance_bands: no changed cells")
+    edges = tuple(float(e) for e in edges)
+    if any(b <= a for a, b in zip(edges, edges[1:])) or edges[0] <= 0:
+        raise ValueError(f"edges must be positive and increasing: {edges}")
+    d = distance_transform_edt(~changed) * float(res_m)
+    band = np.digitize(d, [0.0, *edges], right=True).astype(np.int16)
+    band[band == len(edges) + 1] = -1
+    labels = ["in"] + [f"{lo:g}-{hi:g}" for lo, hi in zip((0.0, *edges[:-1]), edges)]
+    return band, labels
+
+
+def near_field_zones(changed, res_m, *, collar_m=500.0):
+    """
+    ``{"trt": the changed cells, "collar": cells within collar_m of one, excluding them}``
+    — boolean zone masks for :func:`~fb_tools.spread.pyre_outputs.summarize_realization`.
+    """
+    band, _ = distance_bands(changed, res_m, edges=(collar_m,))
+    return {"trt": np.asarray(changed, bool), "collar": band == 1}
+
+
+def _read_shadow(run_dir):
+    import rasterio
+    with rasterio.open(Path(run_dir) / f"{SHADOW_LAYER}.tif") as src:
+        return src.read(1)
+
+
+def lee_profile(baseline_dir, treated_dir, *, bands, labels, shadow_dir=None, shadow_frac=0.5,
+                min_cells=20, intensity_edges=INTENSITY_EDGES_KW_M, intensity_labels=INTENSITY_LABELS):
+    """
+    Paired near-field deltas of one realization by distance from the treatment,
+    split by whether the fire reached the cell *through* the treatment.
+
+    Cells burned in both arms are compared cell by cell. The baseline run's
+    treatment shadow (``treatment_shadow.tif`` from
+    :func:`realization_transmission`) puts a cell in the **lee** when at least
+    ``shadow_frac`` of the fire reaching it had crossed the treatment; every
+    other burned cell is the control the lee is read against. Arrival-time
+    zone statistics read the *first* arrival, which is the windward edge and
+    is unaffected by construction; this profile is where the carried delay
+    and the recovery distance live.
+
+    Parameters
+    ----------
+    baseline_dir, treated_dir : Path
+        The two arms of one exactly paired realization.
+    bands, labels : from :func:`distance_bands`.
+    shadow_dir : Path, optional
+        Run holding ``treatment_shadow.tif``; default ``baseline_dir``.
+    shadow_frac : float
+    min_cells : int
+        Rows with fewer co-burned cells are dropped.
+    intensity_edges, intensity_labels : hauling-chart classes.
+
+    Returns
+    -------
+    DataFrame
+        One row per (``lee``, ``band``): ``n_both`` co-burned cells, ``n_either``,
+        ``frac_disagree`` (burned in one arm only), ``fi_bg`` mean baseline
+        intensity (kW/m), ``d_fi`` mean treated − baseline, ``crown_bg``,
+        ``d_crown`` (crown-fire share), ``d_toa_med`` / ``d_toa_p90`` (hours,
+        positive = later on the treated landscape), ``frac_delayed_30m``,
+        ``frac_delayed_1h``, ``frac_delayed_6h``, ``frac_earlier_1h``, and the
+        intensity-class shares ``cls_<label>_bg`` / ``cls_<label>_tr``.
+    """
+    layers = ("time_of_arrival", "fireline_intensity", "fire_type")
+    b, t = read_realization(baseline_dir, layers=layers), read_realization(treated_dir, layers=layers)
+    toa_b, toa_t = b["time_of_arrival"], t["time_of_arrival"]
+    if toa_b.shape != toa_t.shape or toa_b.shape != np.shape(bands):
+        raise ValueError("lee_profile: arms and bands must share one grid")
+    shadow = _read_shadow(shadow_dir or baseline_dir)
+    keys = {k: b["manifest"].get(k) for k in ("ignition_id", "episode_id", "condition_id")}
+    keys.update(baseline=b["manifest"].get("arm"), treated=t["manifest"].get("arm"))
+    burned_b, burned_t = np.isfinite(toa_b), np.isfinite(toa_t)
+    both, either = burned_b & burned_t, burned_b | burned_t
+    lee = shadow >= shadow_frac
+    fi_b, fi_t = b["fireline_intensity"], t["fireline_intensity"]
+    cr_b, cr_t = b["fire_type"] >= 2, t["fire_type"] >= 2
+    edges = list(intensity_edges)
+    rows = []
+    for in_lee, lmask in ((True, lee), (False, ~lee)):
+        for k, lab in enumerate(labels):
+            m = (bands == k) & lmask
+            mb = m & both
+            n = int(mb.sum())
+            if n < min_cells:
+                continue
+            d_h = (toa_t[mb] - toa_b[mb]) / 60.0
+            n_e = int((m & either).sum())
+            row = {**keys, "lee": in_lee, "band": lab, "n_both": n, "n_either": n_e,
+                   "frac_disagree": float(n_e - n) / n_e,
+                   "fi_bg": float(fi_b[mb].mean()), "d_fi": float((fi_t[mb] - fi_b[mb]).mean()),
+                   "crown_bg": float(cr_b[mb].mean()), "d_crown": float(cr_t[mb].mean() - cr_b[mb].mean()),
+                   "d_toa_med": float(np.median(d_h)), "d_toa_p90": float(np.quantile(d_h, 0.9)),
+                   "frac_delayed_30m": float((d_h > 0.5).mean()), "frac_delayed_1h": float((d_h > 1.0).mean()),
+                   "frac_delayed_6h": float((d_h > 6.0).mean()), "frac_earlier_1h": float((d_h < -1.0).mean())}
+            for arm, fi in (("bg", fi_b), ("tr", fi_t)):
+                share = np.bincount(np.digitize(fi[mb], edges), minlength=len(edges) + 1) / n
+                row.update({f"cls_{c}_{arm}": float(s) for c, s in zip(intensity_labels, share)})
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def lee_profile_batch(results, *, baseline, treated, bands, labels, **kwargs):
+    """
+    :func:`lee_profile` over every exactly paired realization in a ``run_batch``
+    result (rows with ``status == "ok"`` for both arms).
+
+    Returns
+    -------
+    DataFrame
+        Concatenated per-pair rows.
+    """
+    key = ["condition_id", "ignition_id", "episode_id"]
+    ok = results[results.status == "ok"]
+    b = ok[ok.arm == baseline].set_index(key)["out_dir"]
+    t = ok[ok.arm == treated].set_index(key)["out_dir"]
+    shared = b.index.intersection(t.index)
+    out = [lee_profile(b[k], t[k], bands=bands, labels=labels, **kwargs) for k in shared]
+    out = [o for o in out if len(o)]
+    return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
+
+
+def summarize_lee_profile(rows, labels, *, min_pairs=3):
+    """
+    Collapse per-pair profile rows into one table: per (``lee``, ``band``) the
+    number of pairs, the co-burned cells, the **median across pairs** of every
+    per-pair statistic, and the **cell-weighted** intensity-class shares.
+
+    Bands are ordered as in ``labels``; groups seen in fewer than ``min_pairs``
+    pairs are dropped.
+    """
+    if rows.empty:
+        return pd.DataFrame()
+    cls_cols = [c for c in rows.columns if c.startswith("cls_")]
+    med_cols = [c for c in ("frac_disagree", "fi_bg", "d_fi", "crown_bg", "d_crown", "d_toa_med", "d_toa_p90",
+                            "frac_delayed_30m", "frac_delayed_1h", "frac_delayed_6h", "frac_earlier_1h") if c in rows]
+    g = rows.groupby(["lee", "band"], sort=False)
+    out = pd.concat([g.size().rename("pairs"), g.n_both.sum().rename("n_cells"), g[med_cols].median(),
+                     g.apply(lambda d: pd.Series({c: float((d[c] * d.n_both).sum() / d.n_both.sum()) for c in cls_cols}),
+                             include_groups=False)], axis=1)
+    out = out[out.pairs >= min_pairs].reset_index()
+    out["band"] = pd.Categorical(out.band, categories=labels, ordered=True)
+    return out.sort_values(["lee", "band"], ascending=[False, True]).reset_index(drop=True)
+
+
+def near_field_headlines(summary, *, recovery_tol=0.10, carried_band="1000-2000"):
+    """
+    The two numbers the near field reduces to, plus the hauling-chart shift.
+
+    Parameters
+    ----------
+    summary : DataFrame
+        From :func:`summarize_lee_profile`.
+    recovery_tol : float
+        The intensity effect has *recovered* in the first lee band outside the
+        treatment where ``|d_fi| <= recovery_tol * fi_bg``.
+    carried_band : str
+        Band whose lee arrival delay is reported as the *carried delay*
+        (the farthest available lee band if absent).
+
+    Returns
+    -------
+    dict
+        ``recovery_band`` (label, or None if the effect never recovers within
+        the bands), ``carried_delay_h``, ``carried_delay_p90_h``,
+        ``carried_frac_delayed_1h``, ``carried_band``, ``in_d_fi``,
+        ``in_d_crown``, ``in_cls_hand_bg`` / ``in_cls_hand_tr`` (share of treated
+        cells hand crews could work), ``in_cls_uncontrollable_bg`` / ``_tr``
+        (indirect + none).
+    """
+    lee = summary[summary.lee].set_index("band")
+    out = {"recovery_band": None, "carried_band": None, "carried_delay_h": np.nan,
+           "carried_delay_p90_h": np.nan, "carried_frac_delayed_1h": np.nan}
+    for lab, r in lee.iterrows():
+        if lab != "in" and abs(r.d_fi) <= recovery_tol * abs(r.fi_bg):
+            out["recovery_band"] = str(lab)
+            break
+    outside = lee.drop(index="in", errors="ignore")
+    if len(outside):
+        lab = carried_band if carried_band in outside.index else outside.index[-1]
+        r = outside.loc[lab]
+        out.update(carried_band=str(lab), carried_delay_h=float(r.d_toa_med), carried_delay_p90_h=float(r.d_toa_p90),
+                   carried_frac_delayed_1h=float(r.frac_delayed_1h))
+    if "in" in lee.index:
+        r = lee.loc["in"]
+        out.update(in_d_fi=float(r.d_fi), in_d_crown=float(r.d_crown),
+                   in_cls_hand_bg=float(r.cls_hand_bg), in_cls_hand_tr=float(r.cls_hand_tr),
+                   in_cls_uncontrollable_bg=float(r.cls_indirect_bg + r.cls_none_bg),
+                   in_cls_uncontrollable_tr=float(r.cls_indirect_tr + r.cls_none_tr))
+    return out

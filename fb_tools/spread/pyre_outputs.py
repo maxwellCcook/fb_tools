@@ -104,7 +104,8 @@ def summarize_realization(run_dir, *, zones=None, id_col="zone", day_marks=DAY_M
     dict
         ``burned_ha, crown_frac, fl_p95_m, fi_p95_kw_m, max_toa_h, firebrands,
         area_d{D}_ha`` and, per zone, ``{zone}_arrival_h`` (NaN if never
-        reached), ``{zone}_frac_burned``, ``{zone}_fi_mean``, ``{zone}_firebrands``.
+        reached), ``{zone}_frac_burned``, ``{zone}_fi_mean``, ``{zone}_crown_frac``,
+        ``{zone}_firebrands``.
     """
     r = read_realization(run_dir)
     man, toa, ft = r["manifest"], r["time_of_arrival"], r["fire_type"]
@@ -132,6 +133,7 @@ def summarize_realization(run_dir, *, zones=None, id_col="zone", day_marks=DAY_M
             out[f"{zid}_arrival_h"] = round(float(np.nanmin(toa[m]) / 60.0), 1) if zb.any() else np.nan
             out[f"{zid}_frac_burned"] = round(float(zb.sum() / max(m.sum(), 1)), 4)
             out[f"{zid}_fi_mean"] = round(float(r["fireline_intensity"][zb].mean()), 0) if zb.any() else np.nan
+            out[f"{zid}_crown_frac"] = round(float((ft[zb] >= 2).mean()), 4) if zb.any() else np.nan
             out[f"{zid}_firebrands"] = float(fb[m].sum())
     return out
 
@@ -245,3 +247,30 @@ def aggregate_realizations(run_dirs, out_dir, *, day_marks=DAY_MARKS, firebrands
     if verbose:
         print(f"[aggregate_realizations] {n_runs} realizations -> {out_dir} ({', '.join(rasters)})")
     return paths
+
+
+def edge_contact(run_dirs, *, edge_cells=3):
+    """
+    When each realization first touched the domain edge — the domain-adequacy
+    diagnostic for spread runs (fires that reach the edge are truncated, not
+    stopped, so their size and everything downwind of the edge is biased).
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per run: ``out_dir, burned_ha, edge_day`` (NaN if the fire
+        never reached the outer ``edge_cells`` rows/columns).
+    """
+    import rasterio
+    rows = []
+    for rd in run_dirs:
+        rd = Path(rd)
+        with rasterio.open(rd / "time_of_arrival.tif") as src:
+            toa = src.read(1)
+            cell_ha = abs(src.transform.a) ** 2 / 1e4
+        e = edge_cells
+        border = np.concatenate([toa[:e].ravel(), toa[-e:].ravel(), toa[:, :e].ravel(), toa[:, -e:].ravel()])
+        border = border[np.isfinite(border)]
+        rows.append({"out_dir": str(rd), "burned_ha": float(np.isfinite(toa).sum() * cell_ha),
+                     "edge_day": float(border.min() / 1440.0) if border.size else np.nan})
+    return pd.DataFrame(rows)

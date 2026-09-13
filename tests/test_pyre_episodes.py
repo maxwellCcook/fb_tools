@@ -227,3 +227,46 @@ def test_load_rtma_hourly_accepts_yearly_and_monthly_files(tmp_path):
         ep.load_rtma_hourly(emc, 9, [2017])
     with pytest.raises(FileNotFoundError):
         ep.load_rtma_hourly(emc, 9, [2018], wind_dir=tmp_path)
+
+
+def test_rank_top_by_erc_and_explicit_dates(erc_cache):
+    cache, erc = erc_cache
+    top = ep.select_episodes(9, cache, severity="p90", n=3, duration_days=7, rank="erc_day1", seed=0)
+    rnd = ep.select_episodes(9, cache, severity="p90", n=3, duration_days=7, rank="random", seed=0)
+    assert top.erc_day1.min() >= rnd.erc_day1.max() - 1e-9 or top.erc_day1.sum() >= rnd.erc_day1.sum()
+    assert top.erc_day1.iloc[0] <= np.nanmax(erc) and (top.erc_pct >= 90).all()
+    # explicit dates: a named event is kept without a severity filter, and its ERC percentile is reported
+    named = ep.select_episodes(9, cache, severity=None, n=None, duration_days=7, dates=["2015-07-20", "2015-07-22", "2030-01-01"])
+    assert len(named) == 1 and named.source.iloc[0] == "dates" and 0 <= named.erc_pct.iloc[0] <= 100   # overlap + out-of-range dropped
+    assert named.start_date.iloc[0] == pd.Timestamp("2015-07-20")
+    with pytest.raises(ValueError, match="rank must be"):
+        ep.select_episodes(9, cache, rank="hottest")
+
+
+def test_dates_from_fod_groups_by_day():
+    import geopandas as gpd
+    f = gpd.GeoDataFrame({"DISCOVERY_DATE": ["07/06/2005", "07/06/2005", "06/22/2005", "05/01/2006"],
+                          "FIRE_SIZE_CLASS": ["G", "D", "E", "C"], "FIRE_SIZE": [11357.0, 150.0, 1182.0, 20.0],
+                          "FIRE_NAME": ["MASON", "SMALL", "RIO", "TINY"]}, geometry=gpd.points_from_xy([0, 0, 0, 0], [0, 0, 0, 0]))
+    pool = ep.dates_from_fod(f, min_class="D")
+    assert len(pool) == 2 and pool.fire_name.tolist() == ["RIO", "MASON"] and pool.n_fires.tolist() == [1, 2]
+
+
+def test_dates_from_fast_fires_windows_and_area():
+    tab = pd.DataFrame({"fired_id": [1, 2, 3], "mx_grw_dte": ["2020-09-08", "2018-06-28", "2016-07-10"],
+                        "mx_grw_ha": [15283.7, 13265.9, 1000.0], "tot_ar_ha": [48040.6, 41622.3, 6783.2],
+                        "lon": [-105.69, -105.15, -106.1], "lat": [40.65, 37.55, 38.6]})
+    pool = ep.dates_from_fast_fires(tab, bbox=(-106.0, 40.0, -105.0, 41.0), days_before=3)
+    assert len(pool) == 1 and pool.date.iloc[0] == pd.Timestamp("2020-09-05")     # 3 d before the biggest day
+    assert len(ep.dates_from_fast_fires(tab, days_before=0)) == 2                    # the 1,000 ha/day event is below the threshold
+    assert len(ep.dates_from_fast_fires(tab, min_growth_ha=500, days_before=0)) == 3
+
+
+def test_build_fast_fires_table_from_fired(tmp_path):
+    import pytest as _pt
+    fp = ep.Path("/Users/mcc/Library/CloudStorage/Box-Box/MCC/data/wildfire/FIRED/raw/fired_v2025var_usa_lower48_2000-2026_s05_t11_events.gpkg")
+    if not fp.exists():
+        _pt.skip("FIRED events file not on this machine")
+    t = ep.build_fast_fires_table(fp, tmp_path / "fast.csv")
+    assert (t.mx_grw_ha >= ep.FAST_FIRE_GROWTH_HA).all() and {"fired_id", "mx_grw_dte", "lon", "lat"} <= set(t.columns)
+    assert (tmp_path / "fast.csv").exists() and len(t) > 1000

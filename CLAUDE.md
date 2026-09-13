@@ -72,10 +72,17 @@ what is logged there.
   is never downgraded. `import fb_tools` works in both; engine imports are deferred.
 - **Modules**: `models/pyre.py` (version/gate, `build_cubes`, `ignition_matrix`, `seed_for`,
   `run_realization`, `build_runs`, `run_batch`), `spread/episodes.py` (`select_episodes`,
-  `load_rtma_hourly`, `episode_hourly_frame`, `weather_arrays`), `spread/pyre_outputs.py`
-  (`summarize_realization`, `paired_deltas`, `aggregate_realizations`, `firebrand_production`),
-  `spread/convert.py` (`destack_lcp`), `fuelscape/ignitions.py::sample_density_ignitions` (FSim-style
-  sites ∝ FOD density, uniform `w_i`). **Example**: `code/notebooks/01f_PyreBuild.ipynb` on the
+  `load_rtma_hourly`, `episode_hourly_frame`, `weather_arrays`, `episode_weather_report`; `select_episodes` takes a
+  pool — climatology days at a severity (default), `dates=` from `dates_from_fod`, `dates_from_fast_fires` (FIRED
+  events ≥ 1,620 ha/day via `build_fast_fires_table` → `data/wildfire/fast_fires_fired_<release>.csv`) or a named event — and a
+  `rank` — seeded random (default) or top-n by `erc_day1`/`erc_mean`),
+  `spread/pyre_outputs.py` (`summarize_realization`, `paired_deltas`, `aggregate_realizations`,
+  `firebrand_production`, `edge_contact`), `spread/transmission.py` (`structure_blocks`, `treatment_shadow`,
+  `realization_transmission`, `summarize_blocks`, `shadow_probability` — the location product: share of the
+  fire reaching each cell that passed through a treatment, MFD-weighted, one triangular solve),
+  `spread/convert.py` (`destack_lcp`), `fuelscape/lcp.py::clip_lcp` (SFA + buffer window, 100-cell
+  multiples), `fuelscape/ignitions.py::sample_density_ignitions` (FSim-style sites ∝ FOD density, uniform
+  `w_i`). A fire that never leaves its footprint is `stop_condition == "no_spread"`, not an error. **Example**: `code/notebooks/01f_PyreBuild.ipynb` on the
   `front_range` test AOI (LFPS download in `data/spatial/mod/fuelscapes/front_range/`, 3000×1000 @ 30 m,
   pyrome 46): destack → potential map → 3 episodes + HRRR cubes → 30 IDG sites (FOD class ≥ C, 10 km
   kernel; cells drawn ∝ density, never the FOD points) → one burn → 90-run
@@ -107,8 +114,8 @@ what is logged there.
   `pyre_outputs.REALIZATION_LAYERS` / `rasterize_mask`. Do not re-derive these inline.
 - **Diagnostics** (`code/dev/pyre/`): `g0`–`g1c` crown/units checks, `b1`–`b3` benchmark and
   spotting variance, `build_patched_engine.py`, `pyre_source.py` (pure-Python engine for cfunc access).
-- **Tests**: `test_pyre_destack.py`, `test_pyre_episodes.py` (engine-free, run in `fb_tools`);
-  `test_pyre_engine.py`, `test_pyre_runner.py` (need `fb_pyre`).
+- **Tests**: `test_pyre_destack.py`, `test_pyre_episodes.py`, `test_pyre_transmission.py` (engine-free, run in
+  `fb_tools`); `test_pyre_engine.py`, `test_pyre_runner.py` (need `fb_pyre`).
 
 ## Model CLI invocation
 - **FlamMap**: command file approach via `run_cli()`

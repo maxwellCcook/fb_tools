@@ -699,3 +699,63 @@ def create_ignition_ascii(ign_gdf, ref_img_fp, out_ascii_fp):
 
     del ref_img
     print(f"Saved ignition grid → {out_ascii_fp}")
+
+
+def clip_lcp(lcp_fp, geom, out_fp, *, buffer_m=0.0, align_cells=100, overwrite=False):
+    """
+    Window-clip a large LCP to a geometry plus a spread buffer.
+
+    The window is padded so its row and column counts are multiples of
+    ``align_cells`` (pyretechnics repeats coarse wind blocks by integer
+    factors, so a 100-cell multiple at 30 m gives 3 km square blocks). Band
+    descriptions, dtype and nodata are preserved.
+
+    Parameters
+    ----------
+    lcp_fp : str or Path
+        Multi-band LCP (any size; only the window is read).
+    geom : shapely geometry, GeoSeries or GeoDataFrame
+        Analysis unit, in any CRS (reprojected to the raster CRS).
+    out_fp : str or Path
+    buffer_m : float
+        Spread buffer around ``geom``. Fires are truncated at the window
+        edge, so this has to exceed the run of a design fire.
+    align_cells : int
+        Pad the window so ``rows % align_cells == cols % align_cells == 0``.
+    overwrite : bool
+
+    Returns
+    -------
+    Path
+    """
+    import math
+    import geopandas as gpd
+    import rasterio
+    from rasterio.windows import Window, from_bounds
+
+    out_fp = Path(out_fp)
+    if out_fp.exists() and not overwrite:
+        return out_fp
+    with rasterio.open(lcp_fp) as src:
+        if isinstance(geom, (gpd.GeoSeries, gpd.GeoDataFrame)):
+            geom = geom.to_crs(src.crs).union_all()
+        win = from_bounds(*geom.buffer(buffer_m).bounds, src.transform).round_offsets().round_lengths()
+        h = math.ceil(win.height / align_cells) * align_cells
+        w = math.ceil(win.width / align_cells) * align_cells
+        r0 = int(win.row_off - (h - win.height) // 2)
+        c0 = int(win.col_off - (w - win.width) // 2)
+        if r0 < 0 or c0 < 0 or r0 + h > src.height or c0 + w > src.width:
+            raise ValueError(f"buffered window {h}x{w} at ({r0},{c0}) leaves the {src.height}x{src.width} LCP")
+        win = Window(c0, r0, w, h)
+        data = src.read(window=win)
+        profile = {**src.profile, "height": h, "width": w, "transform": src.window_transform(win),
+                   "compress": "deflate", "tiled": True, "blockxsize": 512, "blockysize": 512}
+        descriptions, tags = src.descriptions, src.tags()
+    out_fp.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(out_fp, "w", **profile) as dst:
+        dst.write(data)
+        dst.descriptions = descriptions
+        dst.update_tags(**tags, clip_buffer_m=buffer_m, clip_source=str(lcp_fp))
+    print(f"  [clip_lcp] {h}x{w} @ {abs(profile['transform'].a):.0f} m "
+          f"({h * w / 1e6:.1f} M cells, buffer {buffer_m / 1e3:.0f} km) -> {out_fp}")
+    return out_fp

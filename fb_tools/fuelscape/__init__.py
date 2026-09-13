@@ -1,6 +1,7 @@
 from .lfps import lfps_request, lfps_mosaic
 from .lcp import (
     stack_rasters,
+    clip_lcp,
     create_ignition_ascii,
     create_container_ignition,
     create_random_ignitions,

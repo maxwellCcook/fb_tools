@@ -364,8 +364,9 @@ def run_realization(layers_dir, weather, ignition, out_dir, *, seed, duration_h,
     m = out["spread_state"].get_full_matrices()
     burned = np.asarray(m["fire_type"]) > 0
     n_burned = int(burned.sum())
-    if n_burned <= int((win < 0).sum()):
-        raise RuntimeError(f"Realization did not spread beyond the ignition ({n_burned} cells)")
+    # A fire that never leaves its footprint is an outcome (an ignition in a non-spreading
+    # fuel), not a failure: it is written like any other run and flagged in the manifest.
+    stop_condition = "no_spread" if n_burned <= int((win < 0).sum()) else out["stop_condition"]
 
     _write_layers(out_dir, {k: np.asarray(m[k]) for k in OUTPUT_LAYERS}, burned, transform, crs)
 
@@ -380,7 +381,7 @@ def run_realization(layers_dir, weather, ignition, out_dir, *, seed, duration_h,
         "ignition_window": [r0, c0, *win.shape], "n_ignition_cells": int((win < 0).sum()),
         "wind_cube_shape": list(np.shape(weather["wind_speed_10m"])),
         "n_burned": n_burned, "burned_ha": round(n_burned * res * res / 1e4, 2),
-        "stop_condition": out["stop_condition"], "stop_time_min": float(out["stop_time"]),
+        "stop_condition": stop_condition, "stop_time_min": float(out["stop_time"]),
         "pending_spot_cells": int(sum(len(v) for v in pending.values())),
         "wall_s": round(wall_s, 1),
         **pyre_version_info(),

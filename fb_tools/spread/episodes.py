@@ -50,82 +50,232 @@ def _longest_gap_h(rtma_df, start_date, n_days):
 
 
 def select_episodes(pyrome_id, erc_cache_dir, *, severity="p97", n=5, duration_days=21,
-                    years=None, rtma_df=None, max_gap_h=3, seed=0):
+                    years=None, rtma_df=None, max_gap_h=3, seed=0, dates=None, rank="random"):
     """
-    Choose ``n`` non-overlapping historical windows whose day-1 ERC meets a
-    severity percentile of the pyrome's GridMET climatology.
+    Choose historical windows to burn under.
+
+    The **pool** is either every season day of the pyrome's GridMET ERC
+    climatology that meets ``severity`` (default), or explicit ``dates`` —
+    the discovery dates of large fires (:func:`dates_from_fod`), or a named
+    event such as an ignition date. The **rank** is how ``n`` windows are
+    picked from the pool: a seeded random draw, or the top ``n`` by day-1 or
+    window-mean ERC. Windows never overlap.
 
     Parameters
     ----------
     pyrome_id : int or str
     erc_cache_dir : Path
         Directory of ``pyrome_<id>_gridmet.json`` (``data/weather/pyrome_erc``).
-    severity : str or float
-        ``"p97"`` style label or a percentile in (0, 100). Threshold is taken
-        over every (year, season-day) ERC value in the climatology.
-    n, duration_days : int
+    severity : str, float or None
+        ``"p97"`` style label or a percentile in (0, 100): day-1 ERC must reach
+        this percentile of every (year, season-day) value in the climatology.
+        ``None`` applies no ERC filter (a named event is kept whatever its ERC).
+    n : int or None
+        Windows to return; ``None`` keeps every non-overlapping pool window.
+    duration_days : int
     years : iterable of int, optional
-        Restrict start years.
+        Restrict the climatology pool to these start years (ignored for ``dates``).
     rtma_df : pandas.DataFrame, optional
-        Hourly record from :func:`load_rtma_hourly`. When given, windows with a
-        run of more than ``max_gap_h`` missing hours are not candidates, so an
-        episode can never fail later in :func:`episode_hourly_frame`.
+        Hourly record from :func:`load_rtma_hourly`. Windows with a run of more
+        than ``max_gap_h`` missing hours are dropped (also windows that run past
+        the record, e.g. past October 31).
     max_gap_h : int
     seed : int
+        For ``rank="random"``.
+    dates : iterable of date-like, optional
+        Explicit start dates. Dates outside the climatology's years or the
+        April–October season are dropped and counted.
+    rank : {"random", "erc_day1", "erc_mean"}
+        Random draw, or highest day-1 / window-mean ERC first.
 
     Returns
     -------
     pandas.DataFrame
         One row per episode: ``episode_id, year, season_day, start_date,
-        end_date, erc_day1, erc_mean, erc_threshold``. Sorted by start date.
+        end_date, erc_day1, erc_mean, erc_pct, erc_threshold, source``
+        (``source`` is ``climatology`` or ``dates``). Sorted by start date.
     """
     meta = load_gridmet_pyrome_cache(pyrome_id, erc_cache_dir, return_meta=True)
     erc = np.asarray(meta["HistoricERCValues"], dtype=float)
     yrs = np.asarray(meta["years"], dtype=int)
-    pct = float(str(severity).lstrip("pP"))
-    threshold = float(np.nanpercentile(erc, pct))
-
-    keep = np.ones(len(yrs), dtype=bool) if years is None else np.isin(yrs, list(years))
+    threshold = None if severity is None else float(np.nanpercentile(erc, float(str(severity).lstrip("pP"))))
+    finite = erc[np.isfinite(erc)]
     last_start = SEASON_DAYS - duration_days + 1
-    cands = [(y, d) for yi, y in enumerate(yrs) if keep[yi]
-             for d in range(1, last_start + 1) if erc[yi, d - 1] >= threshold]
+    dropped = {}
+
+    if dates is None:
+        keep = np.ones(len(yrs), dtype=bool) if years is None else np.isin(yrs, list(years))
+        cands = [(y, d) for yi, y in enumerate(yrs) if keep[yi]
+                 for d in range(1, last_start + 1) if threshold is None or erc[yi, d - 1] >= threshold]
+        source = "climatology"
+    else:
+        cands = []
+        for ts in pd.to_datetime(pd.Series(list(dates))).dropna().dt.normalize().drop_duplicates().sort_values():
+            y, d = ts.year, (ts - pd.Timestamp(year=ts.year, month=4, day=1)).days + 1
+            if y not in yrs or not 1 <= d <= SEASON_DAYS:
+                dropped["outside the ERC climatology"] = dropped.get("outside the ERC climatology", 0) + 1
+            elif threshold is not None and erc[int(np.where(yrs == y)[0][0]), d - 1] < threshold:
+                dropped[f"below {severity}"] = dropped.get(f"below {severity}", 0) + 1
+            else:
+                cands.append((y, d))
+        source = "dates"
+    n_pool = len(cands)
     if rtma_df is not None:
-        n_erc = len(cands)
         cands = [(y, d) for y, d in cands
                  if _longest_gap_h(rtma_df, season_day_to_date(y, d), duration_days + 1) <= max_gap_h]
-        print(f"[select_episodes] {n_erc} windows meet {severity}; "
-              f"{len(cands)} also have RTMA coverage (gaps <= {max_gap_h} h)")
+        if n_pool - len(cands):
+            dropped["RTMA gap or record end"] = n_pool - len(cands)
+    print(f"[select_episodes] pool: {n_pool} {source} window(s)" + (f" at {severity}" if threshold is not None else "")
+          + (f"; dropped {dropped}" if dropped else "") + f"; rank = {rank}")
     if not cands:
-        raise ValueError(f"No season day reaches ERC {threshold:.1f} ({severity}) "
-                         f"in years {sorted(yrs[keep])}")
+        raise ValueError(f"No candidate {duration_days}-day window (severity {severity}, years {years}, dates {dates is not None})")
 
-    rng = np.random.default_rng(seed)
-    order = rng.permutation(len(cands))
+    def _stats(y, d):
+        yi = int(np.where(yrs == y)[0][0])
+        win = erc[yi, d - 1:d - 1 + duration_days]
+        return float(erc[yi, d - 1]), float(np.nanmean(win))
+
+    if rank == "random":
+        order = np.random.default_rng(seed).permutation(len(cands))
+    elif rank in ("erc_day1", "erc_mean"):
+        key = [_stats(y, d)[0 if rank == "erc_day1" else 1] for y, d in cands]
+        order = np.argsort(-np.asarray(key), kind="stable")
+    else:
+        raise ValueError(f"rank must be 'random', 'erc_day1' or 'erc_mean', not {rank!r}")
     chosen = []
     for k in order:
         y, d = cands[k]
         if all(y != cy or abs(d - cd) >= duration_days for cy, cd in chosen):
             chosen.append((y, d))
-        if len(chosen) == n:
+        if n is not None and len(chosen) == n:
             break
-    if len(chosen) < n:
+    if n is not None and len(chosen) < n:
         raise ValueError(f"Only {len(chosen)} non-overlapping {duration_days}-day "
-                         f"episodes available at {severity}; asked for {n}")
+                         f"episodes available (severity {severity}); asked for {n}")
 
     rows = []
     for y, d in sorted(chosen):
-        yi = int(np.where(yrs == y)[0][0])
+        day1, mean = _stats(y, d)
         start = pd.Timestamp(season_day_to_date(y, d))
-        rows.append({
-            "year": y, "season_day": d,
-            "start_date": start, "end_date": start + pd.Timedelta(days=duration_days - 1),
-            "erc_day1": round(float(erc[yi, d - 1]), 1),
-            "erc_mean": round(float(erc[yi, d - 1:d - 1 + duration_days].mean()), 1),
-            "erc_threshold": round(threshold, 1),
-        })
+        rows.append({"year": y, "season_day": d,
+                     "start_date": start, "end_date": start + pd.Timedelta(days=duration_days - 1),
+                     "erc_day1": round(day1, 1), "erc_mean": round(mean, 1),
+                     "erc_pct": round(float((finite <= day1).mean() * 100), 1),
+                     "erc_threshold": None if threshold is None else round(threshold, 1),
+                     "source": source})
     df = pd.DataFrame(rows)
     df.insert(0, "episode_id", [f"ep_{i:03d}" for i in range(len(df))])
     return df
+
+
+FAST_FIRE_GROWTH_HA = 1620.0     # Balch et al. (2025, Science): a "fast fire" grows >= 1,620 ha in one day
+
+
+def build_fast_fires_table(fired_events_fp, out_csv, *, min_growth_ha=FAST_FIRE_GROWTH_HA):
+    """
+    Lookup table of FIRED events whose maximum single-day growth reaches the
+    fast-fire threshold. Rebuild it when a new FIRED release lands.
+
+    Parameters
+    ----------
+    fired_events_fp : Path
+        FIRED *events* GeoPackage (``mx_grw_km2``, ``mx_grw_dte``, ``ig_date``, ...).
+    out_csv : Path
+    min_growth_ha : float
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per event: ``fired_id, ig_date, last_date, mx_grw_dte, mx_grw_ha,
+        tot_ar_ha, event_dur, lc_name, lon, lat`` (event ignition centroid, WGS84).
+    """
+    import pyogrio
+    cols = ["id", "ig_date", "last_date", "mx_grw_dte", "mx_grw_km2", "tot_ar_km2", "event_dur", "lc_name"]
+    g = pyogrio.read_dataframe(fired_events_fp, where=f"mx_grw_km2 >= {min_growth_ha / 100.0}", columns=cols)
+    c = g.geometry.centroid.to_crs(4326)
+    out = pd.DataFrame({"fired_id": g["id"].values, "ig_date": pd.to_datetime(g["ig_date"]).dt.date,
+                        "last_date": pd.to_datetime(g["last_date"]).dt.date,
+                        "mx_grw_dte": pd.to_datetime(g["mx_grw_dte"]).dt.date,
+                        "mx_grw_ha": (g["mx_grw_km2"] * 100).round(1).values,
+                        "tot_ar_ha": (g["tot_ar_km2"] * 100).round(1).values,
+                        "event_dur": g["event_dur"].values, "lc_name": g["lc_name"].values,
+                        "lon": c.x.round(4).values, "lat": c.y.round(4).values}).sort_values("mx_grw_dte")
+    out_csv = Path(out_csv)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(out_csv, index=False)
+    print(f"  [build_fast_fires_table] {len(out)} events with max daily growth >= {min_growth_ha:,.0f} ha "
+          f"from {Path(fired_events_fp).name} -> {out_csv}")
+    return out
+
+
+def dates_from_fast_fires(table, *, geom=None, bbox=None, days_before=3, min_growth_ha=FAST_FIRE_GROWTH_HA):
+    """
+    Episode start dates that put a fast fire's biggest day inside the window.
+
+    Parameters
+    ----------
+    table : DataFrame or Path
+        From :func:`build_fast_fires_table` (or its CSV).
+    geom : shapely geometry, GeoSeries or GeoDataFrame, optional
+        Keep events whose ignition centroid falls inside (any CRS).
+    bbox : tuple, optional
+        ``(lon_min, lat_min, lon_max, lat_max)`` alternative to ``geom``.
+    days_before : int
+        The window starts this many days before the maximum-growth day, so
+        with ``duration_days = days_before + 1 + days_after`` in
+        :func:`select_episodes` the run-up, the blow-up day and its aftermath
+        are all simulated.
+    min_growth_ha : float
+        Re-threshold the table (it is built at the fast-fire threshold).
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per event: ``date`` (window start), ``fired_id, mx_grw_dte,
+        mx_grw_ha, tot_ar_ha``. Pass ``dates=pool.date``.
+    """
+    import geopandas as gpd
+    t = pd.read_csv(table) if not isinstance(table, pd.DataFrame) else table.copy()
+    t = t[t.mx_grw_ha >= min_growth_ha]
+    pts = gpd.GeoSeries(gpd.points_from_xy(t.lon, t.lat), index=t.index, crs=4326)
+    if bbox is not None:
+        t = t.loc[pts.cx[bbox[0]:bbox[2], bbox[1]:bbox[3]].index]
+    elif geom is not None:
+        if isinstance(geom, (gpd.GeoSeries, gpd.GeoDataFrame)):
+            geom = geom.to_crs(4326).union_all()
+        t = t[pts.within(geom).values]
+    t = t.assign(mx_grw_dte=pd.to_datetime(t.mx_grw_dte))
+    t["date"] = t.mx_grw_dte - pd.Timedelta(days=days_before)
+    print(f"  [dates_from_fast_fires] {len(t)} fast fire(s) (>= {min_growth_ha:,.0f} ha in a day) in the area; "
+          f"windows start {days_before} d before the biggest day")
+    return t[["date", "fired_id", "mx_grw_dte", "mx_grw_ha", "tot_ar_ha"]].sort_values("date").reset_index(drop=True)
+
+
+def dates_from_fod(fod_gdf, *, min_class="D"):
+    """
+    Discovery dates of large fires, as an episode pool for :func:`select_episodes`.
+
+    Parameters
+    ----------
+    fod_gdf : GeoDataFrame
+        FPA-FOD records (``DISCOVERY_DATE``, ``FIRE_SIZE_CLASS``, ``FIRE_SIZE``,
+        ``FIRE_NAME``), already restricted to the area of interest.
+    min_class : str
+        Smallest size class kept (``"D"`` = 100 ac+).
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per date: ``date, n_fires, largest_ac, fire_name`` (the largest fire
+        that day). Pass ``dates=pool.date``.
+    """
+    f = fod_gdf[fod_gdf["FIRE_SIZE_CLASS"] >= min_class].copy()
+    f["date"] = pd.to_datetime(f["DISCOVERY_DATE"]).dt.normalize()
+    f = f.sort_values("FIRE_SIZE", ascending=False)
+    g = f.groupby("date").agg(n_fires=("FIRE_SIZE", "size"), largest_ac=("FIRE_SIZE", "max"),
+                             fire_name=("FIRE_NAME", "first")).reset_index().sort_values("date")
+    print(f"  [dates_from_fod] {len(f)} fires of class >= {min_class} on {len(g)} distinct dates")
+    return g.reset_index(drop=True)
 
 
 def _year_files(directory, prefix, years):
@@ -201,7 +351,7 @@ def episode_hourly_frame(episode, rtma_df, *, ignition_hour_local=12, utc_offset
     Returns
     -------
     pandas.DataFrame
-        ``duration_days * 24`` rows: ``hour, datetime_utc, tmp_c, ws_kmh,
+        ``duration_days * 24`` rows: ``hour, datetime_utc, tmp_c, rh_pct, ws_kmh,
         wd_from_deg, fm1, fm10, fm100, fm_herb, fm_woody`` (moistures as
         fractions). The frame's wind is the pyrome-mean RTMA wind; an HRRR cube
         replaces it at run time (:func:`weather_arrays`).
@@ -215,14 +365,17 @@ def episode_hourly_frame(episode, rtma_df, *, ignition_hour_local=12, utc_offset
     missing = [c for c in ("u_ms", "v_ms", "ws_ms") if c not in src]
     if missing:
         raise ValueError(f"rtma_df lacks {missing}; load it with load_rtma_hourly(..., wind_dir=)")
-    src = src[["tmp_f", "FM1", "FM10", "FM100", "u_ms", "v_ms", "ws_ms"]].astype(float)
-    gap = longest_true_run(src.isna().any(axis=1).to_numpy())
+    if "rh_pct" not in src:
+        src["rh_pct"] = np.nan                       # older caches; RH is report-only, never an engine input
+    src = src[["tmp_f", "rh_pct", "FM1", "FM10", "FM100", "u_ms", "v_ms", "ws_ms"]].astype(float)
+    gap = longest_true_run(src.drop(columns="rh_pct").isna().any(axis=1).to_numpy())
     if gap > max_gap_h:
         raise ValueError(f"RTMA gap of {gap} h in episode starting {idx[0]} (max_gap_h={max_gap_h})")
     src = src.interpolate(limit_direction="both")
 
     out = pd.DataFrame({"hour": np.arange(len(idx)), "datetime_utc": idx})
     out["tmp_c"] = (src["tmp_f"].values - 32.0) / 1.8
+    out["rh_pct"] = src["rh_pct"].values
     out["ws_kmh"], out["wd_from_deg"] = uv_to_speed_dir(src["u_ms"].values, src["v_ms"].values, "km/h")
     out["fm1"] = src["FM1"].values / 100.0
     out["fm10"] = src["FM10"].values / 100.0
@@ -397,3 +550,56 @@ def write_episode_frames(episodes, rtma_df, out_dir, **kwargs):
         episode_hourly_frame(ep, rtma_df, **kwargs).to_csv(fp, index=False)
         paths[ep["episode_id"]] = fp
     return paths
+
+
+def episode_weather_report(episodes, frames, wind_cubes=None, *, fire_hours_utc=(19, 20, 21, 22)):
+    """
+    One row per episode describing the fire weather it carries, for a report.
+
+    Parameters
+    ----------
+    episodes : DataFrame
+        From :func:`select_episodes`.
+    frames : dict
+        ``{episode_id: csv path or DataFrame}`` hourly frames.
+    wind_cubes : dict, optional
+        ``{episode_id: npz path}``; adds the local HRRR wind (fire-hour domain
+        mean and windiest-cell percentiles) beside the pyrome-mean RTMA wind.
+    fire_hours_utc : tuple of int
+        Afternoon hours the wind statistics are taken over (13–16 MDT).
+
+    Returns
+    -------
+    DataFrame
+        ``episode_id, start_date, end_date, erc_day1, erc_mean, tmp_max_c,
+        rh_min_pct, fm1_min_pct, ws_rtma_p50/p97_kmh, ws_hrrr_mean_p50/p97_kmh,
+        ws_hrrr_max_p97_kmh, ws_hrrr_max_kmh, wd_dominant_deg``.
+    """
+    rows = []
+    for _, ep in episodes.iterrows():
+        eid = ep["episode_id"]
+        f = frames[eid]
+        f = pd.read_csv(f, parse_dates=["datetime_utc"]) if not isinstance(f, pd.DataFrame) else f
+        fh = f[pd.to_datetime(f.datetime_utc).dt.hour.isin(fire_hours_utc)]
+        row = {"episode_id": eid, "start_date": pd.Timestamp(ep["start_date"]).date(),
+               "end_date": pd.Timestamp(ep["end_date"]).date(),
+               "erc_day1": ep["erc_day1"], "erc_mean": ep["erc_mean"],
+               "erc_pct": ep.get("erc_pct"), "source": ep.get("source"),
+               "tmp_max_c": round(float(f.tmp_c.max()), 1),
+               "rh_min_pct": round(float(f.rh_pct.min()), 1) if "rh_pct" in f else np.nan,
+               "fm1_min_pct": round(float(f.fm1.min() * 100), 1),
+               "ws_rtma_p50_kmh": round(float(fh.ws_kmh.quantile(0.5)), 1),
+               "ws_rtma_p97_kmh": round(float(fh.ws_kmh.quantile(0.97)), 1)}
+        if wind_cubes and eid in wind_cubes:
+            c = load_wind_cube(wind_cubes[eid])
+            s = wind_cube_summary(c)
+            s = s[pd.to_datetime(f.datetime_utc).dt.hour.reindex(s.hour).isin(fire_hours_utc).values]
+            u = -(c["wind_speed_10m"] * np.sin(np.radians(c["upwind_direction"]))).mean()
+            v = -(c["wind_speed_10m"] * np.cos(np.radians(c["upwind_direction"]))).mean()
+            row.update({"ws_hrrr_mean_p50_kmh": round(float(s.ws_mean.quantile(0.5)), 1),
+                        "ws_hrrr_mean_p97_kmh": round(float(s.ws_mean.quantile(0.97)), 1),
+                        "ws_hrrr_max_p97_kmh": round(float(s.ws_max.quantile(0.97)), 1),
+                        "ws_hrrr_max_kmh": round(float(s.ws_max.max()), 1),
+                        "wd_dominant_deg": round(float(uv_to_speed_dir(np.array([u]), np.array([v]))[1][0]))})
+        rows.append(row)
+    return pd.DataFrame(rows)

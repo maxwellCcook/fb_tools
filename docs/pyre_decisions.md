@@ -269,3 +269,88 @@ Duration is re-decided by `check_domain_adequacy` on the new domain, not fixed a
   once a spatial FM/temperature surface exists.
 - Passive crown at p75/p90 — does it appear where the Cruz rate no longer dominates?
 - `SharedMemory` for static cubes if worker RSS becomes binding at scale (not needed at 30 runs).
+
+**2026-09-13 (review with Max)** — What the two ensembles actually showed, and the redesign.
+- **`01f` front_range, 100 sites × 5 p97 episodes × 21 d (495 ok):** 87 % of fires reached the domain edge
+  (35 % on day 1; the AOI is a 30 × 90 km strip), site explains 85 % of log fire-size variance and episode 2 %,
+  split-half `BurnProb` by site disagrees by |Δ| p90 0.12 against a median BP of 0.10. The "blocky" BurnProb is
+  ~100 truncated 21-day footprints each stamped 5×; more sites would smooth it only after the truncation is
+  fixed. front_range stays a QA/parameter landscape only.
+- **`05` North Cottonwood, 30 paired realizations:** 18/30 sit on the 32.4 kha domain ceiling; in 4 of 15 pairs
+  one arm spots into a second fuel patch and the other does not (same seed) → ±27 kha area deltas of random
+  sign. **Exact pairing does not make far-field or total-area deltas small when spotting is on**; the stable
+  signal is near-field (intensity in the treatment fell in 14/15 pairs, firebrands in 11/15, median |Δ area|
+  on day 1 = 54 ha).
+- **Redesign, one SFA at a time (Upper Arkansas RMRI first, pyrome 45):** two products. *Location* — one arm
+  (`background` = sc1c, every treatment except COSWAP), density-drawn ignitions inside the SFA + 10 km ring,
+  7-day p97 fires, and per fire the **treatment shadow** (`spread/transmission.py`: BFS from the COSWAP cells
+  the fire burned along 8-neighbour edges that only run forward in arrival time). Value blocks are 1 km cells
+  with ≥ 10 Overture structures. Per block: `p_reached`, `p_intercepted`, lead time; per project: fires
+  reaching it and the share that then reached a block behind it; rasters `BurnProb`, `ShadowGivenBurn`.
+  *Impact* — only the fires that burned into a COSWAP atom are re-run on `coswap` (sc2c); paired near-field
+  deltas (intensity, crown share, firebrands in the atoms and a 500 m collar, day-1/3 area, arrival delay at
+  intercepted blocks) plus a breakout rate for |Δ area| > 1,000 ha. Total-area means are not reported.
+- **Arms are `background` vs `coswap`, not `untreated`.** The 657 UA "treatment atoms" in the CFT table are
+  every recorded treatment; only 42 atoms / 255 ha / 6 projects are COSWAP-funded
+  (`Focus_Area_analysis/Data/spatial/mod/COSWAP_treatment_interactions.gpkg`, SFA from `EVENTS`). sc2c − sc1c
+  differs on 0.05 % of UA cells; that is the COSWAP effect being tested.
+- **Domain:** `fuelscape.clip_lcp` cuts the statewide arm to the SFA + 15 km, padded to 100-cell multiples
+  (UA: 5000 × 2900 = 14.5 M cells, 41 s and 3.7 GB per 7-day realization with spotting → ~600 runs/h on
+  6 workers). Duration is judged by `pyre_outputs.edge_contact` (first edge-contact day per run), not
+  `check_domain_adequacy`.
+- **Shadow validated on front_range:** a 1 km treatment in the head-fire path shadows 42 % of a burn, one on
+  a flank ~0–6 %; every shadow cell arrives after the treatment entry. Strict monotone edges (no tolerance):
+  a tolerance leaks the shadow upstream through level-set wrinkles.
+- **Realized spot ignitions cannot be read as arrival-time local minima.** With spotting *off* the level set
+  still leaves single-cell minima (gaps up to 23 min to their neighbours) where fronts merge; on/off runs
+  give the same set. The chunked-stepping route (open item) stands. Spotting on/off comparisons stay on
+  front_range.
+- **A fire that never leaves its footprint is an outcome** (`stop_condition == "no_spread"`, layers written),
+  not an error — front_range site 54 sat in an urban block and failed all 5 episodes as "errors".
+- Episode frames now carry `rh_pct`; `episodes.episode_weather_report` is the per-episode weather table for
+  the report (ERC, T max, RH min, FM1 min, RTMA and HRRR fire-hour wind percentiles, dominant direction).
+  `summarize_realization` adds `{zone}_crown_frac`.
+- Severity stays p97 only (matches the in-situ analysis); a mixture is a later option.
+
+**2026-09-13 (pilot result, Upper Arkansas RMRI)** — 200 sites × 3 p97 episodes × 7 d on `background`
+(600/600 ok, 80 min wall on 6 workers; 3 no-spread; 0 % reached the edge; fire size median 20.7 kha,
+p90 40.8 kha), then 186 paired `coswap` fires (the ones that burned into a COSWAP atom; 372 rows, 0 errors).
+- *Location:* 31 % of fires burned into a COSWAP atom and 170 of those 186 went on to reach a structure block
+  behind it. Mesa Antero / Mount Princeton / Weldon Creek each met ~110 fires (≈ 20 % of all fires),
+  North Cottonwood 41, Feddema 15, Home Stake 11. 183 of 384 blocks were reached through a COSWAP treatment at
+  least once; among blocks reached by ≥ 30 fires, 85 have `p_intercepted` ≥ 0.25 (3,001 structures) and 5 have
+  ≥ 0.5. Median lead time treatment → block 52 h (p10 10 h, p90 107 h). Split-half convergence on
+  `p_intercepted` (302 blocks, ≥ 10 fires per half): |Δ| median 0.013, p90 0.10, r = 0.94 — 200 sites is
+  enough to rank blocks; 400 would tighten the tail.
+- *Impact (coswap − background, medians over 186 pairs):* intensity in the atoms −2,040 kW/m (99 % of pairs
+  negative; background median 2,400 kW/m), crown share −0.58 (background 0.67), firebrands in the atoms −0.78
+  and in the 500 m collar −0.44 (96 % negative), day-1 area 0 (58 % identical), day-3 area −0.2 ha (50 % neg /
+  29 % pos), arrival at blocks behind the treatment +0.4 h median (73 % delayed, p10/p90 −1.1/+5.7 h; 190 block
+  arrivals disappear on the treated landscape). Breakout (|Δ total area| > 1,000 ha) in 25 % of pairs.
+  Reading: the treatments reliably change *how* the fire burns through them and what they emit, and barely
+  change *whether* or *when* it reaches the blocks behind them at 7 days — 255 ha against 20 kha fires.
+
+**2026-09-13 (episode control, Max)** — `select_episodes` now separates the *pool* from the *rank*, both exposed
+as notebook parameters (`EPISODE_POOL`, `EPISODE_RANK`) with the previous behaviour as the default (verified: the
+same three Upper Arkansas p97 windows are drawn, so cached runs stay valid). Pool = climatology days at
+`SEVERITY` in `YEARS` (default), or explicit `dates=` — `dates_from_fod` (discovery dates of FOD fires ≥ a size
+class in the window; the observed-fire pool) or a named ignition date such as East Troublesome 2020-10-14 with
+`severity=None`. Rank = seeded random (default) or top-n by `erc_day1` / `erc_mean`. Every row reports
+`erc_pct` (where day 1 sits in the climatology) and `source`, carried into the weather report. Limits: dates must
+fall in the ERC climatology years and the April–October season; windows that run past the RTMA record
+(Oct 31) or hold a > 3 h gap are dropped with a count; HRRR cubes need 2014-07-30 or later. Satellite growth
+records (MTBS/FIRED) as a pool are a later add — the interface is the same (`dates=`).
+
+**2026-09-13 (fast-fire episodes, Max)** — Third episode pool: FIRED events whose maximum single-day growth
+reaches **1,620 ha** (the fast-fire threshold of Balch et al. 2025, Science). `episodes.build_fast_fires_table`
+reads the FIRED *events* GeoPackage once (`MCC/data/wildfire/FIRED/raw/fired_v2025var_…_events.gpkg`, 2000–
+Feb 2026) into a lookup, `data/wildfire/fast_fires_fired_v2025var.csv` (2,169 CONUS events: id, ignition /
+last / max-growth dates, max-day ha, total ha, duration, land cover, ignition centroid lon/lat); rebuild it on a
+new FIRED release. `dates_from_fast_fires(table, geom=|bbox=, days_before=3)` returns window starts
+`days_before` the biggest day, so `duration_days = before + 1 + after` brackets the blow-up. Weather then comes
+from the real record for those dates as for every pool. Counts inside the RTMA window (Apr–Oct 2011–2025):
+pyrome 45 has 7 usable fast fires (12 total; largest day 10.9 kha), 46 has 12, 47 has 13, 53 has 7 (largest
+192 kha/day, the 2018 grass fires). Only one fast fire sits inside the Upper Arkansas landscape itself (Hayden
+Pass 2016, 3.5 kha/day), so the notebook's default area for this pool is the **pyrome**, consistent with the
+pyrome-mean T/RH/ERC frames. East Troublesome's biggest day (2020-11-01) is outside the RTMA season and is
+dropped with a count. ICS-209-PLUS can feed the same `dates=` interface later.

@@ -135,6 +135,44 @@ def test_worker_count_is_irrelevant(layers, weather, ignition, tmp_path):
     assert _same(outs[0][0], outs[1][0]) and _same(outs[0][0], outs[0][1])
 
 
+def test_cached_manifest_is_reused_only_for_the_identical_request(layers, weather, ignition, tmp_path):
+    """Same out_dir, changed footprint or seed -> re-run; identical request -> cached manifest."""
+    gate = 0.0 if pyre.is_patched_engine() else None
+    kw = dict(duration_h=HOURS, spot_config=SPOT, crown_gate=gate)
+    first = pyre.run_realization(layers, weather, ignition, tmp_path / "r", seed=11, **kw)
+    again = pyre.run_realization(layers, weather, ignition, tmp_path / "r", seed=11, **kw)
+    assert again == first and "request_hash" in first
+    reseeded = pyre.run_realization(layers, weather, ignition, tmp_path / "r", seed=12, **kw)
+    assert reseeded["seed"] == 12 and reseeded["request_hash"] != first["request_hash"]
+    (r0, c0), win = ignition
+    moved = pyre.run_realization(layers, weather, ((r0 + 5, c0), win), tmp_path / "r", seed=12, **kw)
+    assert moved["ignition_window"][0] == r0 + 5 and moved["request_hash"] != reseeded["request_hash"]
+    hotter = {**weather, "temperature": weather["temperature"] + 5}
+    assert pyre.run_realization(layers, hotter, ((r0 + 5, c0), win), tmp_path / "r", seed=12, **kw)["request_hash"] != moved["request_hash"]
+    # a pre-fingerprint manifest (no request_hash) is treated as stale, not trusted
+    import json
+    man_fp = tmp_path / "r" / "manifest.json"
+    man = json.loads(man_fp.read_text()); man.pop("request_hash"); man_fp.write_text(json.dumps(man))
+    assert "request_hash" in pyre.run_realization(layers, hotter, ((r0 + 5, c0), win), tmp_path / "r", seed=12, **kw)
+
+
+def _maybe_die(p):
+    """Picklable worker body: kill the process for the poisoned payload, echo the rest."""
+    import os
+    if p.get("die"):
+        os._exit(137)
+    return {"id": p["id"], "status": "ok"}
+
+
+def test_parallel_batch_survives_a_dying_worker():
+    """multiprocessing.Pool.map would hang forever here; the executor path reports and moves on."""
+    payload = [{"id": i, "die": i == 2} for i in range(6)]
+    out = pyre._run_parallel(_maybe_die, payload, n_workers=2)
+    assert [r["id"] for r in out if r] == [0, 1, 3, 4, 5]
+    assert out[2] is None                                   # isolated re-run died too -> reported, not hung
+    assert all(r["status"] == "ok" for r in out if r)
+
+
 def test_burn_landscape_head_fire_vs_azimuth(layers, weather, tmp_path):
     gate = 0.0 if pyre.is_patched_engine() else None
     head = pyre.burn_landscape(layers, weather, tmp_path / "head", crown_gate=gate)

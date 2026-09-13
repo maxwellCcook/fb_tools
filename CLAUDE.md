@@ -74,10 +74,15 @@ what is logged there.
   `run_realization`, `build_runs`, `run_batch`), `spread/episodes.py` (`select_episodes`,
   `load_rtma_hourly`, `episode_hourly_frame`, `weather_arrays`), `spread/pyre_outputs.py`
   (`summarize_realization`, `paired_deltas`, `aggregate_realizations`, `firebrand_production`),
-  `spread/convert.py` (`destack_lcp`). **Example**: `code/notebooks/01f_PyreBuild.ipynb` burns the
+  `spread/convert.py` (`destack_lcp`), `fuelscape/ignitions.py::sample_density_ignitions` (FSim-style
+  sites ∝ FOD density, uniform `w_i`). **Example**: `code/notebooks/01f_PyreBuild.ipynb` on the
   `front_range` test AOI (LFPS download in `data/spatial/mod/fuelscapes/front_range/`, 3000×1000 @ 30 m,
-  pyrome 46) end to end in ~1 min. The COSWAP arms/design-fire/paired-Δ work lives in the project folder
-  (`COSWAP/…/fire_behavior/code/05_PyreTransmission.ipynb`), not here.
+  pyrome 46): destack → potential map → 3 episodes + HRRR cubes → 30 IDG sites (FOD class ≥ C, 10 km
+  kernel; cells drawn ∝ density, never the FOD points) → one burn → 90-run
+  ensemble → `BurnProb`, `ArrivalProb_d{d}`, `AvgTime`, `Firebrands`. The COSWAP arms/design-fire/paired-Δ
+  work lives in the project folder (`COSWAP/…/fire_behavior/code/05_PyreTransmission.ipynb`), not here.
+  Outputs that skip on an existing manifest are named by their inputs so a changed parameter cannot reuse
+  a stale product.
 - **Units the engine wants** (each unit-tested): wind km/h, temperature °C, direction met FROM,
   moistures as fractions, slope rise/run (LCP `SLPD` degrees → `tan`; never `load_landfire`),
   `time_of_arrival` minutes (`AvgTime.tif` written in days). `ignite_cells` window is −1 inside.
@@ -91,12 +96,15 @@ what is logged there.
 - **Weather**: T/RH → NFDRS dead FM from the pyrome-mean RTMA monthly files
   (`data/weather/pyrome_emc/RTMA_MONTHLY`; not the older `RTMA_EMC`, different fire mask).
   **Wind is a 3-D HRRR cube per episode** (`weather/hrrr.py::fetch_hrrr_wind_grid`, byte-range from
-  AWS, no herbie; `episodes.episode_wind_cube` → `.npz`; `build_runs(wind_cubes=...)`). Any spatial
+  AWS, no herbie; `episodes.episode_wind_cube` → `.npz`; `build_runs(wind_cubes=...)`). **All HRRR fetches
+  share one cache**, `default_hrrr_cache()` = `$FB_HRRR_CACHE` or `~/fb_scratch/hrrr_cache`. Any spatial
   mean of wind (pyrome or domain) erases the design wind — see the log. Episodes 2016+.
   `RTMA_WIND_MONTHLY` is the pyrome-mean fallback and the frame's 1-D wind.
 - **Domain**: the 52 km North Cottonwood LCP saturates by day 3–5 under any weather; a wider LCP
   (~100 km, rows/cols multiples of 100) is pending. Duration is set by `check_domain_adequacy`.
-- **Scratch**: `~/fb_scratch/coswap_pyre` (`$FB_PYRE_SCRATCH`); only ensemble products go to Box.
+- **Scratch**: `~/fb_scratch/{coswap_pyre,pyre_example}` (`$FB_PYRE_SCRATCH`); only ensemble products go to Box.
+- **Shared helpers, defined once**: `hrrr.uv_to_speed_dir` (met FROM; m/s, km/h, mph), `hrrr.longest_true_run`,
+  `pyre_outputs.REALIZATION_LAYERS` / `rasterize_mask`. Do not re-derive these inline.
 - **Diagnostics** (`code/dev/pyre/`): `g0`–`g1c` crown/units checks, `b1`–`b3` benchmark and
   spotting variance, `build_patched_engine.py`, `pyre_source.py` (pure-Python engine for cfunc access).
 - **Tests**: `test_pyre_destack.py`, `test_pyre_episodes.py` (engine-free, run in `fb_tools`);

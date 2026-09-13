@@ -168,6 +168,92 @@ Duration is re-decided by `check_domain_adequacy` on the new domain, not fixed a
   `layers/`, `episodes/`, `hrrr_cache/` under `~/fb_scratch/coswap_pyre` are kept for the project
   notebook. The example uses `~/fb_scratch/pyre_example`.
 
+**2026-09-13** — Review pass with Max: consistency, duplication, and the example notebook's direction.
+- **Goal restated.** Before COSWAP arms: a baseline probabilistic workflow — deterministic behavior map,
+  point ignitions, arrival/flame-length/ember outputs, then an *ensemble* large enough to make a
+  probabilistic arrival surface. `01f_PyreBuild.ipynb` now ends with that ensemble (section 6).
+- **Ignitions follow FSim's ignition-density-grid step.** `fuelscape.ignitions.sample_density_ignitions`
+  draws sites ∝ `ignition_density_surface` without replacement (so `w_i` is uniform), one footprint
+  shapefile each. The example builds the IDG from the authoritative FOD (through 2024), size class ≥ B
+  (class A is sub-¼-acre starts, mostly human and caught at once), 5 km kernel. `front_range` holds 433
+  class-B+ fires (1,260 within 20 km) vs only 25 class D–G — too few for a surface. What the example does
+  **not** copy from FSim: the ERC-conditioned number of fires per day, and season-long ignition timing
+  (all sites start on day 1 of a severe episode). Both are the next FSim-alignment steps if wanted.
+- **Ensemble size for the example: 30 sites × 3 `p97` episodes = 90 realizations** at 7 days, spotting on,
+  4 workers. Measured headless 2026-09-13 on front_range: 90/90 ok, 23.6 min compute, **6.7 min wall**
+  (~16 s per realization; fires are larger than the earlier 6 s single run). Fire size mean 11,374 ha,
+  median 8,365, sd ≈ mean, min 454 — the heavy tail is the ensemble, not a nuisance. `Σ BP × area` equals
+  the mean fire size to the hectare. Episodes drawn: 2018-06-14, 2020-09-06, 2020-10-09; the 2020-09
+  episode's ERC drops to a 45.7 mean after a day-1 80 — a real front passage the design keeps.
+- **New ensemble products** in `pyre_outputs.aggregate_realizations` (streamed, one run in memory at a
+  time): `ArrivalProb_d{d}` = fraction of realizations reaching a cell by day *d* (the probabilistic
+  arrival surface; marks past the longest run are dropped) and `Firebrands` = expected firebrands per
+  cell averaged over realizations (`firebrand_production` per run; a spot-fire *source* map — realized
+  landings remain unexposed by the engine). `BurnProb`, `AvgTime` (days), `AvgFlameLength`, `n_burned`
+  unchanged.
+- **One HRRR cache.** `weather.hrrr.default_hrrr_cache()` = `$FB_HRRR_CACHE` or
+  `~/fb_scratch/hrrr_cache`, the default for `hrrr_uv10`, `fetch_hrrr_wind_grid` and
+  `fetch_hrrr_winds_at_fires`. The two per-project caches (5.7 GB + 357 MB, 48 hours duplicated) were
+  merged into it (2,309 hours). Files are CONUS-wide two-message subsets, so every consumer shares them.
+- **Duplication removed.** One `uv_to_speed_dir(u, v, units)` (was written 4×, mph in hrrr.py and km/h
+  three times in episodes.py); one `longest_true_run` (was 3×); `REALIZATION_LAYERS` defined once in
+  `pyre_outputs` and imported by `models.pyre`; one `rasterize_mask` behind `ignition_matrix` and
+  `zone_masks`. Archive constants are now the pair `HRRR_ARCHIVE_START` (2014-07-30, refuses earlier) and
+  `HRRR_RELIABLE_YEAR` (2016, the climatology filter) — the old `_HRRR_START_YEAR` was the second one.
+- **Stale text fixed:** `convert.py` docstring (`build_static_cubes`), `environment-pyre.yml`
+  (`03b_Transmitted_Pyre`), README's empty "Optional" block, `00c`'s "Requires herbie-data" comment; the
+  plan doc carries a superseded banner. `burn_landscape` no longer breaks on a 3-D wind cube in its
+  manifest stamp.
+- **Cache hygiene is now enforced in code, not by naming.** Re-running `01f` with the class-C ignition
+  grid reproduced the class-B ensemble to the hectare in 0.0 min: the run dirs are keyed by ignition *id*
+  and `run_realization` returned any existing manifest. `run_realization` and `burn_landscape` now stamp a
+  `request_hash` (sha256 of seed, duration, layers dir, ignition window, weather arrays, spot config, gate,
+  solver knobs, adjustments, behavior options) and re-run when the stored hash differs or is absent
+  (`test_cached_manifest_is_reused_only_for_the_identical_request`). Pre-fingerprint manifests are treated
+  as stale. Wind cubes are still named by episode start date because `.npz` files carry no manifest.
+- **IDG from larger fires (Max, later the same day): size class ≥ C (10 ac+), kernel 10 km.** The
+  front_range 0.6° window holds 494 class-C+ fires (70 inside the LCP, 148 within 15 km) vs 159 class-D+
+  (25 inside), so C is the smallest class that still gives a surface rather than spikes at 10 km. Sites are
+  **grid cells drawn ∝ the smoothed surface, never the FOD points themselves**
+  (`test_sample_density_ignitions_draws_cells_not_fod_points`).
+- **Production surfaces need more than 90 runs.** Cost on this grid ≈ 4.5 s wall per 7-day realization on
+  4 workers (1,000 ≈ 75 min, 5,000 ≈ 6 h). Raise sites first, then episodes; judge convergence by a
+  split-half `BurnProb` comparison. The notebook's "Next" carries this guidance.
+- **Stale code removed:** `episode_hourly_frame(wind=...)` constant-wind placeholder (RTMA wind is on disk
+  and HRRR cubes are the design; the frame now requires `u_ms/v_ms/ws_ms`), the unused `herb_scale` kwarg of
+  `weather_from_scenario`, the unused `transform=/crs=` overrides of `run_realization`, and the unused
+  `models.run_pyre_batch` alias (call `pyre.run_batch`). `load_static_layers` reads `fuel_model` as
+  float32 — the engine copied int64 to float32 on every run with a warning.
+- Scratch: `~/fb_scratch/coswap_pyre/{pyretechnics-src,benchmark,smoke,runs,potential,ensemble}` and
+  the old `pyre_example` outputs are approved for deletion (Max runs the `rm`; the sandbox refused it).
+- Pre-existing, unrelated: `tests/test_mask_lcp.py::test_output_is_lzw_compressed_and_tiled_by_default`
+  fails on `main` too (writer defaults to deflate, test expects lzw).
+
+**2026-09-13 (late)** — The class-C ensemble lost 4 of 90 realizations and `run_batch` hung.
+- **Engine bug, measured.** Four `SIGSEGV` crash reports (`~/Library/Logs/DiagnosticReports/python3.11-*`),
+  identical stacks: `spread_fire_with_phi_field → spread_one_timestep → route_cell_to_diff →
+  is_frontier_cell → spot_fire.is_burnable_cell → SpaceTimeCube.get`. Cause: on the final step the engine
+  indexes cubes at `int(stop_time // band_duration)` (`eulerian_level_set.py` ~L2690), which equals the
+  band count when a run ends exactly at `max_duration`; `check_start_and_stop_times` rejects only `>`.
+  For a 2-D base that is `data[1, y, x]` on a `(1, rows, cols)` array — an out-of-bounds read with
+  `boundscheck(False)`: garbage on most heaps, a fault on some. The same row ran fine alone (0.6 s), so the
+  crash is memory-layout dependent, not input dependent, and the "same seed → bitwise identical" contract
+  was only holding because the garbage was usually benign. **Report upstream.**
+- **fb_tools fix:** `pyre.pad_bands` gives every weather cube `ceil(duration_h) + 1` bands (last hour
+  repeated), so the final lookup is a real band. Stamped into `request_hash`, so all cached runs re-run.
+- **`run_batch` no longer hangs on a dead worker.** `multiprocessing.Pool.map` waits forever for a lost
+  task. `_run_parallel` feeds a `ProcessPoolExecutor` (`spawn`, `max_tasks_per_child=1`) at most
+  `n_workers` rows at a time; when a worker dies, the rows in flight are re-run one per isolated process
+  at the end, so a crash names its row and only that row is reported `status == "error"`
+  (`test_parallel_batch_survives_a_dying_worker`). Progress prints every 10 %.
+- Class-C ensemble before the fix, 86 completed: 26.4 min compute, per-run wall 0.1–89 s (median 12),
+  fire size mean 11,675 ha; 14 of 86 fires touched a domain edge — the front_range window is not wide
+  enough for a 7-day p97 fire from the interior, so `BurnProb` is edge-truncated there.
+
+- **Final class-C ensemble after both fixes (headless, 2026-09-13): 90/90 ok, 0 errors, 28.2 min compute,
+  8.1 min wall on 4 workers, no crash reports.** Fire size mean 11,386 ha, median 10,194, sd 9,290, range
+  108–39,866; `Σ BP × area` = mean size. `BurnProb > 0` covers 171,780 ha of the 270,000 ha window.
+
 ## Open items
 
 - **Realized spot ignitions are not exposed** by the engine's final matrices; `spot_ignitions` in the

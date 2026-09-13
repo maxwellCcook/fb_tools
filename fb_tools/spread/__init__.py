@@ -35,8 +35,8 @@ from .episodes import (select_episodes, load_rtma_hourly, episode_hourly_frame,
                        layer_bounds_lonlat, block_factors, episode_wind_cube, write_wind_cube,
                        load_wind_cube, wind_cube_summary,
                        weather_arrays, write_episode_frames, weather_from_scenario)
-from .pyre_outputs import (read_realization, summarize_realization, summarize_runs,
-                           paired_deltas, aggregate_realizations, firebrand_production)
+from .pyre_outputs import (read_realization, summarize_realization, summarize_runs, paired_deltas,
+                           aggregate_realizations, firebrand_production, REALIZATION_LAYERS)
 
 __all__ = [
     "destack_lcp",
@@ -45,7 +45,7 @@ __all__ = [
     "layer_bounds_lonlat", "block_factors", "episode_wind_cube", "write_wind_cube", "load_wind_cube",
     "wind_cube_summary",
     "write_episode_frames", "read_realization", "summarize_realization", "summarize_runs",
-    "paired_deltas", "aggregate_realizations", "firebrand_production",
+    "paired_deltas", "aggregate_realizations", "firebrand_production", "REALIZATION_LAYERS",
     "read_daily_acres",
     "check_domain_adequacy",
     "delta_burn_probability",

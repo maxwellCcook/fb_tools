@@ -22,6 +22,7 @@ from fb_tools.fuelscape.ignitions import (
     footprint_radius_m,
     ignition_density_surface,
     sample_density_at_points,
+    sample_density_ignitions,
     select_design_ignitions,
     check_ignition_clustering,
     wind_cone_half_angle,
@@ -151,6 +152,37 @@ def test_create_fod_ignitions_returns_one_file_per_ignition(
     assert isinstance(paths, list) and len(paths) > 1
     for p in paths:
         assert len(gpd.read_file(p)) == 1
+
+
+def test_sample_density_ignitions_follows_the_surface(synth_lcp, synth_fod, tmp_path):
+    """Sites land where the density is, one shapefile each, uniform design weights."""
+    import rasterio
+    d = ignition_density_surface(synth_fod, synth_lcp, bandwidth_m=600.0)
+    ign = sample_density_ignitions(d, 12, tmp_path, seed=5, footprint_acres=10.0)
+    assert len(ign) == 12 and ign.ign_id.tolist() == list(range(12))
+    assert ign.w_i.sum() == pytest.approx(1.0) and (ign.density > 0).all()
+    assert ign.footprint_ac.between(9.9, 10.1).all()
+    with rasterio.open(synth_lcp) as src:
+        mid_x = (src.bounds.left + src.bounds.right) / 2
+    assert (ign.geometry.centroid.x < mid_x).all()            # synth_fod is all in the west half
+    assert len({p for p in ign.path}) == 12 and all(len(gpd.read_file(p)) == 1 for p in ign.path)
+    same = sample_density_ignitions(d, 12, tmp_path / "again", seed=5, footprint_acres=10.0)
+    assert same.geometry.centroid.x.tolist() == ign.geometry.centroid.x.tolist()
+    with pytest.raises(ValueError, match="asked for"):
+        sample_density_ignitions(d, 10 ** 6, tmp_path / "too_many")
+
+
+def test_sample_density_ignitions_draws_cells_not_fod_points(synth_lcp, tmp_path):
+    """Sites are grid cells drawn from the smoothed surface, not the historical points themselves."""
+    import rasterio
+    with rasterio.open(synth_lcp) as src:
+        b, crs = src.bounds, src.crs
+    one = gpd.GeoDataFrame(geometry=[Point(b.left + 2000, b.bottom + 2000)], crs=crs)
+    d = ignition_density_surface(one, synth_lcp, bandwidth_m=600.0)
+    ign = sample_density_ignitions(d, 20, tmp_path, seed=1, footprint_acres=10.0)
+    dist = ign.geometry.centroid.distance(one.geometry.iloc[0])
+    assert (dist > 30).sum() >= 19                       # at most the point's own cell can coincide
+    assert dist.max() < 4 * 600                          # but all within the kernel's reach
 
 
 # ── P2.2 — ignition density surface ────────────────────────────────────────────

@@ -82,7 +82,7 @@ dependencies:
   # ── Visualization ─────────────────────────────────────────────────────────
   - matplotlib>=3.7
 
-  # ── Jupyter (so 03b_Transmitted_Pyre.ipynb can run in this env) ───────────
+  # ── Jupyter (so code/notebooks/01f_PyreBuild.ipynb can run in this env) ──
   - ipykernel>=6.25
 
   # ── Test runner (the pyre test files run here, not in fb_tools) ───────────
@@ -90,6 +90,6 @@ dependencies:
 
   - pip
 
-# NOTE: osmnx is deliberately absent. fb_tools defers it
-# imports to call time, so `import fb_tools` succeeds without them; the
-# suppression (osmnx) and HRRR-fetch paths are run from `fb_tools`.
+# NOTE: osmnx is deliberately absent. fb_tools defers its import to call time,
+# so `import fb_tools` succeeds without it; the suppression (osmnx) path runs
+# from `fb_tools`. HRRR fetches run in either env (cfgrib is in both).

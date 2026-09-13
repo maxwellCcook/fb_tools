@@ -28,10 +28,6 @@ pip install -e . --no-deps
 
 **`channel_priority strict`:** prevents conda from silently mixing conda-forge and Anaconda `defaults` builds of the same C library, which causes DLL load failures — especially on Windows.
 
-**Optional** (not in conda-forge):
-```bash
-```
-
 **Platform split:** Data prep and weather processing run on macOS. Fire behavior model executables (FlamMap, FSPro, FSim, MTT) are Windows-only — run those on a Windows VM or machine.
 
 > **Windows:** Always create and activate the environment from Anaconda Prompt, not PowerShell.

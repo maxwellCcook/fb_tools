@@ -30,9 +30,11 @@ most useful for multi-fire probabilistic FSPro/FSim climatology.
 200+ non-calm observations per group. With 3–5 test fires (~20–30 obs)
 most bins will be zero — this is expected, not a bug.
 
-HRRR archive coverage: 2016–present (AWS, ``s3://noaa-hrrr-bdp-pds/``).
-Pre-2016 archive has gaps; 2014–2015 data should not be relied upon.
-Fetched by HTTP byte range from the AWS HRRR archive (``requests`` + ``cfgrib``; no herbie).
+HRRR archive on AWS (``s3://noaa-hrrr-bdp-pds/``) starts 2014-07-30
+(``HRRR_ARCHIVE_START``) but is gappy before 2016 (``HRRR_RELIABLE_YEAR``);
+the fire-point climatology filters to 2016+, the episode grid fetch only
+refuses pre-archive dates. Files are fetched by HTTP byte range (``requests``
++ ``cfgrib``; no herbie) into one cache, ``default_hrrr_cache()``.
 
 Workflow
 --------
@@ -52,6 +54,7 @@ Forecast Cycle: The Rapid Refresh, Mon. Wea. Rev., 144, 1669–1694.
 from __future__ import annotations
 
 import json
+import os
 from collections import defaultdict
 from pathlib import Path
 
@@ -64,37 +67,47 @@ _DEFAULT_SPEED_BREAKS_MPH: list[float] = [5, 10, 15, 20, 25, 30]
 _DEFAULT_DIR_BREAKS_DEG: list[float] = [45, 90, 135, 180, 225, 270, 315, 360]
 _CALM_THRESHOLD_MPH: float = 2.0      # obs below this excluded from wind rose
 _MS_TO_MPH: float = 2.23694
-_HRRR_START_YEAR: int = 2016          # HRRR AWS archive begins mid-2014
+HRRR_AWS = "https://noaa-hrrr-bdp-pds.s3.amazonaws.com"
+HRRR_ARCHIVE_START = pd.Timestamp("2014-07-30")   # first analysis hour on AWS
+HRRR_RELIABLE_YEAR: int = 2016                    # gap-free from here; the climatology floor
+_SPEED_FACTOR = {"m/s": 1.0, "km/h": 3.6, "mph": _MS_TO_MPH}
+
+
+def default_hrrr_cache() -> Path:
+    """One GRIB-subset cache for every HRRR fetch: ``$FB_HRRR_CACHE`` or ``~/fb_scratch/hrrr_cache``."""
+    return Path(os.environ.get("FB_HRRR_CACHE", Path.home() / "fb_scratch" / "hrrr_cache"))
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
-def _uv_to_ws_wd(
-    u: np.ndarray,
-    v: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
+def uv_to_speed_dir(u, v, speed_units: str = "m/s"):
     """
-    Convert U/V wind components (m/s) to speed (mph) and meteorological
-    direction (degrees the wind is coming FROM).
+    U/V wind components (m/s) -> speed and meteorological direction (degrees FROM).
 
     Parameters
     ----------
-    u : np.ndarray
-        Eastward wind component (m/s). Positive = blowing toward east.
-    v : np.ndarray
-        Northward wind component (m/s). Positive = blowing toward north.
+    u, v : array-like
+        Eastward and northward components, m/s.
+    speed_units : {"m/s", "km/h", "mph"}
 
     Returns
     -------
-    ws_mph : np.ndarray
-    wd_deg : np.ndarray
-        Direction FROM which wind is blowing, 0–360° (0/360 = north).
+    speed, direction : numpy.ndarray
+        ``u=5, v=0`` (blowing toward east) gives direction 270 (FROM the west).
     """
-    ws_mph = np.sqrt(u ** 2 + v ** 2) * _MS_TO_MPH
-    # Meteorological FROM convention: atan2(-u, -v) + 360 mod 360
-    # Verification: u=5, v=0 (eastward) → 270° (FROM west) ✓
-    wd_deg = (np.degrees(np.arctan2(-u, -v)) + 360) % 360
-    return ws_mph, wd_deg
+    u, v = np.asarray(u, dtype="float64"), np.asarray(v, dtype="float64")
+    speed = np.hypot(u, v) * _SPEED_FACTOR[speed_units]
+    direction = (np.degrees(np.arctan2(-u, -v)) + 360.0) % 360.0
+    return speed, direction
+
+
+def longest_true_run(flags) -> int:
+    """Length of the longest consecutive run of ``True`` in a 1-D boolean sequence."""
+    f = np.asarray(flags, dtype=bool)
+    if not f.any():
+        return 0
+    edges = np.flatnonzero(np.diff(np.concatenate(([False], f, [False]))))
+    return int((edges[1::2] - edges[::2]).max())
 
 
 def _extract_uv(ds) -> tuple[np.ndarray, np.ndarray]:
@@ -172,8 +185,8 @@ def fetch_hrrr_winds_at_fires(
         Column name for pyrome identifier in ``fod_gdf``.
     cache_dir : Path or str, optional
         GRIB subset cache shared with :func:`hrrr_uv10` (default
-        ``~/fb_scratch/hrrr_cache``; ~2 MB per analysis hour). Cached hours are
-        reused; network failures are retried; genuine archive gaps fail again.
+        :func:`default_hrrr_cache`; ~2 MB per analysis hour). Cached hours are
+        reused; genuine archive gaps are skipped.
     k_neighbors : int
         Number of nearest HRRR grid points to sample per fire location.
         Default 1 (single nearest point). Use 9 (3×3 neighborhood, ~9×9 km
@@ -203,13 +216,13 @@ def fetch_hrrr_winds_at_fires(
     fod[date_col] = pd.to_datetime(fod[date_col])
 
     n_total = len(fod)
-    fod = fod[fod[date_col].dt.year >= _HRRR_START_YEAR].copy().reset_index(drop=False)
+    fod = fod[fod[date_col].dt.year >= HRRR_RELIABLE_YEAR].copy().reset_index(drop=False)
     if fod.empty:
         raise ValueError(
-            f"No FOD fires fall within HRRR coverage period ({_HRRR_START_YEAR}+). "
+            f"No FOD fires fall within HRRR coverage period ({HRRR_RELIABLE_YEAR}+). "
             f"Input had {n_total} fires."
         )
-    print(f"  {len(fod)} / {n_total} fires in HRRR period ({_HRRR_START_YEAR}+)")
+    print(f"  {len(fod)} / {n_total} fires in HRRR period ({HRRR_RELIABLE_YEAR}+)")
 
     # Reproject to WGS84 for KD-tree matching
     fod_wgs84 = fod.to_crs("EPSG:4326")
@@ -232,7 +245,7 @@ def fetch_hrrr_winds_at_fires(
     n_raw = len(fod) * n_days * len(fire_hours_utc)
     print(f"  {n_raw} raw schedule entries → {len(unique_pairs)} unique (date, hour) downloads")
 
-    cache_dir = Path(cache_dir) if cache_dir is not None else Path.home() / "fb_scratch" / "hrrr_cache"
+    cache_dir = Path(cache_dir) if cache_dir is not None else default_hrrr_cache()
 
     kd_tree = None
     lon_flat = None
@@ -286,7 +299,7 @@ def fetch_hrrr_winds_at_fires(
         grid_idx_flat = grid_idx.ravel()
         u_vals = u_flat[grid_idx_flat]
         v_vals = v_flat[grid_idx_flat]
-        ws_mph, wd_deg = _uv_to_ws_wd(u_vals, v_vals)
+        ws_mph, wd_deg = uv_to_speed_dir(u_vals, v_vals, "mph")
 
         for j, pos in enumerate(fire_positions):
             row = fod.iloc[pos]
@@ -992,10 +1005,6 @@ def build_flammap_wind_data(
 # Episode wind: gridded 10 m U/V over a run domain, fetched by byte range (no herbie)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-HRRR_AWS = "https://noaa-hrrr-bdp-pds.s3.amazonaws.com"
-HRRR_ARCHIVE_START = pd.Timestamp("2014-07-30")
-
-
 def hrrr_url(dt, product: str = "wrfsfcf00") -> str:
     """AWS URL of one HRRR CONUS GRIB2 file (analysis hour ``dt``, UTC)."""
     dt = pd.Timestamp(dt)
@@ -1015,7 +1024,7 @@ def _uv10_byte_ranges(idx_text: str) -> list[tuple[int, int | None]]:
     return out
 
 
-def hrrr_uv10(dt, cache_dir, *, timeout: int = 60) -> dict:
+def hrrr_uv10(dt, cache_dir=None, *, timeout: int = 60) -> dict:
     """
     One HRRR analysis hour's 10 m wind on the native grid.
 
@@ -1023,8 +1032,9 @@ def hrrr_uv10(dt, cache_dir, *, timeout: int = 60) -> dict:
     ----------
     dt : datetime-like
         Analysis hour, UTC.
-    cache_dir : Path
-        Where the two-message GRIB2 subset is kept (``hrrr.<ymd>.t<hh>z.uv10.grib2``).
+    cache_dir : Path, optional
+        Where the two-message GRIB2 subset is kept (``hrrr.<ymd>.t<hh>z.uv10.grib2``);
+        default :func:`default_hrrr_cache`.
 
     Returns
     -------
@@ -1039,7 +1049,7 @@ def hrrr_uv10(dt, cache_dir, *, timeout: int = 60) -> dict:
     import requests
 
     dt = pd.Timestamp(dt)
-    cache_dir = Path(cache_dir)
+    cache_dir = Path(cache_dir) if cache_dir is not None else default_hrrr_cache()
     cache_dir.mkdir(parents=True, exist_ok=True)
     fp = cache_dir / f"hrrr.{dt:%Y%m%d}.t{dt:%H}z.uv10.grib2"
     if not fp.exists():
@@ -1071,15 +1081,7 @@ def _read_uv10_grib(fp) -> dict:
         ds.close()
 
 
-def _longest_missing_run(flags: np.ndarray) -> int:
-    best = run = 0
-    for f in flags:
-        run = run + 1 if f else 0
-        best = max(best, run)
-    return best
-
-
-def fetch_hrrr_wind_grid(times, bounds_lonlat, cache_dir, *, n_threads: int = 4,
+def fetch_hrrr_wind_grid(times, bounds_lonlat, cache_dir=None, *, n_threads: int = 4,
                          max_gap_h: int = 3, verbose: bool = True) -> dict:
     """
     Hourly HRRR 10 m U/V on the native cells covering a lon/lat box.
@@ -1090,8 +1092,8 @@ def fetch_hrrr_wind_grid(times, bounds_lonlat, cache_dir, *, n_threads: int = 4,
         Hourly UTC analysis times (e.g. an episode frame's ``datetime_utc``).
     bounds_lonlat : tuple
         ``(min_lon, min_lat, max_lon, max_lat)``, longitudes in −180..180.
-    cache_dir : Path
-        GRIB subset cache; see :func:`hrrr_uv10`.
+    cache_dir : Path, optional
+        GRIB subset cache; default :func:`default_hrrr_cache`.
     n_threads : int
         Concurrent downloads (network-bound; ~2 MB per hour).
     max_gap_h : int
@@ -1141,7 +1143,7 @@ def fetch_hrrr_wind_grid(times, bounds_lonlat, cache_dir, *, n_threads: int = 4,
         u[i], v[i] = g["u"][sl], g["v"][sl]
     if missing:
         flags = np.isin(times, pd.DatetimeIndex(missing))
-        gap = _longest_missing_run(flags)
+        gap = longest_true_run(flags)
         if gap > max_gap_h:
             raise ValueError(f"HRRR gap of {gap} h in {times[0]}..{times[-1]} (max_gap_h={max_gap_h})")
         for arr in (u, v):

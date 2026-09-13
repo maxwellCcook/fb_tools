@@ -1,4 +1,7 @@
 <!--
+SUPERSEDED IN PART: docs/pyre_decisions.md (dated log) wins wherever the two disagree —
+notably herbie is gone, the module layout is three modules, and wind is HRRR 3-D cubes.
+
 Status: APPROVED 2026-09-10. Revised 2026-09-10 after scope review (v2).
 Scope: replaces FSPro as the COSWAP transmission engine with pyretechnics.
 Entry point for a fresh session: Stage 0. G0+G1+G2 are the <=4-day kill point.

@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 
 from ..weather.gridmet import load_gridmet_pyrome_cache
+from ..weather.hrrr import longest_true_run, uv_to_speed_dir
 from ..weather.nfdrs import calc_live_fm_from_dead
 from ..weather.rtma import build_rtma_dead_fm, load_rtma_csv
 
@@ -45,12 +46,7 @@ def season_day_to_date(year, season_day):
 def _longest_gap_h(rtma_df, start_date, n_days):
     """Longest run of missing hours in ``rtma_df`` over ``n_days`` from ``start_date``."""
     idx = pd.date_range(pd.Timestamp(start_date), periods=n_days * 24, freq="h")
-    present = rtma_df["datetime_utc"].isin(idx)
-    have = pd.Series(False, index=idx)
-    have[rtma_df.loc[present, "datetime_utc"]] = True
-    miss = (~have).astype(int)
-    runs = miss.groupby((miss != miss.shift()).cumsum()).sum()
-    return int(runs.max()) if len(runs) else 0
+    return longest_true_run(~idx.isin(rtma_df["datetime_utc"]))
 
 
 def select_episodes(pyrome_id, erc_cache_dir, *, severity="p97", n=5, duration_days=21,
@@ -184,8 +180,8 @@ def load_rtma_hourly(rtma_dir, pyrome_id, years, *, wind_dir=None):
     return df.sort_values("datetime_utc").reset_index(drop=True)
 
 
-def episode_hourly_frame(episode, rtma_df, *, wind=None, ignition_hour_local=12,
-                         utc_offset_h=-6, herb_scale=6.5, woody_scale=9.0, max_gap_h=3):
+def episode_hourly_frame(episode, rtma_df, *, ignition_hour_local=12, utc_offset_h=-6,
+                         herb_scale=6.5, woody_scale=9.0, max_gap_h=3):
     """
     Materialize one episode as an hourly driver frame in pyretechnics units.
 
@@ -194,10 +190,7 @@ def episode_hourly_frame(episode, rtma_df, *, wind=None, ignition_hour_local=12,
     episode : Mapping
         A row of :func:`select_episodes` (needs ``start_date, end_date``).
     rtma_df : pandas.DataFrame
-        From :func:`load_rtma_hourly`.
-    wind : tuple or None
-        ``(speed_kmh, from_deg)`` constant wind, used when the RTMA record has
-        no ``u_ms/v_ms/ws_ms`` columns. ``None`` requires them.
+        From :func:`load_rtma_hourly` with ``wind_dir=`` (needs ``u_ms, v_ms, ws_ms``).
     ignition_hour_local, utc_offset_h : int
         Hour 0 of the cube is the ignition hour in local time (MDT = -6).
     herb_scale, woody_scale : float
@@ -210,7 +203,8 @@ def episode_hourly_frame(episode, rtma_df, *, wind=None, ignition_hour_local=12,
     pandas.DataFrame
         ``duration_days * 24`` rows: ``hour, datetime_utc, tmp_c, ws_kmh,
         wd_from_deg, fm1, fm10, fm100, fm_herb, fm_woody`` (moistures as
-        fractions). ``frame.attrs["wind_source"]`` is ``"rtma"`` or ``"constant"``.
+        fractions). The frame's wind is the pyrome-mean RTMA wind; an HRRR cube
+        replaces it at run time (:func:`weather_arrays`).
     """
     start = datetime.combine(pd.Timestamp(episode["start_date"]).date(), datetime.min.time())
     start += timedelta(hours=ignition_hour_local - utc_offset_h)
@@ -218,40 +212,29 @@ def episode_hourly_frame(episode, rtma_df, *, wind=None, ignition_hour_local=12,
     idx = pd.date_range(start, periods=n_days * 24, freq="h")
 
     src = rtma_df.set_index("datetime_utc").reindex(idx)
-    cols = ["tmp_f", "FM1", "FM10", "FM100"]
-    have_wind = wind is None
-    if have_wind:
-        missing = [c for c in ("u_ms", "v_ms", "ws_ms") if c not in src]
-        if missing:
-            raise ValueError(f"rtma_df lacks {missing}; pass wind=(speed_kmh, from_deg) "
-                             "or load with wind_dir=")
-        cols += ["u_ms", "v_ms", "ws_ms"]
-    src = src[cols].astype(float)
-    gap = src.isna().any(axis=1).astype(int)
-    run = gap.groupby((gap != gap.shift()).cumsum()).transform("sum") * gap
-    if run.max() > max_gap_h:
-        raise ValueError(f"RTMA gap of {int(run.max())} h in episode starting {idx[0]} "
-                         f"(max_gap_h={max_gap_h})")
+    missing = [c for c in ("u_ms", "v_ms", "ws_ms") if c not in src]
+    if missing:
+        raise ValueError(f"rtma_df lacks {missing}; load it with load_rtma_hourly(..., wind_dir=)")
+    src = src[["tmp_f", "FM1", "FM10", "FM100", "u_ms", "v_ms", "ws_ms"]].astype(float)
+    gap = longest_true_run(src.isna().any(axis=1).to_numpy())
+    if gap > max_gap_h:
+        raise ValueError(f"RTMA gap of {gap} h in episode starting {idx[0]} (max_gap_h={max_gap_h})")
     src = src.interpolate(limit_direction="both")
 
     out = pd.DataFrame({"hour": np.arange(len(idx)), "datetime_utc": idx})
     out["tmp_c"] = (src["tmp_f"].values - 32.0) / 1.8
-    if have_wind:
-        out["ws_kmh"] = src["ws_ms"].values * 3.6
-        out["wd_from_deg"] = (np.degrees(np.arctan2(-src["u_ms"].values, -src["v_ms"].values)) + 360) % 360
-    else:
-        out["ws_kmh"], out["wd_from_deg"] = float(wind[0]), float(wind[1])
+    out["ws_kmh"], out["wd_from_deg"] = uv_to_speed_dir(src["u_ms"].values, src["v_ms"].values, "km/h")
     out["fm1"] = src["FM1"].values / 100.0
     out["fm10"] = src["FM10"].values / 100.0
     out["fm100"] = src["FM100"].values / 100.0
     herb, woody = calc_live_fm_from_dead(src["FM100"].values, herb_scale, woody_scale)
     out["fm_herb"], out["fm_woody"] = herb / 100.0, woody / 100.0
-    out.attrs["wind_source"] = "rtma" if have_wind else "constant"
+    out.attrs["wind_source"] = "rtma"
     out.attrs["episode_id"] = episode.get("episode_id")
     return out
 
 
-def weather_from_scenario(scenario, *, wind_from_deg, tmp_c=30.0, n_hours=1, herb_scale=None):
+def weather_from_scenario(scenario, *, wind_from_deg, tmp_c=30.0, n_hours=1):
     """
     A FlamMap scenario-cache entry (``pyrome_<id>_flammap.json`` ``scenarios[pNN]``)
     as engine-unit weather, so a single-run map is parameterized exactly like
@@ -365,9 +348,10 @@ def episode_wind_cube(hrrr, transform, crs, shape, *, block=None, target_block=1
     u = np.asarray(hrrr["u"]).reshape(n_t, -1)[:, idx].reshape(n_t, ny, nx)
     v = np.asarray(hrrr["v"]).reshape(n_t, -1)[:, idx].reshape(n_t, ny, nx)
     res = abs(float(transform.a))
+    ws, wd = uv_to_speed_dir(u, v, "km/h")
     return {
-        "wind_speed_10m": (np.hypot(u, v) * 3.6).astype("float32"),
-        "upwind_direction": ((np.degrees(np.arctan2(-u, -v)) + 360.0) % 360.0).astype("float32"),
+        "wind_speed_10m": ws.astype("float32"),
+        "upwind_direction": wd.astype("float32"),
         "block": (ky, kx), "block_m": (ky * res, kx * res),
         "source": "hrrr_10m_nearest", "n_hrrr_cells": int(len(np.unique(idx))),
     }
@@ -400,7 +384,7 @@ def wind_cube_summary(cube):
     return pd.DataFrame({"hour": np.arange(n_t), "ws_mean": ws.reshape(n_t, -1).mean(axis=1),
                          "ws_p90": np.percentile(ws.reshape(n_t, -1), 90, axis=1),
                          "ws_max": ws.reshape(n_t, -1).max(axis=1),
-                         "wd_vecmean": (np.degrees(np.arctan2(-u, -v)) + 360.0) % 360.0})
+                         "wd_vecmean": uv_to_speed_dir(u, v)[1]})
 
 
 def write_episode_frames(episodes, rtma_df, out_dir, **kwargs):

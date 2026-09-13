@@ -9,8 +9,8 @@ from .scenarios import (
     build_mtt_scenarios,
 )
 from .mtt import run_mtt, run_mtt_batch
-from .pyre import (pyre_version_info, build_runs, run_realization, run_batch as run_pyre_batch,
-                   seed_for, ignition_matrix, burn_landscape, spot_ignition_probability)
+from .pyre import (pyre_version_info, build_runs, run_realization, seed_for, ignition_matrix,
+                   burn_landscape, spot_ignition_probability)
 from .fspro import run_fspro, run_fspro_batch, build_fspro_inputs, build_treatment_pair
 from .fspro_validate import (
     parse_fspro_input,
@@ -28,7 +28,7 @@ from .container import (
 
 __all__ = [
     "run_flammap_scenarios",
-    "pyre_version_info", "build_runs", "run_realization", "run_pyre_batch", "seed_for",
+    "pyre_version_info", "build_runs", "run_realization", "seed_for",
     "ignition_matrix", "burn_landscape", "spot_ignition_probability",
     "load_scenarios",
     "build_scenarios",

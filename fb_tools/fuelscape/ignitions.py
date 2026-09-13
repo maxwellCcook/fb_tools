@@ -544,6 +544,57 @@ def write_density_raster(density: dict, out_path: "str | Path") -> Path:
     return out_path.resolve()
 
 
+def sample_density_ignitions(
+    density: dict,
+    n: int,
+    out_dir: "str | Path",
+    seed=None,
+    footprint_acres: "float | None" = DEFAULT_FOOTPRINT_ACRES,
+    prefix: str = "ign",
+):
+    """
+    Draw ``n`` ignition sites in proportion to an ignition density surface and
+    write one footprint shapefile per site — FSim's ignition-density-grid step.
+
+    Parameters
+    ----------
+    density : dict
+        Output of :func:`ignition_density_surface` (burnable-masked, normalized).
+    n : int
+        Sites to draw, without replacement, with probability ∝ density.
+    out_dir : str or Path
+        Destination directory for ``{prefix}_000.shp`` …
+    seed : int, optional
+    footprint_acres : float or None
+        Day-1 perimeter area; see :func:`footprint_radius_m`.
+    prefix : str
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        One row per ignition: ``ign_id, density, w_i, footprint_ac, path``,
+        polygon geometry in the LCP CRS. Because sites are drawn ∝ density the
+        design weights ``w_i`` are uniform (``1/n``).
+    """
+    rng = np.random.default_rng(seed)
+    p = np.asarray(density["density"], dtype="float64")
+    cand, rows, cols = _points_from_mask(p > 0, density["transform"], density["crs"])
+    if len(cand) < n:
+        raise ValueError(f"Only {len(cand)} cells carry ignition density; asked for {n}")
+    w = p[rows, cols]
+    pick = rng.choice(len(cand), size=int(n), replace=False, p=w / w.sum())
+    pts = cand.iloc[pick].reset_index(drop=True)
+    pts["ign_id"] = np.arange(len(pts))
+    pts["density"] = w[pick]
+    pts["w_i"] = 1.0 / len(pts)
+    res_m = float(min(abs(density["transform"].a), abs(density["transform"].e)))
+    foot = build_ignition_footprints(pts, acres=footprint_acres, lcp_res_m=res_m)
+    foot["path"] = [str(fp) for fp in write_ignition_shapefiles(foot, out_dir, prefix=prefix, id_col="ign_id")]
+    print(f"  [sample_density_ignitions] {len(foot)} site(s) drawn ∝ density "
+          f"({foot['footprint_ac'].iloc[0]:.2f} ac each) → {Path(out_dir)}")
+    return foot
+
+
 # ── Ager's uniform-ignition assumption (P2.2) ──────────────────────────────────
 
 def check_ignition_clustering(

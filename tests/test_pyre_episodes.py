@@ -87,10 +87,8 @@ def test_frame_units_match_engine(rtma_df):
     assert set(arrs) == set(ep.WEATHER_CUBES) and all(a.dtype == np.float32 for a in arrs.values())
 
 
-def test_constant_wind_fallback_and_gap_raise(rtma_df):
+def test_missing_wind_and_gap_raise(rtma_df):
     row = {"start_date": "2018-07-02", "end_date": "2018-07-03"}
-    f = ep.episode_hourly_frame(row, rtma_df.drop(columns=["u_ms", "v_ms", "ws_ms"]), wind=(40.0, 270.0))
-    assert f.attrs["wind_source"] == "constant" and (f.wd_from_deg == 270).all()
     with pytest.raises(ValueError, match="lacks"):
         ep.episode_hourly_frame(row, rtma_df.drop(columns=["u_ms"]))
     gappy = rtma_df.drop(rtma_df.index[50:60])      # inside the window
@@ -107,6 +105,17 @@ def test_weather_from_scenario_units():
 
 
 # ── seeds and the CRN contract ───────────────────────────────────────────────
+
+def test_pad_bands_gives_one_spare_hour():
+    """The engine reads band ``stop_time // 60`` on its last step: that must be a real band."""
+    w = {"temperature": np.arange(10, dtype="float32"), "wind_speed_10m": np.ones((10, 2, 3), "float32")}
+    out = pyre.pad_bands(w, duration_h=8)
+    assert out["temperature"].shape == (9,) and out["wind_speed_10m"].shape == (9, 2, 3)   # ceil(8) + 1
+    assert out["temperature"].tolist() == list(range(9))                                    # trimmed, not repeated
+    short = pyre.pad_bands({"temperature": np.arange(3, dtype="float32")}, duration_h=4.5)
+    assert short["temperature"].tolist() == [0, 1, 2, 2, 2, 2]                              # ceil(4.5) + 1, last repeated
+    assert all(a.dtype == np.float32 for a in out.values())
+
 
 def test_seed_is_arm_independent_and_key_sensitive():
     s = pyre.seed_for(617327, "ign_000", "ep_000", "central")
@@ -150,7 +159,7 @@ def _write_run(run_dir, toa, meta):
     for k, a in layers.items():
         with rasterio.open(run_dir / f"{k}.tif", "w", **prof) as dst:
             dst.write(a.astype("float32"), 1)
-    (run_dir / "manifest.json").write_text(json.dumps({**meta, "seed": 7, "spot_config": None}))
+    (run_dir / "manifest.json").write_text(json.dumps({**meta, "seed": 7, "spot_config": None, "duration_h": 48.0}))
 
 
 def test_aggregate_and_paired_deltas(tmp_path):
@@ -162,13 +171,21 @@ def test_aggregate_and_paired_deltas(tmp_path):
     _write_run(tmp_path / "a", toa_a, {**key, "arm": "a"})
     _write_run(tmp_path / "b", toa_b, {**key, "arm": "b"})
 
-    paths = po.aggregate_realizations([tmp_path / "a", tmp_path / "b"], tmp_path / "agg", verbose=False)
-    with rasterio.open(paths["BurnProb"]) as s:
-        bp = s.read(1)
-    with rasterio.open(paths["AvgTime"]) as s:
-        at = s.read(1)
+    paths = po.aggregate_realizations([tmp_path / "a", tmp_path / "b"], tmp_path / "agg",
+                                      day_marks=(1, 2, 21), verbose=False)
+    rd = lambda k: rasterio.open(paths[k]).read(1)                  # noqa: E731
+    bp, at = rd("BurnProb"), rd("AvgTime")
     assert bp[0, 0] == 1.0 and bp[3, 0] == 0.0
     assert at[0, 0] == pytest.approx(1.5) and np.isnan(at[3, 0])   # days, NaN outside
+    # arrival probability: row 0 reached on day 1 in a, day 2 in b; row 1 day 1 in both
+    assert rd("ArrivalProb_d1")[0, 0] == 0.5 and rd("ArrivalProb_d1")[1, 0] == 1.0
+    assert rd("ArrivalProb_d2")[0, 0] == 1.0 and rd("ArrivalProb_d2")[3, 0] == 0.0
+    assert "ArrivalProb_d21" not in paths                           # past the 2-day runs
+    # expected firebrands: 5e-11 * 60 * I / R * cell area, averaged over realizations
+    fb = rd("Firebrands")
+    assert fb[0, 0] == pytest.approx(5e-11 * 60 * 100.0 / 5.0 * 100.0, rel=1e-5) and fb[3, 0] == 0.0
+    assert set(paths) == {"BurnProb", "AvgFlameLength", "AvgTime", "n_burned", "ArrivalProb_d1",
+                          "ArrivalProb_d2", "Firebrands"}
 
     res = pd.DataFrame({"out_dir": [tmp_path / "a", tmp_path / "b"], "status": ["ok", "ok"]})
     summ = po.summarize_runs(res, day_marks=(1, 2))

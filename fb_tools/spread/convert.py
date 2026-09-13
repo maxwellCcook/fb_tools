@@ -4,9 +4,9 @@ LCP de-stacking — multi-band LANDFIRE landscape → per-variable engine inputs
 Two consumers, one de-stacker:
 
 pyretechnics
-    ``destack_lcp`` writes the eight rasters ``SpreadInputs`` requires, each in
-    the units pyretechnics documents, so ``build_static_cubes`` (Stage 3) is a
-    read-and-wrap with no arithmetic in it.
+    ``destack_lcp`` writes the eight rasters the engine requires, each in the
+    units pyretechnics documents, so ``models.pyre.load_static_layers`` /
+    ``build_cubes`` are a read-and-wrap with no arithmetic in them.
 
 Cell2Fire
     ``lcp_to_cell2fire`` / ``build_cell2fire_weather`` remain stubs. They are

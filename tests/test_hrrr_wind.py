@@ -25,6 +25,31 @@ def test_uv10_byte_ranges_pick_only_10m_messages():
         hrrr._uv10_byte_ranges(IDX.replace("VGRD:10 m", "VGRD:80 m"))
 
 
+def test_uv_to_speed_dir_units_and_from_convention():
+    ws, wd = hrrr.uv_to_speed_dir([5.0, 0.0, -3.0], [0.0, 5.0, 0.0])
+    assert np.allclose(wd, [270.0, 180.0, 90.0])            # toward east = FROM west
+    assert np.allclose(ws, [5.0, 5.0, 3.0])
+    assert hrrr.uv_to_speed_dir(5.0, 0.0, "km/h")[0] == pytest.approx(18.0)
+    assert hrrr.uv_to_speed_dir(5.0, 0.0, "mph")[0] == pytest.approx(11.1847, rel=1e-4)
+    with pytest.raises(KeyError):
+        hrrr.uv_to_speed_dir(1.0, 1.0, "knots")
+
+
+def test_longest_true_run():
+    assert hrrr.longest_true_run([]) == 0
+    assert hrrr.longest_true_run([False, False]) == 0
+    assert hrrr.longest_true_run([True, True, False, True, True, True, False]) == 3
+    assert hrrr.longest_true_run(np.array([False, True])) == 1
+
+
+def test_default_cache_honours_env(monkeypatch, tmp_path):
+    monkeypatch.delenv("FB_HRRR_CACHE", raising=False)
+    assert hrrr.default_hrrr_cache() == hrrr.Path.home() / "fb_scratch" / "hrrr_cache"
+    monkeypatch.setenv("FB_HRRR_CACHE", str(tmp_path / "c"))
+    assert hrrr.default_hrrr_cache() == tmp_path / "c"
+    assert hrrr.HRRR_ARCHIVE_START.year == 2014 and hrrr.HRRR_RELIABLE_YEAR == 2016
+
+
 def _fake_grid(lon0=-106.2, lat0=38.4, n=12, step=0.03):
     lon, lat = np.meshgrid(lon0 + step * np.arange(n), lat0 + step * np.arange(n))
     return lat, (lon + 360.0) % 360.0        # HRRR stores 0..360

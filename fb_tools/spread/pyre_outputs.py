@@ -5,7 +5,8 @@ Per realization ``run_realization`` writes ``time_of_arrival`` (minutes),
 ``fire_type``, ``spread_rate`` (m/min), ``fireline_intensity`` (kW/m) and
 ``flame_length`` (m), NaN outside the burn. This module turns those into
 per-realization metrics (growth, arrival at zones, firebrand production),
-exactly paired deltas, and the three ensemble rasters ``bp.py`` consumes.
+exactly paired deltas, and the ensemble rasters: burn probability, arrival
+probability by day, mean arrival, mean flame length, expected firebrands.
 Engine-free.
 """
 
@@ -17,9 +18,23 @@ import pandas as pd
 
 DAY_MARKS = (1, 2, 3, 5, 7, 14, 21)
 
-
+#: What one realization writes (``models.pyre`` imports this; the first entry is spread-only).
 REALIZATION_LAYERS = ("time_of_arrival", "fire_type", "spread_rate", "spread_direction",
                       "fireline_intensity", "flame_length")
+
+DEFAULT_FIREBRAND_FLUX = 5e-11        # pyretechnics' ``firebrands_per_unit_heat``
+
+
+def rasterize_mask(geoms, transform, shape, *, all_touched=True):
+    """Boolean mask of the cells touched by ``geoms`` (an iterable of shapely geometries)."""
+    from rasterio.features import rasterize
+    return rasterize(((g, 1) for g in geoms), out_shape=shape, transform=transform,
+                     all_touched=all_touched, dtype="uint8").astype(bool)
+
+
+def _flux(manifest, override=None):
+    """Firebrand flux for a run: explicit override, else its ``spot_config``, else the engine default."""
+    return override or (manifest.get("spot_config") or {}).get("firebrands_per_unit_heat", DEFAULT_FIREBRAND_FLUX)
 
 
 def read_realization(run_dir, layers=REALIZATION_LAYERS):
@@ -44,7 +59,7 @@ def read_realization(run_dir, layers=REALIZATION_LAYERS):
 
 
 def firebrand_production(fireline_intensity, spread_rate, cell_area_m2, *, slope=None,
-                         firebrands_per_unit_heat=5e-11):
+                         firebrands_per_unit_heat=DEFAULT_FIREBRAND_FLUX):
     """
     Expected firebrands produced per cell — pyretechnics'
     ``spot_fire.expected_firebrand_production`` vectorized.
@@ -62,13 +77,7 @@ def firebrand_production(fireline_intensity, spread_rate, cell_area_m2, *, slope
 
 def zone_masks(zones, transform, shape, id_col="zone"):
     """Rasterize zone polygons -> ``{zone_id: bool mask}`` (all_touched)."""
-    from rasterio.features import rasterize
-    masks = {}
-    for zid, sub in zones.groupby(id_col):
-        m = rasterize(((g, 1) for g in sub.geometry), out_shape=shape, transform=transform,
-                      all_touched=True, dtype="uint8").astype(bool)
-        masks[zid] = m
-    return masks
+    return {zid: rasterize_mask(sub.geometry, transform, shape) for zid, sub in zones.groupby(id_col)}
 
 
 def summarize_realization(run_dir, *, zones=None, id_col="zone", day_marks=DAY_MARKS,
@@ -101,7 +110,7 @@ def summarize_realization(run_dir, *, zones=None, id_col="zone", day_marks=DAY_M
     man, toa, ft = r["manifest"], r["time_of_arrival"], r["fire_type"]
     burned = np.isfinite(toa)
     cell_ha = r["res_m"] ** 2 / 1e4
-    flux = firebrands_per_unit_heat or ((man.get("spot_config") or {}).get("firebrands_per_unit_heat", 5e-11))
+    flux = _flux(man, firebrands_per_unit_heat)
     fb = firebrand_production(r["fireline_intensity"], r["spread_rate"], r["res_m"] ** 2,
                               slope=slope, firebrands_per_unit_heat=flux)
 
@@ -153,53 +162,86 @@ def paired_deltas(summary, *, baseline, treated, cols=None):
     return d.reset_index()
 
 
-def aggregate_realizations(run_dirs, out_dir, *, verbose=True):
+def aggregate_realizations(run_dirs, out_dir, *, day_marks=DAY_MARKS, firebrands=True,
+                           firebrands_per_unit_heat=None, verbose=True):
     """
-    Collapse realizations into the rasters ``bp.py`` consumes.
+    Collapse realizations into ensemble rasters, streaming one run at a time.
 
-    Writes ``BurnProb.tif`` (fraction of realizations burned, 0 everywhere
-    unburned), ``AvgFlameLength.tif`` (m, NaN outside), ``AvgTime.tif``
-    (**days**, NaN outside) and ``n_burned.tif``.
+    Parameters
+    ----------
+    run_dirs : iterable of Path
+        Realization directories (``run_batch`` rows with ``status == "ok"``).
+    out_dir : Path
+    day_marks : tuple of int
+        Days ``d`` for which ``ArrivalProb_d{d}.tif`` = fraction of realizations
+        that reached the cell by day ``d``. Marks past the longest run are dropped.
+    firebrands : bool
+        Also write ``Firebrands.tif``: expected firebrands produced per cell,
+        averaged over realizations (:func:`firebrand_production`; 0 where unburned).
+    firebrands_per_unit_heat : float, optional
+        Flux override; default each run's ``spot_config`` value.
 
     Returns
     -------
     dict
-        ``{name: Path}``.
+        ``{name: Path}`` for ``BurnProb`` (fraction burned, 0 unburned),
+        ``AvgFlameLength`` (m, NaN outside), ``AvgTime`` (**days**, NaN outside),
+        ``n_burned``, ``ArrivalProb_d{d}``, ``Firebrands``.
     """
     import rasterio
     run_dirs = [Path(p) for p in run_dirs]
-    n_b = fl_sum = toa_sum = None
-    profile = None
+    if not run_dirs:
+        raise ValueError("aggregate_realizations needs at least one run directory")
+    layers = ["time_of_arrival", "flame_length"] + (["fireline_intensity", "spread_rate"] if firebrands else [])
+    sums = None
+    max_h = 0.0
     for rd in run_dirs:
-        r = read_realization(rd, layers=("time_of_arrival", "flame_length"))
-        b = np.isfinite(r["time_of_arrival"])
-        if n_b is None:
-            n_b = np.zeros(b.shape, dtype="int32")
-            fl_sum = np.zeros(b.shape, dtype="float64")
-            toa_sum = np.zeros(b.shape, dtype="float64")
+        r = read_realization(rd, layers=layers)
+        toa = r["time_of_arrival"]
+        b = np.isfinite(toa)
+        if sums is None:
+            z = lambda dt: np.zeros(b.shape, dtype=dt)          # noqa: E731
+            sums = {"n": z("int32"), "fl": z("float64"), "toa": z("float64"), "fb": z("float64"),
+                    "arr": {d: z("int32") for d in day_marks}}
             profile = dict(driver="GTiff", height=b.shape[0], width=b.shape[1], count=1,
                            crs=r["crs"], transform=r["transform"], compress="deflate")
-        n_b += b
-        fl_sum[b] += r["flame_length"][b]
-        toa_sum[b] += r["time_of_arrival"][b] / 1440.0
+            cell_m2 = r["res_m"] ** 2
+        elif b.shape != sums["n"].shape:
+            raise ValueError(f"{rd} has shape {b.shape}; expected {sums['n'].shape}")
+        sums["n"] += b
+        sums["fl"][b] += r["flame_length"][b]
+        sums["toa"][b] += toa[b] / 1440.0
+        for d, a in sums["arr"].items():
+            a += toa <= d * 1440.0
+        if firebrands:
+            fb = firebrand_production(r["fireline_intensity"], r["spread_rate"], cell_m2,
+                                      firebrands_per_unit_heat=_flux(r["manifest"], firebrands_per_unit_heat))
+            sums["fb"][b] += fb[b]
+        max_h = max(max_h, float(r["manifest"].get("duration_h", np.nanmax(toa) / 60.0 if b.any() else 0.0)))
 
+    n_runs, n_b = len(run_dirs), sums["n"]
     with np.errstate(invalid="ignore", divide="ignore"):
         rasters = {
-            "BurnProb": (n_b / len(run_dirs)).astype("float32"),
-            "AvgFlameLength": np.where(n_b > 0, fl_sum / n_b, np.nan).astype("float32"),
-            "AvgTime": np.where(n_b > 0, toa_sum / n_b, np.nan).astype("float32"),
+            "BurnProb": (n_b / n_runs).astype("float32"),
+            "AvgFlameLength": np.where(n_b > 0, sums["fl"] / n_b, np.nan).astype("float32"),
+            "AvgTime": np.where(n_b > 0, sums["toa"] / n_b, np.nan).astype("float32"),
             "n_burned": n_b,
         }
+    for d, a in sums["arr"].items():
+        if d * 24.0 <= max_h or d == min(day_marks):
+            rasters[f"ArrivalProb_d{d}"] = (a / n_runs).astype("float32")
+    if firebrands:
+        rasters["Firebrands"] = (sums["fb"] / n_runs).astype("float32")
+
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     paths = {}
     for name, a in rasters.items():
         fp = out_dir / f"{name}.tif"
-        prof = {**profile, "dtype": str(a.dtype),
-                "nodata": None if a.dtype.kind == "i" else np.nan}
+        prof = {**profile, "dtype": str(a.dtype), "nodata": None if a.dtype.kind == "i" else np.nan}
         with rasterio.open(fp, "w", **prof) as dst:
             dst.write(a, 1)
         paths[name] = fp
     if verbose:
-        print(f"[aggregate_realizations] {len(run_dirs)} realizations -> {out_dir}")
+        print(f"[aggregate_realizations] {n_runs} realizations -> {out_dir} ({', '.join(rasters)})")
     return paths

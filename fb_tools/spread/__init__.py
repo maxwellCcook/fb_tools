@@ -32,6 +32,8 @@ from .fspro_outputs import (
 )
 from .convert import destack_lcp, PYRE_LAYERS
 from .episodes import (select_episodes, load_rtma_hourly, episode_hourly_frame,
+                       layer_bounds_lonlat, block_factors, episode_wind_cube, write_wind_cube,
+                       load_wind_cube, wind_cube_summary,
                        weather_arrays, write_episode_frames, weather_from_scenario)
 from .pyre_outputs import (read_realization, summarize_realization, summarize_runs,
                            paired_deltas, aggregate_realizations, firebrand_production)
@@ -40,6 +42,8 @@ __all__ = [
     "destack_lcp",
     "PYRE_LAYERS",
     "select_episodes", "load_rtma_hourly", "episode_hourly_frame", "weather_arrays", "weather_from_scenario",
+    "layer_bounds_lonlat", "block_factors", "episode_wind_cube", "write_wind_cube", "load_wind_cube",
+    "wind_cube_summary",
     "write_episode_frames", "read_realization", "summarize_realization", "summarize_runs",
     "paired_deltas", "aggregate_realizations", "firebrand_production",
     "read_daily_acres",

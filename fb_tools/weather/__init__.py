@@ -10,6 +10,8 @@
 
 from .hrrr import (
     fetch_hrrr_winds_at_fires,
+    hrrr_uv10,
+    fetch_hrrr_wind_grid,
     build_wind_cells,
     build_pyrome_wind_cells,
     load_pyrome_wind_cells,
@@ -63,6 +65,8 @@ from .rtma import (
 __all__ = [
     # hrrr
     "fetch_hrrr_winds_at_fires",
+    "hrrr_uv10",
+    "fetch_hrrr_wind_grid",
     "build_wind_cells",
     "build_pyrome_wind_cells",
     "load_pyrome_wind_cells",

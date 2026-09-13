@@ -132,6 +132,19 @@ def select_episodes(pyrome_id, erc_cache_dir, *, severity="p97", n=5, duration_d
     return df
 
 
+def _year_files(directory, prefix, years):
+    """``<prefix>_*_<year>.csv`` and ``<prefix>_*_<year>_<mm>.csv`` under ``directory``, sorted."""
+    directory = Path(directory)
+    years = sorted({int(y) for y in years})
+    files = []
+    for y in years:
+        files += directory.glob(f"{prefix}_*_{y}.csv")
+        files += directory.glob(f"{prefix}_*_{y}_[0-1][0-9].csv")
+    if not files:
+        raise FileNotFoundError(f"No {prefix}_*_<year>[_<mm>].csv for {years} in {directory}")
+    return sorted(set(files))
+
+
 def load_rtma_hourly(rtma_dir, pyrome_id, years, *, wind_dir=None):
     """
     Load the cached hourly RTMA record for one pyrome with dead FM spun up.
@@ -139,12 +152,13 @@ def load_rtma_hourly(rtma_dir, pyrome_id, years, *, wind_dir=None):
     Parameters
     ----------
     rtma_dir : Path
-        Directory of ``rtma_hourly_*_pyromes_<year>.csv``.
+        Directory of ``rtma_hourly_*_<year>.csv`` or ``rtma_hourly_*_<year>_<mm>.csv``
+        (the ``00b`` per-month export). Both spellings load; they may be mixed.
     pyrome_id : int
     years : iterable of int
     wind_dir : Path, optional
-        Directory of ``rtma_wind_*_pyromes_<year>.csv`` (``u_ms, v_ms, ws_ms``)
-        from the wind export in ``00b_RTMA-EMC.ipynb``. Merged on time when given.
+        Directory of ``rtma_wind_*_<year>[_<mm>].csv`` (``u_ms, v_ms, ws_ms``) from
+        the wind export in ``00b_RTMA-EMC.ipynb``. Merged on time when given.
 
     Returns
     -------
@@ -153,22 +167,19 @@ def load_rtma_hourly(rtma_dir, pyrome_id, years, *, wind_dir=None):
         :func:`~fb_tools.weather.rtma.build_rtma_dead_fm`. The lag is run over
         the full record so every episode window is spun up.
     """
-    rtma_dir = Path(rtma_dir)
-    files = [p for y in years for p in sorted(rtma_dir.glob(f"rtma_hourly_*_{y}.csv"))]
-    if not files:
-        raise FileNotFoundError(f"No rtma_hourly_*_<year>.csv for {sorted(years)} in {rtma_dir}")
+    files = _year_files(rtma_dir, "rtma_hourly", years)
     df = load_rtma_csv(files)
     df = df[df["pyrome_id"].astype(int) == int(pyrome_id)].copy()
     df["datetime_utc"] = pd.to_datetime(df["datetime_utc"])
     df = build_rtma_dead_fm(df)
 
     if wind_dir is not None:
-        wfiles = [p for y in years for p in sorted(Path(wind_dir).glob(f"rtma_wind_*_{y}.csv"))]
-        if not wfiles:
-            raise FileNotFoundError(f"No rtma_wind_*_<year>.csv for {sorted(years)} in {wind_dir}")
-        w = pd.concat(pd.read_csv(p) for p in wfiles)
-        w = w[w["pyrome_id"].astype(int) == int(pyrome_id)]
+        parts = [pd.read_csv(p) for p in _year_files(wind_dir, "rtma_wind", years)]
+        w = pd.concat([x for x in parts if len(x)], ignore_index=True)   # header-only months poison dtypes
+        w = w[w["pyrome_id"].astype(int) == int(pyrome_id)].copy()
         w["datetime_utc"] = pd.to_datetime(w["datetime_utc"])
+        w[["u_ms", "v_ms", "ws_ms"]] = w[["u_ms", "v_ms", "ws_ms"]].astype(float)
+        w = w.drop_duplicates("datetime_utc")
         df = df.merge(w[["datetime_utc", "u_ms", "v_ms", "ws_ms"]], on="datetime_utc", how="left")
     return df.sort_values("datetime_utc").reset_index(drop=True)
 
@@ -215,7 +226,7 @@ def episode_hourly_frame(episode, rtma_df, *, wind=None, ignition_hour_local=12,
             raise ValueError(f"rtma_df lacks {missing}; pass wind=(speed_kmh, from_deg) "
                              "or load with wind_dir=")
         cols += ["u_ms", "v_ms", "ws_ms"]
-    src = src[cols]
+    src = src[cols].astype(float)
     gap = src.isna().any(axis=1).astype(int)
     run = gap.groupby((gap != gap.shift()).cumsum()).transform("sum") * gap
     if run.max() > max_gap_h:
@@ -267,9 +278,129 @@ def weather_from_scenario(scenario, *, wind_from_deg, tmp_c=30.0, n_hours=1, her
     return {k: np.full(n_hours, v, dtype="float32") for k, v in vals.items()}
 
 
-def weather_arrays(frame):
-    """Hourly frame -> ``{cube_name: float32 1-D array}`` for :func:`~fb_tools.models.pyre.build_cubes`."""
-    return {cube: frame[col].to_numpy(dtype="float32") for cube, col in WEATHER_CUBES.items()}
+def weather_arrays(frame, wind_cube=None):
+    """
+    Hourly frame -> ``{cube_name: float32 array}`` for :func:`~fb_tools.models.pyre.build_cubes`.
+
+    Parameters
+    ----------
+    frame : pandas.DataFrame
+        From :func:`episode_hourly_frame`.
+    wind_cube : Path or dict, optional
+        A :func:`episode_wind_cube` result (or its ``.npz``). Replaces the
+        frame's 1-D wind with the 3-D ``(n_hours, rows/ky, cols/kx)`` arrays.
+    """
+    out = {cube: frame[col].to_numpy(dtype="float32") for cube, col in WEATHER_CUBES.items()}
+    if wind_cube is not None:
+        wc = load_wind_cube(wind_cube) if isinstance(wind_cube, (str, Path)) else wind_cube
+        for k in WIND_CUBES:
+            a = np.asarray(wc[k], dtype="float32")
+            if a.shape[0] != len(frame):
+                raise ValueError(f"{k} has {a.shape[0]} hours; frame has {len(frame)}")
+            out[k] = a
+    return out
+
+
+# ── Local wind: HRRR 3-D cubes on a coarse block grid ───────────────────────
+
+WIND_CUBES = ("wind_speed_10m", "upwind_direction")
+
+
+def layer_bounds_lonlat(layers_dir, *, margin_km=5.0, n_edge=25):
+    """Lon/lat box ``(min_lon, min_lat, max_lon, max_lat)`` of a ``destack_lcp`` layer set plus a margin."""
+    import rasterio
+    from pyproj import Transformer
+    with rasterio.open(Path(layers_dir) / "slope.tif") as src:
+        b, crs = src.bounds, src.crs
+    m = margin_km * 1000.0
+    xs = np.linspace(b.left - m, b.right + m, n_edge)
+    ys = np.linspace(b.bottom - m, b.top + m, n_edge)
+    ex = np.concatenate([xs, xs, np.full(n_edge, xs[0]), np.full(n_edge, xs[-1])])
+    ey = np.concatenate([np.full(n_edge, ys[0]), np.full(n_edge, ys[-1]), ys, ys])
+    lon, lat = Transformer.from_crs(crs, "EPSG:4326", always_xy=True).transform(ex, ey)
+    return (float(np.min(lon)), float(np.min(lat)), float(np.max(lon)), float(np.max(lat)))
+
+
+def block_factors(shape, target=100):
+    """Largest divisor of each dimension not above ``target`` — a block the engine can repeat exactly."""
+    return tuple(max(k for k in range(1, min(int(n), int(target)) + 1) if n % k == 0) for n in shape)
+
+
+def episode_wind_cube(hrrr, transform, crs, shape, *, block=None, target_block=100):
+    """
+    Nearest-HRRR-cell wind on a coarse block grid aligned to the landscape.
+
+    Parameters
+    ----------
+    hrrr : dict
+        From :func:`~fb_tools.weather.hrrr.fetch_hrrr_wind_grid` (``u, v, lat, lon``).
+    transform, crs : affine.Affine, CRS
+        Landscape grid (from :func:`~fb_tools.models.pyre.load_static_layers`).
+    shape : tuple
+        Landscape ``(rows, cols)``.
+    block : tuple, optional
+        ``(ky, kx)`` cells per block; must divide ``shape``. Default
+        :func:`block_factors` with ``target_block``.
+
+    Returns
+    -------
+    dict
+        ``wind_speed_10m`` km/h and ``upwind_direction`` degrees (met FROM), each
+        float32 ``(n_hours, rows/ky, cols/kx)``; ``block``, ``block_m``, ``source``,
+        ``n_hrrr_cells``.
+    """
+    from pyproj import Transformer
+    from scipy.spatial import cKDTree
+    rows, cols = int(shape[0]), int(shape[1])
+    ky, kx = block or block_factors((rows, cols), target_block)
+    if rows % ky or cols % kx:
+        raise ValueError(f"block {ky}x{kx} does not divide the landscape {rows}x{cols}")
+    ny, nx = rows // ky, cols // kx
+    cc, rr = np.meshgrid((np.arange(nx) + 0.5) * kx, (np.arange(ny) + 0.5) * ky)
+    x, y = transform * (cc.ravel(), rr.ravel())
+    hx, hy = Transformer.from_crs("EPSG:4326", crs, always_xy=True).transform(
+        np.asarray(hrrr["lon"]).ravel(), np.asarray(hrrr["lat"]).ravel())
+    _, idx = cKDTree(np.column_stack([hx, hy])).query(np.column_stack([x, y]))
+    n_t = hrrr["u"].shape[0]
+    u = np.asarray(hrrr["u"]).reshape(n_t, -1)[:, idx].reshape(n_t, ny, nx)
+    v = np.asarray(hrrr["v"]).reshape(n_t, -1)[:, idx].reshape(n_t, ny, nx)
+    res = abs(float(transform.a))
+    return {
+        "wind_speed_10m": (np.hypot(u, v) * 3.6).astype("float32"),
+        "upwind_direction": ((np.degrees(np.arctan2(-u, -v)) + 360.0) % 360.0).astype("float32"),
+        "block": (ky, kx), "block_m": (ky * res, kx * res),
+        "source": "hrrr_10m_nearest", "n_hrrr_cells": int(len(np.unique(idx))),
+    }
+
+
+def write_wind_cube(path, cube):
+    """Save an :func:`episode_wind_cube` result as ``.npz`` (readable without cfgrib/netCDF)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, wind_speed_10m=cube["wind_speed_10m"], upwind_direction=cube["upwind_direction"],
+                        block=np.asarray(cube["block"]), block_m=np.asarray(cube["block_m"]),
+                        source=np.asarray(cube["source"]), n_hrrr_cells=np.asarray(cube["n_hrrr_cells"]))
+    return path
+
+
+def load_wind_cube(path):
+    """Inverse of :func:`write_wind_cube`."""
+    with np.load(path) as z:
+        return {"wind_speed_10m": z["wind_speed_10m"], "upwind_direction": z["upwind_direction"],
+                "block": tuple(int(b) for b in z["block"]), "block_m": tuple(float(b) for b in z["block_m"]),
+                "source": str(z["source"]), "n_hrrr_cells": int(z["n_hrrr_cells"])}
+
+
+def wind_cube_summary(cube):
+    """Per-hour domain mean / max speed (km/h) and vector-mean direction of a wind cube, for plots."""
+    ws, wd = cube["wind_speed_10m"], np.radians(cube["upwind_direction"])
+    n_t = ws.shape[0]
+    u = -(ws * np.sin(wd)).reshape(n_t, -1).mean(axis=1)
+    v = -(ws * np.cos(wd)).reshape(n_t, -1).mean(axis=1)
+    return pd.DataFrame({"hour": np.arange(n_t), "ws_mean": ws.reshape(n_t, -1).mean(axis=1),
+                         "ws_p90": np.percentile(ws.reshape(n_t, -1), 90, axis=1),
+                         "ws_max": ws.reshape(n_t, -1).max(axis=1),
+                         "wd_vecmean": (np.degrees(np.arctan2(-u, -v)) + 360.0) % 360.0})
 
 
 def write_episode_frames(episodes, rtma_df, out_dir, **kwargs):

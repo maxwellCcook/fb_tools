@@ -160,8 +160,9 @@ def build_cubes(static, weather, *, foliar_moisture=0.9, adjustments=None):
     static : dict
         From :func:`load_static_layers`.
     weather : dict
-        ``{cube_name: 1-D float32 array}`` of ``n_hours`` bands, from
-        :func:`~fb_tools.spread.episodes.weather_arrays`.
+        ``{cube_name: float32 array}`` from :func:`~fb_tools.spread.episodes.weather_arrays`:
+        1-D ``(n_hours,)`` or 3-D ``(n_hours, rows/ky, cols/kx)`` — the engine repeats a
+        coarse block grid by exact integer factors.
     foliar_moisture : float
         Fraction; constant over the run.
     adjustments : dict, optional
@@ -174,11 +175,14 @@ def build_cubes(static, weather, *, foliar_moisture=0.9, adjustments=None):
         Cubes and the cube shape ``(bands, rows, cols)``.
     """
     from pyretechnics.space_time_cube import SpaceTimeCube
-    bands = {len(v) for v in weather.values()}
+    bands = {int(np.shape(v)[0]) for v in weather.values()}
     if len(bands) != 1:
         raise ValueError(f"weather arrays differ in length: {bands}")
     rows, cols = static["slope"].shape
     shape = (bands.pop(), rows, cols)
+    for k, v in weather.items():                     # the engine does not check this for 3-D bases
+        if np.ndim(v) == 3 and (rows % np.shape(v)[1] or cols % np.shape(v)[2]):
+            raise ValueError(f"{k} block grid {np.shape(v)[1:]} does not divide the landscape {(rows, cols)}")
     cubes = {k: SpaceTimeCube(shape, v) for k, v in static.items()}
     cubes.update({k: SpaceTimeCube(shape, np.asarray(v, dtype="float32")) for k, v in weather.items()})
     cubes["foliar_moisture"] = SpaceTimeCube(shape, np.float32(foliar_moisture))
@@ -315,6 +319,7 @@ def run_realization(layers_dir, weather, ignition, out_dir, *, seed, duration_h,
         "foliar_moisture": foliar_moisture, "layers_dir": str(layers_dir),
         "adjustments": sorted(adjustments) if adjustments else [],
         "ignition_window": [r0, c0, *win.shape], "n_ignition_cells": int((win < 0).sum()),
+        "wind_cube_shape": list(np.shape(weather["wind_speed_10m"])),
         "n_burned": n_burned, "burned_ha": round(n_burned * res * res / 1e4, 2),
         "stop_condition": out["stop_condition"], "stop_time_min": float(out["stop_time"]),
         "pending_spot_cells": int(sum(len(v) for v in pending.values())),
@@ -439,7 +444,7 @@ def spot_ignition_probability(temperature_c, fm1, *, distance_m=0.0, decay_dista
 
 # ── Campaign table and batch ─────────────────────────────────────────────────
 
-def build_runs(arms, ignitions, episodes, conditions, *, base_seed, out_root):
+def build_runs(arms, ignitions, episodes, conditions, *, base_seed, out_root, wind_cubes=None):
     """
     One row per realization: every (ignition, episode, condition) crossed with every arm.
 
@@ -456,13 +461,17 @@ def build_runs(arms, ignitions, episodes, conditions, *, base_seed, out_root):
         extra keys are passed to :func:`run_realization`.
     base_seed : int
     out_root : Path
+    wind_cubes : dict, optional
+        ``{episode_id: wind_cube_npz}`` from :func:`~fb_tools.spread.episodes.write_wind_cube`;
+        episodes without an entry use the frame's 1-D wind.
 
     Returns
     -------
     pandas.DataFrame
         ``arm, ignition_id, episode_id, condition_id, seed, layers_dir,
-        footprint, episode_csv, out_dir`` plus the condition fields as JSON.
+        footprint, episode_csv, wind_cube, out_dir`` plus the condition fields as JSON.
     """
+    wind_cubes = wind_cubes or {}
     rows = []
     for ign, fp in ignitions.items():
         for ep, csv in episodes.items():
@@ -472,7 +481,8 @@ def build_runs(arms, ignitions, episodes, conditions, *, base_seed, out_root):
                     rows.append({
                         "arm": arm, "ignition_id": ign, "episode_id": ep, "condition_id": cid,
                         "seed": seed, "layers_dir": str(ldir), "footprint": str(fp),
-                        "episode_csv": str(csv), "condition_json": json.dumps(cfg),
+                        "episode_csv": str(csv), "wind_cube": str(wind_cubes.get(ep, "")),
+                        "condition_json": json.dumps(cfg),
                         "out_dir": str(Path(out_root) / cid / ign / ep / arm),
                     })
     runs = pd.DataFrame(rows)
@@ -483,8 +493,11 @@ def build_runs(arms, ignitions, episodes, conditions, *, base_seed, out_root):
 def assert_crn_contract(runs, n_arms):
     """Every (condition, ignition, episode) group has one seed, one episode file, and ``n_arms`` rows."""
     g = runs.groupby(["condition_id", "ignition_id", "episode_id"])
-    bad = g.agg(seeds=("seed", "nunique"), eps=("episode_csv", "nunique"), n=("arm", "size"))
-    bad = bad[(bad.seeds != 1) | (bad.eps != 1) | (bad.n != n_arms)]
+    agg = dict(seeds=("seed", "nunique"), eps=("episode_csv", "nunique"), n=("arm", "size"))
+    if "wind_cube" in runs:
+        agg["cubes"] = ("wind_cube", "nunique")
+    bad = g.agg(**agg)
+    bad = bad[(bad.seeds != 1) | (bad.eps != 1) | (bad.n != n_arms) | (bad.get("cubes", 1) != 1)]
     if len(bad):
         raise AssertionError(f"CRN contract violated:\n{bad}")
 
@@ -493,9 +506,11 @@ def _run_row(row):
     from ..spread.episodes import weather_arrays
     cfg = json.loads(row["condition_json"])
     frame = pd.read_csv(row["episode_csv"])
+    cube = row.get("wind_cube") or None
     meta = {k: row[k] for k in ("arm", "ignition_id", "episode_id", "condition_id")}
+    meta["wind_source"] = f"cube:{Path(cube).name}" if cube else "frame"
     try:
-        man = run_realization(row["layers_dir"], weather_arrays(frame), row["ignition"],
+        man = run_realization(row["layers_dir"], weather_arrays(frame, wind_cube=cube), row["ignition"],
                               row["out_dir"], seed=row["seed"], duration_h=row["duration_h"],
                               meta=meta, **cfg)
         return {**meta, "out_dir": row["out_dir"], "status": "ok",

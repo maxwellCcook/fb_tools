@@ -11,8 +11,6 @@ GitHub: https://github.com/maxwellCcook/fb_tools
 ```
 conda env create -f environment.yml && conda activate fb_tools
 pip install -e . --no-deps   # --no-deps is critical: conda manages GDAL/rasterio DLLs
-# Optional (not in conda-forge):
-pip install herbie-data
 ```
 
 ## Package layout (fb_tools/)
@@ -62,7 +60,7 @@ weather/
 - `pathlib.Path` throughout; convert `str → Path` at function boundary
 - Copy-not-mutate: return new objects, never modify inputs in place
 - `print()` for progress; no `logging` module
-- Deferred imports for heavy/optional deps (`osmnx`, `herbie`) so `import fb_tools` never fails
+- Deferred imports for heavy/optional deps (`osmnx`, `pyretechnics`) so `import fb_tools` never fails
 
 ## pyretechnics transmission (branch `pyre-transmission`) — prototype stage
 COSWAP transmission moves from FSPro to `pyretechnics` (pinned 2026.8.10, CFRI build `+cfri1`) for
@@ -76,7 +74,10 @@ what is logged there.
   `run_realization`, `build_runs`, `run_batch`), `spread/episodes.py` (`select_episodes`,
   `load_rtma_hourly`, `episode_hourly_frame`, `weather_arrays`), `spread/pyre_outputs.py`
   (`summarize_realization`, `paired_deltas`, `aggregate_realizations`, `firebrand_production`),
-  `spread/convert.py` (`destack_lcp`). Example: `code/notebooks/01f_PyreBuild.ipynb`.
+  `spread/convert.py` (`destack_lcp`). **Example**: `code/notebooks/01f_PyreBuild.ipynb` burns the
+  `front_range` test AOI (LFPS download in `data/spatial/mod/fuelscapes/front_range/`, 3000×1000 @ 30 m,
+  pyrome 46) end to end in ~1 min. The COSWAP arms/design-fire/paired-Δ work lives in the project folder
+  (`COSWAP/…/fire_behavior/code/05_PyreTransmission.ipynb`), not here.
 - **Units the engine wants** (each unit-tested): wind km/h, temperature °C, direction met FROM,
   moistures as fractions, slope rise/run (LCP `SLPD` degrees → `tan`; never `load_landfire`),
   `time_of_arrival` minutes (`AvgTime.tif` written in days). `ignite_cells` window is −1 inside.
@@ -87,9 +88,14 @@ what is logged there.
 - **Production resolution 30 m** (90 m destroys fuel breaks, 3.8× area). ~250 s per 21-day
   realization with spotting; 0.55 GB per worker.
 - **Spotting is a heavy tail**: report breakout rate + conditional magnitudes, never a mean alone.
-- **Weather**: pyrome-mean RTMA hourly cache (`data/weather/pyrome_emc/RTMA_EMC`) → NFDRS dead FM;
-  wind from the RTMA `UGRD/VGRD` GEE export (`00b_RTMA-EMC.ipynb`, last cells) into
-  `RTMA_WIND/rtma_wind_*_<year>.csv`. Constant-wind placeholder until that export exists.
+- **Weather**: T/RH → NFDRS dead FM from the pyrome-mean RTMA monthly files
+  (`data/weather/pyrome_emc/RTMA_MONTHLY`; not the older `RTMA_EMC`, different fire mask).
+  **Wind is a 3-D HRRR cube per episode** (`weather/hrrr.py::fetch_hrrr_wind_grid`, byte-range from
+  AWS, no herbie; `episodes.episode_wind_cube` → `.npz`; `build_runs(wind_cubes=...)`). Any spatial
+  mean of wind (pyrome or domain) erases the design wind — see the log. Episodes 2016+.
+  `RTMA_WIND_MONTHLY` is the pyrome-mean fallback and the frame's 1-D wind.
+- **Domain**: the 52 km North Cottonwood LCP saturates by day 3–5 under any weather; a wider LCP
+  (~100 km, rows/cols multiples of 100) is pending. Duration is set by `check_domain_adequacy`.
 - **Scratch**: `~/fb_scratch/coswap_pyre` (`$FB_PYRE_SCRATCH`); only ensemble products go to Box.
 - **Diagnostics** (`code/dev/pyre/`): `g0`–`g1c` crown/units checks, `b1`–`b3` benchmark and
   spotting variance, `build_patched_engine.py`, `pyre_source.py` (pure-Python engine for cfunc access).

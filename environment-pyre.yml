@@ -77,6 +77,7 @@ dependencies:
 
   # ── HTTP / I-O ────────────────────────────────────────────────────────────
   - requests>=2.28
+  - cfgrib>=0.9.10           # GRIB2 decode for the HRRR wind cubes (weather/hrrr.py)
 
   # ── Visualization ─────────────────────────────────────────────────────────
   - matplotlib>=3.7
@@ -89,6 +90,6 @@ dependencies:
 
   - pip
 
-# NOTE: osmnx and herbie-data are deliberately absent. fb_tools defers both
+# NOTE: osmnx is deliberately absent. fb_tools defers it
 # imports to call time, so `import fb_tools` succeeds without them; the
-# suppression (osmnx) and HRRR-fetch (herbie) paths are run from `fb_tools`.
+# suppression (osmnx) and HRRR-fetch paths are run from `fb_tools`.

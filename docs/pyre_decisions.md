@@ -101,12 +101,79 @@ in `build_runs` / `run_batch` / `paired_deltas` / `aggregate_realizations`, whic
 single-run outputs. Fire-behavior options (`use_wind_limit`, `surface_lw_ratio_model`,
 `crown_max_lw_ratio`) are explicit kwargs and stamped, with the engine defaults.
 
+**2026-09-12 (later)** — RTMA wind export landed: `data/weather/pyrome_emc/RTMA_WIND_MONTHLY/
+rtma_wind_InterWest_pyromes_<yyyy>_<mm>.csv`, 12 InterWest pyromes, Apr–Oct 2011–2025, one file per
+month. `load_rtma_hourly` now globs both `*_<year>.csv` and `*_<year>_<mm>.csv`. Facts measured on
+pyrome 45:
+- The wind files carry exactly the same missing hours as the T/RH record (both come from the same
+  RTMA images): 2016–2023 and 2025 complete, 2012–2015 and 2024-05 gappy, 2013-09 empty.
+- **Use `RTMA_MONTHLY` (InterWest, fire-masked) with the wind, not `RTMA_EMC` (older CO yearly).**
+  The two disagree on the same hours (2020-08: mean −2.0 °F, up to 3.9 °F / 5.9 % RH) because the
+  monthly export applies the fire mask. EMC differs by < 0.1 pp on average, so dead FM is barely
+  affected; the wind export is only coherent with the monthly record. The FlamMap/FSPro RTMA
+  caches still derive from `RTMA_EMC`.
+- **Pyrome-mean wind is calmer than the design wind.** Fire-hour (13–16 MDT) speed, Jul–Sep 2016+:
+  p50 9.4, p90 14.3, p97 16.7 mph, vs the FlamMap `p97` scenario's 23.1 mph (point-scale, 20 ft).
+  Spatial averaging over the pyrome damps the peaks; direction stays coherent (|mean vector| /
+  mean speed 0.78 at fire hours; 65 % of fire hours from WSW–WNW).
+- Episode pool at 21 days with gaps ≤ 3 h: p97 supports at most 11 non-overlapping episodes,
+  p90 ≥ 20. Five p97 episodes is fine for the prototype.
+
+**2026-09-12 (evening)** — Two decisions with Max, both measured on ep_003 (2020-08-18, pyrome 45):
+
+*Wind: HRRR, local, spatially resolved.* Fire-hour speed over the 504 h episode, mph:
+
+| | p50 | p97 | max |
+|---|---|---|---|
+| RTMA pyrome mean (frame) | 10.2 | 17.0 | 18.8 |
+| HRRR mean over the 52 km domain | 11.7 | 17.7 | 19.3 |
+| HRRR windiest 3 km cell in the domain | 21.0 | 29.4 | 31.9 |
+
+The domain mean is the pyrome mean (ratio 1.06, r = 0.69): changing the *source* buys nothing, any
+spatial *mean* erases the design wind. 139 of 504 hours have a cell above 20 mph; no hour's mean does.
+Local direction differs from the pyrome-mean direction by a median 46° at fire hours (64° all hours).
+So each episode gets a 3-D wind cube: `weather.hrrr.fetch_hrrr_wind_grid` (byte-range GET of the two
+10 m U/V messages from the AWS `.idx`, ~2 MB/h, cached; **no herbie** — its index parser fails on every
+pre-2019 file, and the archive starts 2014-07-30) → `spread.episodes.episode_wind_cube` (nearest HRRR
+cell per block on a block grid that divides the landscape exactly; the engine repeats integer factors,
+and **does not check divisibility for 3-D bases**, so `build_cubes` does) → `.npz` beside the frame →
+`build_runs(wind_cubes=...)`. T/RH → NFDRS FM stay on the RTMA pyrome-mean frame. Episodes are
+restricted to 2016+ (`YEARS` in the notebook). Manifests stamp `wind_source` and `wind_cube_shape`.
+Block for the current 1738×1730 grid is 79×10 cells (2.4 km × 0.3 km) — a re-cut LCP should have
+row and column counts that are multiples of 100 so the block is 3 km square.
+
+*Domain: the 52 km landscape fails on real weather too — Max re-cuts a wider LCP (~100 km).*
+Six realizations (3 design fires × 2 arms, RTMA wind, gate 0.0, central spotting, 21 d) all burned
+31.7–32.4 k ha, reached the domain edge on day 3.4–5.5, and filled 44–45 % of the 72 k ha connected
+fuel patch, which itself touches the edge. The same 32.4 k ha ceiling appears in the constant-wind
+21-day benchmark. Under this geometry area Δ is zero by construction and arrival Δ is noise
+(mean ≈ 0 h, p5/p95 ≈ −13/+17 h); runtime was 65 s per realization because the fire runs out of room.
+Duration is re-decided by `check_domain_adequacy` on the new domain, not fixed at 21 d.
+
+*Provenance:* the FlamMap/FSPro RTMA caches stay on `RTMA_EMC`; the pyre path uses `RTMA_MONTHLY`.
+
+**2026-09-12 (night)** — Housekeeping decided with Max:
+- **herbie is gone.** Its `.idx` parser fails on every pre-2019 HRRR file (an empty forecast field
+  becomes a missing value under pandas' pyarrow string dtype and breaks the join). Both HRRR paths —
+  `fetch_hrrr_winds_at_fires` (fire-point climatology) and `fetch_hrrr_wind_grid` (episode cubes) —
+  now share `hrrr_uv10`: byte-range GET from the AWS index, cfgrib decode, one cache. `cfgrib` is
+  declared in both environment files (installed into `fb_pyre` so the notebook can fetch in-kernel).
+- **Notebook split.** `code/notebooks/01f_PyreBuild.ipynb` is the generic "burn a landscape" example
+  (14 cells: destack → potential map → one episode → HRRR cube → one burn). The COSWAP arms/design
+  fires/paired-Δ work moved to the project folder as `fire_behavior/code/05_PyreTransmission.ipynb`.
+- **Example landscape: the `front_range` test AOI** (`data/spatial/raw/test_aois.gpkg`, ~2,060 km²,
+  pyrome 46) via `lfps_request`. The treatment-effects `LCP_p46_Baseline.tif` was tried first and is
+  89 % nodata (masked to the study's forest types), so no contiguous window exists in it.
+- Scratch: the North Cottonwood RTMA/HRRR pair runs were deleted after being logged above;
+  `layers/`, `episodes/`, `hrrr_cache/` under `~/fb_scratch/coswap_pyre` are kept for the project
+  notebook. The example uses `~/fb_scratch/pyre_example`.
+
 ## Open items
 
 - **Realized spot ignitions are not exposed** by the engine's final matrices; `spot_ignitions` in the
   output is only the pending set at stop time. To attribute cells to embers, step the run in chunks
   (`max_duration`, carrying `spot_ignitions` and `random_generator`) and diff the pending set.
-- Domain adequacy on real episodes (see 2026-09-11).
+- ~~Domain adequacy on real episodes~~ — fails (2026-09-12 evening); waiting on the wider LCP.
 - **Next session**: (a) pause/fork wrapper over `SpreadState.copy()` for spot attribution and mid-run
   treatment forks (note: the RNG is re-seeded per call, so chunked ≠ single-run bitwise, but stays
   deterministic); (b) `suppression.make_sdi_suppression_priority_fn` with `calculate_sdi` output — see the

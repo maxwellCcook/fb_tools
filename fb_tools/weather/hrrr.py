@@ -32,14 +32,14 @@ most bins will be zero — this is expected, not a bug.
 
 HRRR archive coverage: 2016–present (AWS, ``s3://noaa-hrrr-bdp-pds/``).
 Pre-2016 archive has gaps; 2014–2015 data should not be relied upon.
-Access via the ``herbie-data`` library (optional dependency).
+Fetched by HTTP byte range from the AWS HRRR archive (``requests`` + ``cfgrib``; no herbie).
 
 Workflow
 --------
 1. Filter FOD to HRRR coverage period (2016+).
 2. Expand each fire to n_days × fire_hours schedule entries.
 3. Deduplicate to unique (date, UTC-hour) pairs → one download per pair.
-4. For each pair: download HRRR U/V 10m with herbie; extract values at
+4. For each pair: fetch the two HRRR U/V 10 m messages (:func:`hrrr_uv10`); extract values at
    all active fire point locations in one KD-tree lookup.
 5. Group by grouping column → build WindCellValues frequency table + CalmValue.
 
@@ -99,9 +99,9 @@ def _uv_to_ws_wd(
 
 def _extract_uv(ds) -> tuple[np.ndarray, np.ndarray]:
     """
-    Extract U and V 10m wind arrays from a herbie xarray Dataset.
+    Extract U and V 10m wind arrays from a cfgrib xarray Dataset.
 
-    herbie/cfgrib can assign different short names depending on GRIB2
+    cfgrib can assign different short names depending on GRIB2
     parameter encoding; this helper accepts common variants.
 
     Returns
@@ -171,11 +171,9 @@ def fetch_hrrr_winds_at_fires(
     pyrome_col : str
         Column name for pyrome identifier in ``fod_gdf``.
     cache_dir : Path or str, optional
-        Directory for herbie GRIB cache. Strongly recommended to avoid
-        re-downloading on repeat runs (~6 GB for ~900 CO fires).
-        Successfully downloaded GRIB files are reused on subsequent runs;
-        files that failed due to network errors are retried; genuine archive
-        gaps (file missing on AWS) will fail again regardless of caching.
+        GRIB subset cache shared with :func:`hrrr_uv10` (default
+        ``~/fb_scratch/hrrr_cache``; ~2 MB per analysis hour). Cached hours are
+        reused; network failures are retried; genuine archive gaps fail again.
     k_neighbors : int
         Number of nearest HRRR grid points to sample per fire location.
         Default 1 (single nearest point). Use 9 (3×3 neighborhood, ~9×9 km
@@ -192,21 +190,11 @@ def fetch_hrrr_winds_at_fires(
 
     Raises
     ------
-    ImportError
-        If ``herbie-data`` is not installed.
     ValueError
         If no FOD fires fall within the HRRR coverage period.
     RuntimeError
         If no wind records could be extracted (all downloads failed).
     """
-    try:
-        from herbie import Herbie
-    except ImportError as exc:
-        raise ImportError(
-            "herbie-data is required for HRRR wind extraction.\n"
-            "Install with:  pip install herbie-data"
-        ) from exc
-
     if fire_hours_utc is None:
         fire_hours_utc = [19, 20, 21, 22]
 
@@ -244,12 +232,7 @@ def fetch_hrrr_winds_at_fires(
     n_raw = len(fod) * n_days * len(fire_hours_utc)
     print(f"  {n_raw} raw schedule entries → {len(unique_pairs)} unique (date, hour) downloads")
 
-    # ── herbie configuration ───────────────────────────────────────────────────
-    herbie_kwargs: dict = {"model": "hrrr", "fxx": 0, "product": "sfc", "verbose": False}
-    if cache_dir is not None:
-        herbie_kwargs["save_dir"] = Path(cache_dir)
-
-    searchstring = "UGRD:10 m above ground|VGRD:10 m above ground"
+    cache_dir = Path(cache_dir) if cache_dir is not None else Path.home() / "fb_scratch" / "hrrr_cache"
 
     kd_tree = None
     lon_flat = None
@@ -261,8 +244,7 @@ def fetch_hrrr_winds_at_fires(
         dt_str = target_date.strftime("%Y-%m-%d") + f" {utc_hour:02d}:00"
 
         try:
-            H = Herbie(dt_str, **herbie_kwargs)
-            ds = H.xarray(searchstring, remove_grib=False)
+            grid = hrrr_uv10(dt_str, cache_dir)
         except Exception as exc:
             n_skip += 1
             if n_skip <= 10 or n_skip % 50 == 0:
@@ -274,14 +256,14 @@ def fetch_hrrr_winds_at_fires(
 
         # Build KD-tree once (HRRR grid is fixed across all analysis hours)
         if kd_tree is None:
-            hrrr_lats = ds["latitude"].values
-            hrrr_lons = ds["longitude"].values
+            hrrr_lats = grid["lat"]
+            hrrr_lons = grid["lon"]
             kd_tree, lon_flat = _build_kd_tree(hrrr_lats, hrrr_lons)
             lat_flat = hrrr_lats.ravel()
             print(f"  HRRR grid shape: {hrrr_lats.shape} ({hrrr_lats.size:,} grid points)")
 
         # Extract U and V; lookup fire points
-        u_grid, v_grid = _extract_uv(ds)
+        u_grid, v_grid = grid["u"], grid["v"]
         u_flat = u_grid.ravel()
         v_flat = v_grid.ravel()
 
@@ -329,7 +311,7 @@ def fetch_hrrr_winds_at_fires(
 
     if not records:
         raise RuntimeError(
-            "No HRRR wind records extracted. Check herbie installation, "
+            "No HRRR wind records extracted. Check network access, "
             "HRRR archive availability, and FOD date range."
         )
 
@@ -496,7 +478,7 @@ def build_pyrome_wind_cells(
     fod_gdf : geopandas.GeoDataFrame
         Fire occurrence points. Requires: geometry, ``date_col``, ``pyrome_col``.
     cache_dir : Path or str, optional
-        herbie GRIB cache directory (avoids re-downloading on repeat runs).
+        GRIB subset cache directory (see :func:`hrrr_uv10`).
     speed_breaks : list of float, optional
         Speed bin upper bounds (mph). Default: [5, 10, 15, 20, 25, 30].
     dir_breaks : list of float, optional
@@ -1004,3 +986,168 @@ def build_flammap_wind_data(
         ))
 
     return rows, len(rows)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Episode wind: gridded 10 m U/V over a run domain, fetched by byte range (no herbie)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+HRRR_AWS = "https://noaa-hrrr-bdp-pds.s3.amazonaws.com"
+HRRR_ARCHIVE_START = pd.Timestamp("2014-07-30")
+
+
+def hrrr_url(dt, product: str = "wrfsfcf00") -> str:
+    """AWS URL of one HRRR CONUS GRIB2 file (analysis hour ``dt``, UTC)."""
+    dt = pd.Timestamp(dt)
+    return f"{HRRR_AWS}/hrrr.{dt:%Y%m%d}/conus/hrrr.t{dt:%H}z.{product}.grib2"
+
+
+def _uv10_byte_ranges(idx_text: str) -> list[tuple[int, int | None]]:
+    """``(start, end)`` byte ranges of the UGRD/VGRD 10 m messages in a ``.idx``; ``end`` is None for a last message."""
+    recs = [l.split(":") for l in idx_text.strip().splitlines() if l.strip()]
+    starts = [int(r[1]) for r in recs]
+    out = []
+    for i, r in enumerate(recs):
+        if r[3] in ("UGRD", "VGRD") and r[4] == "10 m above ground":
+            out.append((starts[i], starts[i + 1] - 1 if i + 1 < len(starts) else None))
+    if len(out) != 2:
+        raise ValueError(f"Expected UGRD and VGRD at 10 m in the index; found {len(out)} messages")
+    return out
+
+
+def hrrr_uv10(dt, cache_dir, *, timeout: int = 60) -> dict:
+    """
+    One HRRR analysis hour's 10 m wind on the native grid.
+
+    Parameters
+    ----------
+    dt : datetime-like
+        Analysis hour, UTC.
+    cache_dir : Path
+        Where the two-message GRIB2 subset is kept (``hrrr.<ymd>.t<hh>z.uv10.grib2``).
+
+    Returns
+    -------
+    dict
+        ``u, v`` (m/s, float32), ``lat, lon`` (degrees; ``lon`` as stored, 0–360).
+
+    Raises
+    ------
+    FileNotFoundError
+        The hour is not in the archive.
+    """
+    import requests
+
+    dt = pd.Timestamp(dt)
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    fp = cache_dir / f"hrrr.{dt:%Y%m%d}.t{dt:%H}z.uv10.grib2"
+    if not fp.exists():
+        url = hrrr_url(dt)
+        r = requests.get(url + ".idx", timeout=timeout)
+        if r.status_code in (403, 404):
+            raise FileNotFoundError(f"No HRRR analysis for {dt}: {url}")
+        r.raise_for_status()
+        buf = b""
+        for a, b in _uv10_byte_ranges(r.text):
+            g = requests.get(url, headers={"Range": f"bytes={a}-{'' if b is None else b}"}, timeout=timeout)
+            g.raise_for_status()
+            buf += g.content
+        tmp = fp.with_suffix(".part")
+        tmp.write_bytes(buf)
+        tmp.replace(fp)
+    return _read_uv10_grib(fp)
+
+
+def _read_uv10_grib(fp) -> dict:
+    import xarray as xr
+    ds = xr.open_dataset(fp, engine="cfgrib", backend_kwargs={"indexpath": ""})
+    try:
+        u, v = _extract_uv(ds)
+        return {"u": np.asarray(u, dtype="float32"), "v": np.asarray(v, dtype="float32"),
+                "lat": np.asarray(ds["latitude"].values, dtype="float64"),
+                "lon": np.asarray(ds["longitude"].values, dtype="float64")}
+    finally:
+        ds.close()
+
+
+def _longest_missing_run(flags: np.ndarray) -> int:
+    best = run = 0
+    for f in flags:
+        run = run + 1 if f else 0
+        best = max(best, run)
+    return best
+
+
+def fetch_hrrr_wind_grid(times, bounds_lonlat, cache_dir, *, n_threads: int = 4,
+                         max_gap_h: int = 3, verbose: bool = True) -> dict:
+    """
+    Hourly HRRR 10 m U/V on the native cells covering a lon/lat box.
+
+    Parameters
+    ----------
+    times : DatetimeIndex
+        Hourly UTC analysis times (e.g. an episode frame's ``datetime_utc``).
+    bounds_lonlat : tuple
+        ``(min_lon, min_lat, max_lon, max_lat)``, longitudes in −180..180.
+    cache_dir : Path
+        GRIB subset cache; see :func:`hrrr_uv10`.
+    n_threads : int
+        Concurrent downloads (network-bound; ~2 MB per hour).
+    max_gap_h : int
+        Longest run of missing hours to interpolate linearly; longer raises.
+
+    Returns
+    -------
+    dict
+        ``u, v`` float32 ``(n_hours, ny, nx)`` m/s; ``lat, lon`` ``(ny, nx)`` with
+        ``lon`` in −180..180; ``times``; ``missing`` (list of interpolated hours).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    times = pd.DatetimeIndex(times)
+    if times.min() < HRRR_ARCHIVE_START:
+        raise ValueError(f"HRRR archive starts {HRRR_ARCHIVE_START.date()}; asked for {times.min()}")
+
+    def one(t):
+        try:
+            return t, hrrr_uv10(t, cache_dir)
+        except FileNotFoundError:
+            return t, None
+
+    with ThreadPoolExecutor(max(1, n_threads)) as ex:
+        got = dict(ex.map(one, times))
+    first = next((g for g in got.values() if g is not None), None)
+    if first is None:
+        raise RuntimeError(f"No HRRR hours retrieved for {times[0]}..{times[-1]}")
+
+    lon = ((first["lon"] + 180.0) % 360.0) - 180.0
+    lat = first["lat"]
+    min_lon, min_lat, max_lon, max_lat = bounds_lonlat
+    inside = (lon >= min_lon) & (lon <= max_lon) & (lat >= min_lat) & (lat <= max_lat)
+    if not inside.any():
+        raise ValueError(f"No HRRR cells inside {bounds_lonlat}")
+    rr, cc = np.where(inside)
+    sl = (slice(rr.min(), rr.max() + 1), slice(cc.min(), cc.max() + 1))
+
+    u = np.full((len(times), *lat[sl].shape), np.nan, dtype="float32")
+    v = u.copy()
+    missing = []
+    for i, t in enumerate(times):
+        g = got[t]
+        if g is None:
+            missing.append(t)
+            continue
+        u[i], v[i] = g["u"][sl], g["v"][sl]
+    if missing:
+        flags = np.isin(times, pd.DatetimeIndex(missing))
+        gap = _longest_missing_run(flags)
+        if gap > max_gap_h:
+            raise ValueError(f"HRRR gap of {gap} h in {times[0]}..{times[-1]} (max_gap_h={max_gap_h})")
+        for arr in (u, v):
+            flat = pd.DataFrame(arr.reshape(len(times), -1)).interpolate(limit_direction="both")
+            arr[:] = flat.to_numpy(dtype="float32").reshape(arr.shape)
+    if verbose:
+        print(f"[fetch_hrrr_wind_grid] {len(times)} h, {lat[sl].shape[0]}x{lat[sl].shape[1]} cells, "
+              f"{len(missing)} missing hour(s) interpolated")
+    return {"u": u, "v": v, "lat": lat[sl], "lon": lon[sl], "times": times, "missing": missing}

@@ -227,3 +227,28 @@ def test_gate_reaches_the_spread_model_not_just_burn_cells(patched):
         f"crown fire appeared ({n_crown_open} cells) but area did not grow "
         f"({n_burned_open} vs {n_burned_gated})"
     )
+
+
+# ---------------------------------------------------------------------------
+# engine required: coarse 3-D wind cubes
+# ---------------------------------------------------------------------------
+
+def test_build_cubes_accepts_coarse_3d_wind():
+    """A (t, rows/ky, cols/kx) wind array must be repeated by the engine, not rejected or resampled."""
+    pytest.importorskip("pyretechnics", reason="run in the fb_pyre env")
+    import numpy as np
+    rows, cols, n_t = 20, 30, 4
+    static = {k: np.full((rows, cols), 0.1, "float32") for k in pyre.STATIC_LAYERS}
+    static["fuel_model"] = np.full((rows, cols), 102, "int64")
+    weather = {k: np.full(n_t, 0.05, "float32") for k in
+               ("temperature", "fuel_moisture_dead_1hr", "fuel_moisture_dead_10hr", "fuel_moisture_dead_100hr",
+                "fuel_moisture_live_herbaceous", "fuel_moisture_live_woody")}
+    ws = np.arange(n_t * 2 * 3, dtype="float32").reshape(n_t, 2, 3)
+    weather["wind_speed_10m"] = ws
+    weather["upwind_direction"] = np.full((n_t, 2, 3), 270.0, "float32")
+    cubes, shape = pyre.build_cubes(static, weather)
+    assert shape == (n_t, rows, cols)
+    c = cubes["wind_speed_10m"]
+    assert c.get(0, 0, 0) == ws[0, 0, 0] and c.get(3, 19, 29) == ws[3, 1, 2] and c.get(2, 9, 10) == ws[2, 0, 1]
+    with pytest.raises(ValueError):
+        pyre.build_cubes(static, {**weather, "wind_speed_10m": np.zeros((n_t, 3, 3), "float32")})

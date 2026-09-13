@@ -65,6 +65,7 @@ dependencies:
   - rasterio>=1.3
   - rioxarray>=0.15          # xarray + rasterio bridge; .rio accessor
   - xarray>=2023.6
+  - cfgrib>=0.9.10           # GRIB2 decode for HRRR wind (byte-range fetch in weather/hrrr.py)
   - geocube>=0.4             # rasterize vector → raster (rasterize() in utils)
   - osmnx>=1.9               # OSM road/trail network fetch for SDI inputs
 
@@ -82,11 +83,6 @@ dependencies:
   # ── Dev / quality-of-life ─────────────────────────────────────────────────
   - pip                      # needed for editable install below
 
-  # ── Optional: weather data access ────────────────────────────────────────
-  # herbie-data: HRRR/NOMADS/AWS GRIB access for fire-hour wind climatology.
-  # Not in conda-forge; install separately after environment creation:
-  #   pip install herbie-data
-  # (omitted here to avoid channel conflicts with the geospatial stack)
 
   # ── fb_tools (editable) ───────────────────────────────────────────────────
   # Run `pip install -e .` from the repo root after `conda activate fb_tools`.

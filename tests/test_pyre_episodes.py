@@ -176,3 +176,37 @@ def test_aggregate_and_paired_deltas(tmp_path):
     d = po.paired_deltas(summ, baseline="a", treated="b")
     assert len(d) == 1 and d.d_area_d1_ha.iloc[0] == pytest.approx(-0.04)
     assert d.d_max_toa_h.iloc[0] == pytest.approx(24.0)
+
+
+# ── load_rtma_hourly: yearly and per-month export spellings ─────────────────
+
+def test_load_rtma_hourly_accepts_yearly_and_monthly_files(tmp_path):
+    def rows(start, n, pid=9):
+        idx = pd.date_range(start, periods=n, freq="h")
+        return pd.DataFrame({"pyrome_id": pid, "datetime_utc": idx.strftime("%Y-%m-%d %H:%M:%S"),
+                             "tmp_f": 80.0, "rh_pct": 20.0, "emc_pct": 5.0, "vpd_pa": 2000.0,
+                             "pcp_mm_hr": 0.0})
+    emc, wind = tmp_path / "emc", tmp_path / "wind"
+    emc.mkdir(); wind.mkdir()
+    rows("2018-07-01", 48).to_csv(emc / "rtma_hourly_X_pyromes_2018_07.csv", index=False)
+    rows("2018-08-01", 48).to_csv(emc / "rtma_hourly_X_pyromes_2018_08.csv", index=False)
+    rows("2019-07-01", 48).to_csv(emc / "rtma_hourly_X_pyromes_2019.csv", index=False)
+    rows("2018-07-01", 48, pid=8).to_csv(emc / "rtma_hourly_X_pyromes_2018_09.csv", index=False)
+    for name, start in [("rtma_wind_X_pyromes_2018_07.csv", "2018-07-01"),
+                        ("rtma_wind_X_pyromes_2018_08.csv", "2018-08-01"),
+                        ("rtma_wind_X_pyromes_2019.csv", "2019-07-01")]:
+        r = rows(start, 48)[["pyrome_id", "datetime_utc"]].assign(u_ms=-3.0, v_ms=0.0, ws_ms=4.0)
+        r.to_csv(wind / name, index=False)
+    # a header-only month (a failed GEE task) must not poison the dtypes of the concat
+    (wind / "rtma_wind_X_pyromes_2018_09.csv").write_text("pyrome_id,datetime_utc,u_ms,v_ms,ws_ms\n")
+
+    df = ep.load_rtma_hourly(emc, 9, [2018, 2019], wind_dir=wind)
+    assert all(df[c].dtype.kind == "f" for c in ("u_ms", "v_ms", "ws_ms", "FM1"))
+    assert len(df) == 144 and df["datetime_utc"].is_monotonic_increasing
+    assert {"FM1", "FM10", "FM100", "u_ms", "v_ms", "ws_ms"} <= set(df.columns)
+    assert df["ws_ms"].notna().all() and (df["pyrome_id"].astype(int) == 9).all()
+
+    with pytest.raises(FileNotFoundError):
+        ep.load_rtma_hourly(emc, 9, [2017])
+    with pytest.raises(FileNotFoundError):
+        ep.load_rtma_hourly(emc, 9, [2018], wind_dir=tmp_path)

@@ -30,7 +30,6 @@ pip install -e . --no-deps
 
 **Optional** (not in conda-forge):
 ```bash
-pip install herbie-data   # required for HRRR wind extraction
 ```
 
 **Platform split:** Data prep and weather processing run on macOS. Fire behavior model executables (FlamMap, FSPro, FSim, MTT) are Windows-only — run those on a Windows VM or machine.
@@ -78,7 +77,7 @@ fb_tools/
 
 | Source | Cadence | Variables | Module |
 |--------|---------|-----------|--------|
-| **HRRR** | Hourly (via Herbie) | Wind speed & direction | `weather/hrrr.py` |
+| **HRRR** | Hourly (AWS byte-range) | Wind speed & direction | `weather/hrrr.py` |
 | **GridMET** | Daily (via GEE export) | ERC climatology, ERC classes | `weather/gridmet.py` |
 | **NWS RTMA** | Hourly (via GEE export) | Dead FM (FM1/FM10/FM100), live FM (herb/woody) | `weather/rtma.py` |
 

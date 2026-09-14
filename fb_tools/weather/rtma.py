@@ -117,8 +117,14 @@ def load_rtma_csv(
         missing_cols = [c for c in _REQUIRED_RTMA_COLS if c not in df.columns]
         if missing_cols:
             raise KeyError(f"{f.name}: missing columns {missing_cols}")
+        if len(df) == 0:
+            # A header-only month (an empty GEE export) reads as all-object columns and
+            # would set the dtype of every numeric column in the concat under pandas 3.
+            continue
         frames.append(df[list(_REQUIRED_RTMA_COLS)])
 
+    if not frames:
+        raise ValueError(f"No RTMA rows in {len(files)} file(s): {[f.name for f in files]}")
     out = pd.concat(frames, ignore_index=True)
     out["datetime_utc"] = pd.to_datetime(out["datetime_utc"], utc=True).dt.tz_convert(None)
     # RTMA ACPC01 is masked (not zero-filled) when there is no precipitation,

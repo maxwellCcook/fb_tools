@@ -30,13 +30,14 @@ from .fspro_outputs import (
     read_daily_acres,
     check_domain_adequacy,
 )
-from .convert import destack_lcp, PYRE_LAYERS
+from .convert import destack_lcp, raster_to_layers, PYRE_LAYERS
 from .episodes import (select_episodes, dates_from_fod, dates_from_fast_fires, build_fast_fires_table,
                        FAST_FIRE_GROWTH_HA, FAST_FIRES_CSV, load_rtma_hourly, episode_hourly_frame,
                        layer_bounds_lonlat, block_factors, episode_wind_cube, write_wind_cube,
                        load_wind_cube, wind_cube_summary,
                        weather_arrays, write_episode_frames, weather_from_scenario, episode_weather_report)
 from .pyre_outputs import (read_realization, summarize_realization, summarize_runs, paired_deltas,
+                           suppression_summary, suppression_batch,
                            aggregate_realizations, firebrand_production, REALIZATION_LAYERS, edge_contact)
 from .transmission import (structure_blocks, zone_id_raster, treatment_shadow, realization_transmission,
                            transmission_batch, summarize_blocks, shadow_probability,
@@ -44,13 +45,13 @@ from .transmission import (structure_blocks, zone_id_raster, treatment_shadow, r
                            summarize_lee_profile, near_field_headlines, INTENSITY_EDGES_KW_M, INTENSITY_LABELS)
 
 __all__ = [
-    "destack_lcp",
+    "destack_lcp", "raster_to_layers",
     "PYRE_LAYERS",
     "select_episodes", "load_rtma_hourly", "episode_hourly_frame", "weather_arrays", "weather_from_scenario",
     "layer_bounds_lonlat", "block_factors", "episode_wind_cube", "write_wind_cube", "load_wind_cube",
     "wind_cube_summary",
     "write_episode_frames", "read_realization", "summarize_realization", "summarize_runs",
-    "paired_deltas", "aggregate_realizations", "firebrand_production", "REALIZATION_LAYERS",
+    "paired_deltas", "suppression_summary", "suppression_batch", "aggregate_realizations", "firebrand_production", "REALIZATION_LAYERS",
     "read_daily_acres",
     "check_domain_adequacy",
     "delta_burn_probability",

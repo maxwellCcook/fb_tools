@@ -71,13 +71,13 @@ what is logged there.
 - **Env**: engine runs only in `fb_pyre` (`environment-pyre.yml`; py 3.11 / numpy 1.26). `fb_tools`
   is never downgraded. `import fb_tools` works in both; engine imports are deferred.
 - **Modules**: `models/pyre.py` (version/gate, `build_cubes`, `ignition_matrix`, `seed_for`,
-  `run_realization`, `build_runs`, `run_batch`), `spread/episodes.py` (`select_episodes`,
+  `run_realization` — one call, or stepped with `step_h` and a containment rule via `suppression` (`suppression/containment.py::SectorContainment` = ELMFIRE model 0, reads `layers_dir/sdi.tif`, writes `held_line.tif`; every arm of a stepped experiment must be stepped), `build_runs`, `run_batch`), `spread/episodes.py` (`select_episodes`,
   `load_rtma_hourly`, `episode_hourly_frame`, `weather_arrays`, `episode_weather_report`; `select_episodes` takes a
   pool — climatology days at a severity (default), `dates=` from `dates_from_fod`, `dates_from_fast_fires` (FIRED
   events ≥ 1,620 ha/day; the lookup `fb_tools/data/fast_fires_fired_v2025var.csv` ships with the package, rebuild it with
   `build_fast_fires_table` on a new FIRED release) or a named event — and a
   `rank` — seeded random (default) or top-n by `erc_day1`/`erc_mean`),
-  `spread/pyre_outputs.py` (`summarize_realization`, `paired_deltas`, `aggregate_realizations`,
+  `spread/pyre_outputs.py` (`summarize_realization`, `paired_deltas`, `suppression_summary`/`_batch`, `aggregate_realizations`,
   `firebrand_production`, `edge_contact`), `spread/transmission.py` (`structure_blocks`, `treatment_shadow`,
   `realization_transmission`, `summarize_blocks`, `shadow_probability` — the location product: share of the
   fire reaching each cell that passed through a treatment, MFD-weighted, one triangular solve; and the
@@ -85,14 +85,14 @@ what is logged there.
   (mask zones — `all_touched` polygons a few cells wide leak into their own collar), `lee_profile` /
   `lee_profile_batch` / `summarize_lee_profile` / `near_field_headlines` — paired deltas by distance from
   the treatment, split by the baseline run's shadow; recovery distance, carried delay, hauling-chart classes),
-  `spread/convert.py` (`destack_lcp`), `fuelscape/lcp.py::clip_lcp` (SFA + buffer window, 100-cell
+  `spread/convert.py` (`destack_lcp`, `raster_to_layers` — a statewide raster windowed onto a layers grid), `fuelscape/lcp.py::clip_lcp` (SFA + buffer window, 100-cell
   multiples), `fuelscape/ignitions.py::sample_density_ignitions` (FSim-style sites ∝ FOD density, uniform
   `w_i`). A fire that never leaves its footprint is `stop_condition == "no_spread"`, not an error. **Example**: `code/notebooks/01f_PyreBuild.ipynb` on the
   `front_range` test AOI (LFPS download in `data/spatial/mod/fuelscapes/front_range/`, 3000×1000 @ 30 m,
   pyrome 46): destack → potential map → 3 episodes + HRRR cubes → 30 IDG sites (FOD class ≥ C, 10 km
   kernel; cells drawn ∝ density, never the FOD points) → one burn → 90-run
   ensemble → `BurnProb`, `ArrivalProb_d{d}`, `AvgTime`, `Firebrands`. The COSWAP arms/design-fire/paired-Δ
-  work lives in the project folder (`COSWAP/…/fire_behavior/code/05_PyreTransmission.ipynb`), not here.
+  work lives in the project folder (`COSWAP/…/fire_behavior/code/04_PyreTransmission.ipynb`, a private repo with `scripts/run.sh` for CyVerse), not here.
   Outputs that skip on an existing manifest are named by their inputs so a changed parameter cannot reuse
   a stale product.
 - **Units the engine wants** (each unit-tested): wind km/h, temperature °C, direction met FROM,
@@ -119,8 +119,8 @@ what is logged there.
   `pyre_outputs.REALIZATION_LAYERS` / `rasterize_mask`. Do not re-derive these inline.
 - **Diagnostics** (`code/dev/pyre/`): `g0`–`g1c` crown/units checks, `b1`–`b3` benchmark and
   spotting variance, `build_patched_engine.py`, `pyre_source.py` (pure-Python engine for cfunc access).
-- **Tests**: `test_pyre_destack.py`, `test_pyre_episodes.py`, `test_pyre_transmission.py` (engine-free, run in
-  `fb_tools`); `test_pyre_engine.py`, `test_pyre_runner.py` (need `fb_pyre`).
+- **Tests**: `test_pyre_destack.py`, `test_pyre_episodes.py`, `test_pyre_transmission.py`, `test_raster_to_layers.py` (engine-free, run in
+  `fb_tools`); `test_pyre_engine.py`, `test_pyre_runner.py`, `test_pyre_stepped.py` (need `fb_pyre`).
 
 ## Model CLI invocation
 - **FlamMap**: command file approach via `run_cli()`

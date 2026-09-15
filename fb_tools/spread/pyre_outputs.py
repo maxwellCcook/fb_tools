@@ -146,6 +146,60 @@ def summarize_realization(run_dir, *, zones=None, id_col="zone", day_marks=DAY_M
     return out
 
 
+def suppression_summary(run_dir, changed=None):
+    """
+    What rule S1 did in one stepped run (``run_realization(..., suppression=...)``).
+
+    Parameters
+    ----------
+    run_dir : Path
+    changed : 2-D bool array, optional
+        Cells whose fuels differ between the arms (:func:`~fb_tools.spread.transmission.changed_cells`);
+        gives the share of the held line that lies on treated ground — the anchor statistic.
+
+    Returns
+    -------
+    dict
+        ``held_ha``, ``held_in_changed_ha``, ``held_in_changed_share``, ``containment_target``,
+        ``frozen_sectors``, ``first_hold_h`` (NaN if no line was held), ``target_d{1,3}`` (target at
+        the end of days 1 and 3), ``sdi_known_share`` plus the run keys. Empty except the keys for a
+        run without suppression.
+    """
+    import rasterio
+    run_dir = Path(run_dir)
+    man = json.loads((run_dir / "manifest.json").read_text())
+    out = {k: man.get(k) for k in ("arm", "ignition_id", "episode_id", "condition_id")}
+    if not man.get("suppression"):
+        return out
+    with rasterio.open(run_dir / "held_line.tif") as src:
+        held = src.read(1)
+        cell_ha = abs(src.transform.a) ** 2 / 1e4
+    h = np.isfinite(held)
+    log = pd.DataFrame(man.get("suppression_log") or [])
+    step_h = float(man.get("step_h") or 1.0)
+    first = held[h].min() if h.any() else np.nan
+    out.update({
+        "held_ha": round(float(h.sum() * cell_ha), 3),
+        "held_in_changed_ha": round(float((h & changed).sum() * cell_ha), 3) if changed is not None else np.nan,
+        "held_in_changed_share": round(float((h & changed).sum() / h.sum()), 4) if changed is not None and h.any() else np.nan,
+        "containment_target": man.get("containment_target"),
+        "frozen_sectors": man.get("frozen_sectors"),
+        "first_hold_h": round(float(first * step_h), 2) if h.any() else np.nan,
+        "sdi_known_share": man.get("sdi_known_share"),
+    })
+    for d in (1, 3):
+        at = log[log.hour <= d * 24] if len(log) else log
+        out[f"target_d{d}"] = round(float(at.target.iloc[-1]), 4) if len(at) and "target" in at else np.nan
+        out[f"held_ha_d{d}"] = round(float(np.isfinite(held[(held > 0) & (held * step_h <= d * 24)]).sum() * cell_ha), 3)
+    return out
+
+
+def suppression_batch(results, changed=None):
+    """:func:`suppression_summary` over a ``run_batch`` result (rows with ``status == "ok"``)."""
+    rows = [suppression_summary(r["out_dir"], changed=changed) for _, r in results.iterrows() if r["status"] == "ok"]
+    return pd.DataFrame(rows)
+
+
 def summarize_runs(results, **kwargs):
     """:func:`summarize_realization` over a ``run_batch`` result; skips rows with ``status != "ok"``."""
     rows = [summarize_realization(r["out_dir"], **kwargs)

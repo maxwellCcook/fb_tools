@@ -284,14 +284,15 @@ def seed_for(base_seed, *keys):
 def run_realization(layers_dir, weather, ignition, out_dir, *, seed, duration_h,
                     spot_config=None, crown_gate=None, max_cells_per_timestep=0.4,
                     buffer_width=3, foliar_moisture=0.9, adjustments=None, meta=None,
-                    overwrite=False, **behavior_opts):
+                    overwrite=False, step_h=None, suppression=None, **behavior_opts):
     """
     Run one pyretechnics spread and write its rasters and manifest.
 
     Parameters
     ----------
     layers_dir : Path
-        ``destack_lcp`` output for one arm.
+        ``destack_lcp`` output for one arm. With ``suppression`` it must also hold
+        ``sdi.tif`` (suppression difficulty on the same grid).
     weather : dict
         ``{cube_name: 1-D or 3-D array}`` with at least ``duration_h`` hourly bands;
         padded to one spare band by :func:`pad_bands`.
@@ -312,6 +313,20 @@ def run_realization(layers_dir, weather, ignition, out_dir, *, seed, duration_h,
         Extra manifest fields (arm, ignition_id, ...).
     overwrite : bool
         Re-run even if ``manifest.json`` exists.
+    step_h : float, optional
+        Step the engine in windows of this many hours instead of one call. The
+        embers pending at a step's end are carried into the next; the spotting RNG is
+        re-seeded per step from ``seed`` (``seed_for(seed, step)``), so pairing across
+        arms holds exactly. A stepped run is *not* bitwise the unstepped run — every
+        arm of a stepped experiment, including its no-suppression arm, must be
+        stepped the same way. Required by ``suppression`` (default 1 h there).
+    suppression : dict, optional
+        ``{"rule": "pyre_firelines" | "elmfire0", **params}`` — a containment rule from
+        :mod:`fb_tools.suppression.containment` (the engine's own ``build_firelines``, or
+        rule S1), applied after every step: the frontier cells it holds are set to fuel
+        model 91 for the rest of the run. Writes
+        ``held_line.tif`` (step index at which each cell was first held) and
+        ``suppression_log`` rows into the manifest.
     **behavior_opts
         ``use_wind_limit``, ``surface_lw_ratio_model``, ``crown_max_lw_ratio`` (see ``BEHAVIOR_OPTS``).
 
@@ -322,6 +337,8 @@ def run_realization(layers_dir, weather, ignition, out_dir, *, seed, duration_h,
         manifest is returned without running only if its ``request_hash``
         matches this call — a changed footprint, weather, seed or setting
         under the same ``out_dir`` re-runs rather than returning stale output.
+        ``step_h`` and ``suppression`` enter the hash only when set, so runs made
+        before they existed keep their hash.
     """
     import rasterio
     import pyretechnics.eulerian_level_set as els
@@ -329,17 +346,33 @@ def run_realization(layers_dir, weather, ignition, out_dir, *, seed, duration_h,
     opts = _behavior_opts(behavior_opts)
     out_dir = Path(out_dir)
     man_fp = out_dir / "manifest.json"
+    if suppression is not None and step_h is None:
+        step_h = 1.0
 
     static, transform, crs = load_static_layers(layers_dir)
     weather = pad_bands(weather, duration_h)
     if not isinstance(ignition, tuple):
         ignition = ignition_matrix(ignition, transform, static["slope"].shape)
     (r0, c0), win = ignition
+    sdi = None
+    if suppression is not None:
+        sdi_fp = Path(layers_dir) / "sdi.tif"
+        if not sdi_fp.exists():
+            raise FileNotFoundError(f"suppression needs {sdi_fp} (SDI on the run grid; NaN/nodata where unknown)")
+        with rasterio.open(sdi_fp) as src:
+            sdi = src.read(1).astype("float32")
+            if src.nodata is not None:
+                sdi[sdi == src.nodata] = np.nan
+        if sdi.shape != static["slope"].shape:
+            raise ValueError(f"sdi.tif {sdi.shape} is not on the run grid {static['slope'].shape}")
     req = request_hash(seed=int(seed), duration_h=float(duration_h), layers_dir=str(layers_dir),
                        ignition_origin=[int(r0), int(c0)], ignition_window=win, weather=weather,
                        spot_config=spot_config, crown_gate=crown_gate, max_cells_per_timestep=max_cells_per_timestep,
                        buffer_width=buffer_width, foliar_moisture=foliar_moisture,
-                       adjustments={k: np.asarray(v, dtype="float32") for k, v in (adjustments or {}).items()}, **opts)
+                       adjustments={k: np.asarray(v, dtype="float32") for k, v in (adjustments or {}).items()},
+                       **({"step_h": float(step_h)} if step_h is not None else {}),
+                       **({"suppression": suppression, "sdi": sdi} if suppression is not None else {}),
+                       **opts)
     cached = _cached_manifest(man_fp, req, overwrite)
     if cached is not None:
         return cached
@@ -354,11 +387,23 @@ def run_realization(layers_dir, weather, ignition, out_dir, *, seed, duration_h,
     spot = None if spot_config is None else {**spot_config, "random_seed": int(seed)}
 
     t0 = time.perf_counter()
-    out = els.spread_fire_with_phi_field(
-        cubes, state, max_duration=duration_h * 60.0,
-        max_cells_per_timestep=max_cells_per_timestep, buffer_width=buffer_width,
-        spot_config=spot, **opts,
-    )
+    if step_h is None:
+        out = els.spread_fire_with_phi_field(
+            cubes, state, max_duration=duration_h * 60.0,
+            max_cells_per_timestep=max_cells_per_timestep, buffer_width=buffer_width,
+            spot_config=spot, **opts,
+        )
+        n_steps, held, rule = 1, None, None
+    else:
+        rule = None
+        if suppression is not None:
+            from ..suppression.containment import make_rule
+            rr, cc = np.nonzero(win < 0)
+            rule = make_rule(suppression, sdi, res, (r0 + rr.mean(), c0 + cc.mean()))
+        out, n_steps, held = _spread_stepped(
+            els, cubes, state, duration_min=duration_h * 60.0, step_min=float(step_h) * 60.0,
+            seed=int(seed), spot_config=spot_config, rule=rule,
+            max_cells_per_timestep=max_cells_per_timestep, buffer_width=buffer_width, **opts)
     wall_s = time.perf_counter() - t0
 
     m = out["spread_state"].get_full_matrices()
@@ -369,6 +414,8 @@ def run_realization(layers_dir, weather, ignition, out_dir, *, seed, duration_h,
     stop_condition = "no_spread" if n_burned <= int((win < 0).sum()) else out["stop_condition"]
 
     _write_layers(out_dir, {k: np.asarray(m[k]) for k in OUTPUT_LAYERS}, burned, transform, crs)
+    if held is not None:
+        _write_layers(out_dir, {"held_line": held}, held > 0, transform, crs)
 
     pending = out.get("spot_ignitions") or {}
     manifest = {
@@ -383,11 +430,63 @@ def run_realization(layers_dir, weather, ignition, out_dir, *, seed, duration_h,
         "n_burned": n_burned, "burned_ha": round(n_burned * res * res / 1e4, 2),
         "stop_condition": stop_condition, "stop_time_min": float(out["stop_time"]),
         "pending_spot_cells": int(sum(len(v) for v in pending.values())),
+        "step_h": None if step_h is None else float(step_h), "n_steps": int(n_steps),
+        "suppression": suppression,
         "wall_s": round(wall_s, 1),
         **pyre_version_info(),
     }
+    if rule is not None:
+        manifest.update({
+            "held_cells": int((held > 0).sum()), "held_ha": round(float((held > 0).sum()) * res * res / 1e4, 2),
+            "containment_target": None if np.isnan(rule.target) else rule.target, "frozen_sectors": int(rule.frozen.sum()),
+            "sdi_fill": rule.sdi_fill, "sdi_known_share": round(rule.sdi_known_share, 4),
+            "suppression_log": rule.log,
+        })
     man_fp.write_text(json.dumps(manifest, indent=2, default=str))
     return manifest
+
+
+def _spread_stepped(els, cubes, state, *, duration_min, step_min, seed, spot_config, rule, **engine_kw):
+    """
+    Drive ``spread_fire_with_phi_field`` in windows of ``step_min``.
+
+    Pending embers are carried between windows and the spotting RNG is re-seeded
+    per window with ``seed_for(seed, k)``. After each window ``rule.step`` (if any)
+    names the frontier cells to hold; they are set to fuel model 91 in the live
+    fuel-model cube, which the engine re-reads when it rebuilds its tracked cells
+    at the next window. Stops early when the fire has no tracked cells and no
+    pending embers.
+
+    Returns
+    -------
+    (engine output of the last window, number of windows, held-line raster or None)
+    """
+    fuel = np.asarray(cubes["fuel_model"].data)        # (1, rows, cols) float32 view of the array the engine reads
+    rows, cols = state.get_cube_shape()[1:]
+    burned_prev = np.zeros((rows, cols), dtype=bool)
+    held = np.zeros((rows, cols), dtype="int16") if rule is not None else None
+    pending, t, k, out = {}, 0.0, 0, None
+    while t < duration_min - 0.5:                     # the engine may stop a fraction of a minute short
+        dt = min(step_min, duration_min - t)
+        spot = None if spot_config is None else {**spot_config, "random_seed": seed_for(seed, k)}
+        out = els.spread_fire_with_phi_field(cubes, state, max_duration=dt, spot_ignitions=pending,
+                                             spot_config=spot, **engine_kw)
+        state, k = out["spread_state"], k + 1
+        pending = dict(out.get("spot_ignitions") or {})   # the engine hands back a SortedDict and wants a dict
+        t = float(out["stop_time"])
+        if rule is not None:
+            mats = state.get_full_matrices(["fire_type", "flame_length"])
+            burned = np.asarray(mats["fire_type"]) > 0
+            new_burned = burned & ~burned_prev
+            burned_prev = burned
+            rr, cc = rule.step(hour=t / 60.0, dt_h=dt / 60.0, new_burned=new_burned, frontier=out["frontier_cells"],
+                               fuel=fuel[0], flame_length=np.asarray(mats["flame_length"]))
+            fuel[0, rr, cc] = 91.0
+            first = held[rr, cc] == 0
+            held[rr[first], cc[first]] = k
+        if out["num_tracked_cells"] == 0 and not pending:
+            break
+    return out, k, held
 
 
 def _behavior_opts(kw):

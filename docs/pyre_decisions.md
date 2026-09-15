@@ -369,3 +369,33 @@ dropped with a count. ICS-209-PLUS can feed the same `dates=` interface later.
   suppression. Next: stepped runner (`SpreadState` continue, per-step `seed_for(seed, step)` in every arm,
   pending-spot logging), then the paired 2 × 2 {background, coswap} × {none, suppression} with ELMFIRE's
   area-growth containment (model 0) before direct attack. `fuel_spread_adjustment` vs crown spread is open.
+
+**2026-09-15 (stepped runner + rule S1, Max)** — `run_realization(step_h=, suppression=)`:
+- **Stepping.** `step_h` drives `spread_fire_with_phi_field` in windows; the engine's `spot_ignitions`
+  (a `SortedDict`, handed back as a `dict`) carry over, the spotting RNG is re-seeded per window with
+  `seed_for(seed, k)`, so pairing across arms stays exact (sham Δ = 0, tested). Stepped ≠ unstepped bitwise
+  but indistinguishable in practice: one 7-day Upper Arkansas fire burned 13,726 ha in one call, 13,727 ha at
+  1 h steps (Jaccard 1.000) and 13,728 ha at 3 h; engine time 11.6 → 17.5 → 13.3 s. **Every condition of an
+  experiment is stepped the same way** (the notebook steps all four at 1 h). `step_h`/`suppression` enter
+  `request_hash` only when set, so pre-existing manifests keep answering.
+- **Rule S1** (`fb_tools/suppression/containment.py::SectorContainment`) = ELMFIRE containment model 0: target
+  `dC = 0.01·diurnal·MAX_CONTAINMENT_PER_DAY·(1 − rate_ac_day/AREA_NO_CONTAINMENT_CHANGE)·exp(−B_SDI·SDĪ)·dt/24`,
+  clipped to [0, 1]; the perimeter is split into 36 sectors around the ignition, the slowest sectors are held
+  first, a held sector stays held. Held cells = the engine's unburned frontier cells in held sectors, set to fuel
+  91 in the live `fuel_model` cube (`np.asarray(cube.data)` aliases the base). Held cells leave the engine's
+  frontier, so the rule keeps its own count of them as perimeter — without that it froze every sector within
+  three days. SDI is the package's `SDI97_*.tif` (raw SDI × 100, `sdi_scale` 100; clipped 0–3 like ELMFIRE),
+  read from `layers_dir/sdi.tif` (`spread.convert.raster_to_layers`), NaN filled with the median of the known
+  cells (25.7 % of the UA domain is known; 98.5 % of the pilot fire's burned cells). Written per run:
+  `held_line.tif` (step index), manifest `suppression_log`, `held_ha`, `containment_target`;
+  `pyre_outputs.suppression_summary/_batch` add `held_in_changed_share` (line on treated ground).
+- **What the defaults do at this scale**: the same fire burned 12,974 ha with S1 (−5.5 %, 117 ha of line, all
+  perimeter held by hour 108) and 6,251 ha at 3× `max_containment_per_day` (358 ha of line). Fires growing
+  > 10,000 ac/day drive `dC` negative, so ELMFIRE's model is nearly inert during the run; the notebook exposes
+  `PYRE_CONTAINMENT_PER_DAY` and reports the parameter with every number. Uncalibrated for Colorado; a
+  sensitivity axis like the crown gate, never a containment prediction.
+- **Ember lottery under suppression**: with the accounting bug the held line reshaped the front, the identical
+  ember stream cast differently, and a second 18,177 ha fire started at hour 16 (10 of 3,558 held cells burned,
+  all by embers). Not a level-set leak — but the reason the factorial has a spotting-off column and reports
+  breakout rates. Direct attack (S2, `build_firelines`) is still not started; `fuel_spread_adjustment` vs crown
+  spread still open.

@@ -459,3 +459,44 @@ def build_cell2fire_weather(*args, **kwargs):
         "Cell2Fire weather CSV builder is not yet implemented. "
         "See fb_tools/spread/convert.py for the planned API."
     )
+
+
+def raster_to_layers(src_fp, layers_dir, name, *, dtype="int16", nodata=-9999):
+    """
+    Window-read a statewide raster onto a ``destack_lcp`` grid and write it beside
+    the engine layers as ``layers_dir/<name>.tif``.
+
+    The source must share the layers' CRS and cell lattice (same resolution, origins
+    an integer number of cells apart); it may be larger (typical) or smaller — cells
+    outside it are ``nodata``. Used for the suppression-difficulty surface a stepped
+    run with ``suppression`` needs (``sdi.tif``).
+
+    Returns
+    -------
+    Path
+        The written raster.
+    """
+    import rasterio
+    from rasterio.windows import from_bounds
+    layers_dir = Path(layers_dir)
+    with rasterio.open(layers_dir / "slope.tif") as ref, rasterio.open(src_fp) as src:
+        if src.crs != ref.crs:
+            raise ValueError(f"{src_fp} is in {src.crs}, the layers are in {ref.crs}")
+        if abs(abs(src.transform.a) - abs(ref.transform.a)) > 1e-6:
+            raise ValueError(f"{src_fp} is at {abs(src.transform.a)} m, the layers at {abs(ref.transform.a)} m")
+        dc = (ref.transform.c - src.transform.c) / src.transform.a
+        dr = (ref.transform.f - src.transform.f) / src.transform.e
+        if abs(dc - round(dc)) > 1e-3 or abs(dr - round(dr)) > 1e-3:
+            raise ValueError(f"{src_fp} is not on the layers' cell lattice (offset {dr:.3f} rows, {dc:.3f} cols)")
+        win = from_bounds(*ref.bounds, transform=src.transform)
+        fill = src.nodata if src.nodata is not None else nodata
+        a = src.read(1, window=win, boundless=True, fill_value=fill).astype("float64")
+        if src.nodata is not None:
+            a[a == src.nodata] = nodata
+        a = np.where(np.isfinite(a), a, nodata)
+        profile = ref.profile.copy()
+        profile.update(count=1, dtype=dtype, nodata=nodata, compress="deflate")
+        out = layers_dir / f"{name}.tif"
+        with rasterio.open(out, "w", **profile) as dst:
+            dst.write(a.astype(dtype), 1)
+    return out

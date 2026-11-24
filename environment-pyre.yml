@@ -78,6 +78,7 @@ dependencies:
   # ── HTTP / I-O ────────────────────────────────────────────────────────────
   - requests>=2.28
   - cfgrib>=0.9.10           # GRIB2 decode for the HRRR wind cubes (weather/hrrr.py)
+  - osmnx>=2.0               # OSM roads for containment features (suppression/roads.py; 01f §5b)
 
   # ── Visualization ─────────────────────────────────────────────────────────
   - matplotlib>=3.7
@@ -90,6 +91,6 @@ dependencies:
 
   - pip
 
-# NOTE: osmnx is deliberately absent. fb_tools defers its import to call time,
-# so `import fb_tools` succeeds without it; the suppression (osmnx) path runs
-# from `fb_tools`. HRRR fetches run in either env (cfgrib is in both).
+# NOTE: osmnx was added 2026-10-08 so the notebook's road-corridor treatment
+# (fetch_osm_roads) runs here; fb_tools still defers its import, so `import
+# fb_tools` succeeds without it. HRRR fetches run in either env (cfgrib is in both).

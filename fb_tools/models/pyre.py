@@ -108,6 +108,25 @@ def set_crown_cover_threshold(value):
     cf.set_crown_cover_threshold(float(value))
 
 
+def _resolve_crown_gate(crown_gate):
+    """The gate a run asks for, as a float; raises when it is missing or this build cannot honour it."""
+    if crown_gate is None:
+        raise ValueError(
+            "crown_gate is required: the gate is a process-wide engine setting, so a run that does not "
+            f"state it would inherit the previous run's. Use 0.0 (Van Wagner as published) or "
+            f"{STOCK_CROWN_COVER_THRESHOLD} (stock pyretechnics).")
+    gate = float(crown_gate)
+    if not is_patched_engine() and gate != STOCK_CROWN_COVER_THRESHOLD:
+        set_crown_cover_threshold(gate)                           # raises: stock build, gate fixed at 0.4
+    return gate
+
+
+def _apply_crown_gate(gate):
+    """Set the engine's gate for this run (a stock build is already at the only value it accepts)."""
+    if is_patched_engine():
+        set_crown_cover_threshold(gate)
+
+
 def pyre_version_info(strict=True):
     """Provenance stamp for a manifest: engine, patch, gate, python, numpy, scipy, env."""
     if strict:
@@ -194,8 +213,12 @@ def build_cubes(static, weather, *, foliar_moisture=0.9, adjustments=None):
 
 def pad_bands(weather, duration_h):
     """
-    Trim or extend each weather array to ``ceil(duration_h) + 1`` bands along axis 0,
-    repeating the last hour.
+    Trim each weather array to ``ceil(duration_h) + 1`` bands along axis 0, adding the
+    one spare band by repeating the last hour.
+
+    An array must hold at least ``ceil(duration_h)`` hourly bands, or exactly one
+    (a constant state, repeated for the whole run). Anything in between raises: it
+    would run the remaining hours on the last hour's weather.
 
     The engine indexes cubes at ``stop_time // band_duration`` on its final step,
     which equals the band count when a run ends exactly at ``max_duration`` — one
@@ -208,32 +231,48 @@ def pad_bands(weather, duration_h):
     out = {}
     for k, v in weather.items():
         a = np.asarray(v, dtype="float32")[:n]
+        if 1 < a.shape[0] < n - 1:
+            raise ValueError(f"weather[{k!r}] has {a.shape[0]} hourly bands; a {duration_h} h run needs "
+                             f"at least {n - 1} (or exactly 1 for constant weather)")
         if a.shape[0] < n:
             a = np.concatenate([a, np.repeat(a[-1:], n - a.shape[0], axis=0)])
         out[k] = a
     return out
 
 
-def ignition_matrix(footprint, transform, shape):
+def ignition_matrix(footprint, transform, shape, crs=None):
     """
     Rasterize an ignition footprint once for reuse across arms.
 
     Parameters
     ----------
     footprint : Path or GeoDataFrame
-        Polygon(s); reprojected to the raster CRS if it carries one.
+        Polygon(s).
     transform : affine.Affine
     shape : tuple
         Raster ``(rows, cols)``.
+    crs : CRS, optional
+        The grid's CRS. The footprint is reprojected to it and must carry a CRS of its
+        own. ``None`` rasterizes the coordinates as they are.
 
     Returns
     -------
     tuple, numpy.ndarray
         ``(row0, col0)`` of the window and a float32 window with ``-1.0``
         inside the footprint, ``1.0`` outside — pyretechnics' ``ignite_cells`` convention.
+
+    Raises
+    ------
+    ValueError
+        The footprint has no CRS while ``crs`` is given, or covers no cell of the grid.
     """
     import geopandas as gpd
     gdf = footprint if isinstance(footprint, gpd.GeoDataFrame) else gpd.read_file(footprint)
+    if crs is not None:
+        if gdf.crs is None:
+            raise ValueError("Ignition footprint has no CRS; it cannot be placed on the run grid")
+        if gdf.crs != crs:
+            gdf = gdf.to_crs(crs)
     mask = rasterize_mask(gdf.geometry, transform, shape)
     if not mask.any():
         raise ValueError("Ignition footprint rasterizes to zero cells on this grid")
@@ -281,8 +320,8 @@ def seed_for(base_seed, *keys):
 
 # ── One realization ───────────────────────────────────────────────────────────
 
-def run_realization(layers_dir, weather, ignition, out_dir, *, seed, duration_h,
-                    spot_config=None, crown_gate=None, max_cells_per_timestep=0.4,
+def run_realization(layers_dir, weather, ignition, out_dir, *, seed, duration_h, crown_gate,
+                    spot_config=None, max_cells_per_timestep=0.4,
                     buffer_width=3, foliar_moisture=0.9, adjustments=None, meta=None,
                     overwrite=False, step_h=None, suppression=None, **behavior_opts):
     """
@@ -294,8 +333,9 @@ def run_realization(layers_dir, weather, ignition, out_dir, *, seed, duration_h,
         ``destack_lcp`` output for one arm. With ``suppression`` it must also hold
         ``sdi.tif`` (suppression difficulty on the same grid).
     weather : dict
-        ``{cube_name: 1-D or 3-D array}`` with at least ``duration_h`` hourly bands;
-        padded to one spare band by :func:`pad_bands`.
+        ``{cube_name: 1-D or 3-D array}`` with at least ``duration_h`` hourly bands, or
+        one band for constant weather; :func:`pad_bands` adds the spare band and raises
+        on anything shorter.
     ignition : tuple or Path
         ``((row0, col0), window)`` from :func:`ignition_matrix`, or a footprint path.
     out_dir : Path
@@ -304,8 +344,9 @@ def run_realization(layers_dir, weather, ignition, out_dir, *, seed, duration_h,
     duration_h : float
     spot_config : dict or None
         Spotting parameters (``random_seed`` is set here). ``None`` = off.
-    crown_gate : float or None
-        Crown canopy-cover threshold; ``None`` leaves the engine as is.
+    crown_gate : float
+        Crown canopy-cover threshold, set on the engine for this run. Required: 0.0
+        (Van Wagner as published; CFRI build only) or 0.4 (stock).
     max_cells_per_timestep, buffer_width : solver knobs, stamped into the manifest.
     adjustments : dict, optional
         See :func:`build_cubes`.
@@ -344,6 +385,7 @@ def run_realization(layers_dir, weather, ignition, out_dir, *, seed, duration_h,
     import pyretechnics.eulerian_level_set as els
 
     opts = _behavior_opts(behavior_opts)
+    crown_gate = _resolve_crown_gate(crown_gate)
     out_dir = Path(out_dir)
     man_fp = out_dir / "manifest.json"
     if suppression is not None and step_h is None:
@@ -352,7 +394,7 @@ def run_realization(layers_dir, weather, ignition, out_dir, *, seed, duration_h,
     static, transform, crs = load_static_layers(layers_dir)
     weather = pad_bands(weather, duration_h)
     if not isinstance(ignition, tuple):
-        ignition = ignition_matrix(ignition, transform, static["slope"].shape)
+        ignition = ignition_matrix(ignition, transform, static["slope"].shape, crs)
     (r0, c0), win = ignition
     sdi = None
     if suppression is not None:
@@ -377,8 +419,7 @@ def run_realization(layers_dir, weather, ignition, out_dir, *, seed, duration_h,
     if cached is not None:
         return cached
 
-    if crown_gate is not None:
-        set_crown_cover_threshold(crown_gate)
+    _apply_crown_gate(crown_gate)
     cubes, shape = build_cubes(static, weather, foliar_moisture=foliar_moisture, adjustments=adjustments)
     res = abs(transform.a)
 
@@ -513,7 +554,7 @@ def _write_layers(out_dir, arrays, mask, transform, crs):
 
 # ── Single-run product: potential fire behavior, no spread ───────────────────
 
-def burn_landscape(layers_dir, weather, out_dir, *, t=0, azimuth=None, crown_gate=None,
+def burn_landscape(layers_dir, weather, out_dir, *, crown_gate, t=0, azimuth=None,
                    foliar_moisture=0.9, adjustments=None, meta=None, overwrite=False,
                    **behavior_opts):
     """
@@ -549,6 +590,7 @@ def burn_landscape(layers_dir, weather, out_dir, *, t=0, azimuth=None, crown_gat
     out_dir = Path(out_dir)
     man_fp = out_dir / "manifest.json"
     opts = _behavior_opts(behavior_opts)
+    crown_gate = _resolve_crown_gate(crown_gate)
     weather = {k: np.atleast_1d(np.asarray(v, dtype="float32")) for k, v in weather.items()}
     req = request_hash(product="burn_landscape", layers_dir=str(layers_dir), weather=weather, t=int(t),
                        azimuth=azimuth, crown_gate=crown_gate, foliar_moisture=foliar_moisture,
@@ -556,8 +598,7 @@ def burn_landscape(layers_dir, weather, out_dir, *, t=0, azimuth=None, crown_gat
     cached = _cached_manifest(man_fp, req, overwrite)
     if cached is not None:
         return cached
-    if crown_gate is not None:
-        set_crown_cover_threshold(crown_gate)
+    _apply_crown_gate(crown_gate)
     static, transform, crs = load_static_layers(layers_dir)
     cubes, shape = build_cubes(static, weather, foliar_moisture=foliar_moisture, adjustments=adjustments)
 
@@ -620,8 +661,8 @@ def build_runs(arms, ignitions, episodes, conditions, *, base_seed, out_root, wi
     episodes : dict
         ``{episode_id: hourly_frame_csv}`` from :func:`~fb_tools.spread.episodes.write_episode_frames`.
     conditions : dict
-        ``{condition_id: {"spot_config": dict|None, "crown_gate": float, ...}}``;
-        extra keys are passed to :func:`run_realization`.
+        ``{condition_id: {"crown_gate": float, "spot_config": dict|None, ...}}``;
+        ``crown_gate`` is required, extra keys are passed to :func:`run_realization`.
     base_seed : int
     out_root : Path
     wind_cubes : dict, optional
@@ -635,6 +676,10 @@ def build_runs(arms, ignitions, episodes, conditions, *, base_seed, out_root, wi
         footprint, episode_csv, wind_cube, out_dir`` plus the condition fields as JSON.
     """
     wind_cubes = wind_cubes or {}
+    for cid, cfg in conditions.items():
+        if cfg.get("crown_gate") is None:
+            raise ValueError(f"condition {cid!r}: crown_gate is required (0.0 or {STOCK_CROWN_COVER_THRESHOLD}); "
+                             "every run states its gate")
     rows = []
     for ign, fp in ignitions.items():
         for ep, csv in episodes.items():
@@ -739,8 +784,9 @@ def run_batch(runs, *, duration_h, n_workers=1, verbose=True):
     """
     Run a runs table, serially or in a ``spawn`` pool.
 
-    Ignitions are rasterized once per footprint on the first arm's grid and
-    shared by every row, so pairing cannot be broken by per-arm rasterization.
+    Ignitions are rasterized once per footprint and shared by every row, so
+    pairing cannot be broken by per-arm rasterization. Every ``layers_dir`` in
+    the table must sit on one grid (shape, transform, CRS).
     Rows whose ``manifest.json`` already answers the identical request are
     skipped by :func:`run_realization`; a changed footprint, weather or setting
     under the same ``out_dir`` is re-run. A row whose worker process dies is
@@ -751,12 +797,18 @@ def run_batch(runs, *, duration_h, n_workers=1, verbose=True):
     -------
     pandas.DataFrame
         One row per realization with ``status, burned_ha, wall_s, error``.
+
+    Raises
+    ------
+    ValueError
+        If the arms' layer sets are not on one grid.
     """
-    import rasterio
-    first = runs.iloc[0]
-    with rasterio.open(Path(first["layers_dir"]) / "slope.tif") as src:
-        transform, shape = src.transform, src.shape
-    igns = {fp: ignition_matrix(fp, transform, shape) for fp in runs["footprint"].unique()}
+    from .container import _assert_grid_congruence
+    arms = runs.drop_duplicates("layers_dir")
+    grid = _assert_grid_congruence({f"{a} ({d})": Path(d) / "slope.tif"
+                                    for a, d in zip(arms["arm"], arms["layers_dir"])})
+    transform, shape, crs = grid["transform"], (grid["height"], grid["width"]), grid["crs"]
+    igns = {fp: ignition_matrix(fp, transform, shape, crs) for fp in runs["footprint"].unique()}
     payload = [{**r, "ignition": igns[r["footprint"]], "duration_h": duration_h}
                for r in runs.to_dict("records")]
     n = len(payload)

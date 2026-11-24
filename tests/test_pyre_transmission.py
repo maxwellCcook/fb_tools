@@ -178,3 +178,145 @@ def test_zone_masks_pass_dicts_through():
     m = {"trt": np.zeros((3, 3), int)}
     out = zone_masks(m, None, (3, 3))
     assert list(out) == ["trt"] and out["trt"].dtype == bool and out["trt"].shape == (3, 3)
+
+
+def _shift_origin(fp, dx):
+    """Rewrite a raster's origin dx metres east, keeping its data — a same-shape, different-ground grid."""
+    import rasterio
+    from rasterio.transform import Affine
+    with rasterio.open(fp) as src:
+        a, prof = src.read(1), src.profile
+    prof["transform"] = prof["transform"] * Affine.translation(dx / prof["transform"].a, 0)
+    with rasterio.open(fp, "w", **prof) as dst:
+        dst.write(a, 1)
+
+
+def test_output_functions_reject_runs_on_different_grids(tmp_path):
+    from fb_tools.spread.transmission import realization_transmission, shadow_probability
+    bdir, tdir, trt, key = _synthetic_pair(tmp_path)
+    bands, labels = distance_bands(trt, 30.0, edges=(100, 250, 500, 1000))
+    blocks = np.ones(trt.shape, "int32")
+
+    # same grid: all three run, and the per-run shadow feeds the ensemble
+    summary, _, _ = realization_transmission(bdir, treated=trt, block_ids=blocks)
+    realization_transmission(tdir, treated=trt, block_ids=blocks)
+    assert summary["treated_ha_burned"] > 0
+    with pytest.raises(ValueError, match="one arm"):                               # the shadow is a one-arm product
+        shadow_probability([bdir, tdir], tmp_path / "ens", verbose=False)
+    out = shadow_probability([bdir, tdir], tmp_path / "ens", arm="background", verbose=False)
+    assert set(out) == {"ShadowProb", "ShadowGivenBurn"}
+    import rasterio
+    assert rasterio.open(bdir / "treatment_shadow.tif").tags()["arm"] == "background"
+    from fb_tools.spread.transmission import transmission_batch
+    res = pd.DataFrame({"arm": ["background", "coswap"], "out_dir": [bdir, tdir], "status": "ok"})
+    with pytest.raises(ValueError, match="pass arm="):
+        transmission_batch(res, treated=trt, block_ids=blocks, write_shadow=False)
+    fires, _, _ = transmission_batch(res, arm="background", treated=trt, block_ids=blocks, write_shadow=False)
+    assert fires.arm.tolist() == ["background"]
+
+    with pytest.raises(ValueError, match="treated is not on the same grid"):       # masks are bare arrays: shape only
+        realization_transmission(bdir, treated=trt[:-1], block_ids=blocks, write_shadow=False)
+    with pytest.raises(ValueError, match="bands is not on the same grid"):
+        lee_profile(bdir, tdir, bands=bands[:-1], labels=labels)
+
+    # same shape, shifted half a cell: caught only by the transform
+    for name in ("time_of_arrival", "fireline_intensity", "fire_type", "treatment_shadow"):
+        _shift_origin(tdir / f"{name}.tif", 15.0)
+    with pytest.raises(ValueError, match="not on the same grid: transform"):
+        lee_profile(bdir, tdir, bands=bands, labels=labels)
+    import json
+    (tdir / "manifest.json").write_text(json.dumps({**key, "arm": "background"}))  # same arm, shifted grid
+    with pytest.raises(ValueError, match="not on the same grid: transform"):
+        shadow_probability([bdir, tdir], tmp_path / "ens2", verbose=False)
+
+    # a shadow left over from an earlier grid is not read against new rasters
+    _shift_origin(bdir / "treatment_shadow.tif", 15.0)
+    with pytest.raises(ValueError, match="shadow"):
+        lee_profile(bdir, bdir, bands=bands, labels=labels)
+
+
+def test_shadow_bridges_skipped_cells_but_not_ember_landings():
+    from fb_tools.spread.transmission import ember_descent
+    n, dt = 120, 3.0
+    r, c = np.mgrid[:n, :n]
+    toa = (c * dt).astype("float64")                       # plane front moving east
+    trt = np.zeros((n, n), bool); trt[:, 20:24] = True     # full-height strip: everything east is 1 by construction
+    ign = np.zeros((n, n), bool); ign[:, 0] = True
+    assert treatment_shadow(toa, trt)[:, 24:].min() == 1.0
+    # a skipped cell: burns before all 8 neighbours while fire is 2 cells away (as the engine's raster does)
+    skip = toa.copy(); skip[60, 50] = toa[60, 48] + 0.5
+    old = treatment_shadow(skip, trt, bridge_cells=1)
+    assert old[60, 50] == 0.0 and (old[:, 51:] < 0.5).sum() > 5            # unbridged: zeros trail downstream of it
+    new = treatment_shadow(skip, trt)
+    assert new[:, 24:].min() == pytest.approx(1.0)
+    share, k = ember_descent(skip, ign)
+    assert k == 0 and not share.any()
+    # an ember landing: 8 cells ahead of the front, nothing earlier within 3 cells
+    spot = toa.copy(); spot[60, 50] = toa[60, 42] + 0.5
+    sh = treatment_shadow(spot, trt)
+    assert sh[60, 50] == 0.0 and (sh[:, 51:] < 0.5).any()
+    share, k = ember_descent(spot, ign)
+    assert k == 1 and share[60, 50] == 1.0 and share[:, :42].max() == 0.0
+    both = sh + share                                                       # every cell east of the strip is traced or flagged
+    assert both[:, 24:].min() == pytest.approx(1.0, abs=1e-5)
+    # no ignition mask: the earliest cells are the ignition
+    assert ember_descent(spot)[1] == 1
+
+
+def test_realization_transmission_reports_ember_descent(tmp_path):
+    import rasterio
+    from fb_tools.spread.transmission import realization_transmission
+    n = 80
+    r, c = np.mgrid[:n, :n]
+    toa = np.hypot(r - 40, c - 10) * 3.0
+    toa[40, 60] = toa[40, 52] + 0.5                                         # ember 8 cells ahead on the axis
+    trt = np.zeros((n, n), bool); trt[:, 30:33] = True
+    z = np.zeros((n, n))
+    _write_run(tmp_path / "run", toa, z, z, {"arm": "a", "ignition_window": [39, 9, 3, 3]})
+    s, _, _ = realization_transmission(tmp_path / "run", treated=trt, block_ids=np.ones((n, n), "int32"))
+    assert s["n_ember_starts"] == 1 and 0 < s["ember_descent_ha"] < s["burned_ha"]
+    with rasterio.open(tmp_path / "run" / "ember_descent.tif") as src:
+        assert src.read(1)[40, 60] == 1.0
+
+
+def test_shadow_agreement_scores_the_shadow_against_the_paired_change(tmp_path):
+    from fb_tools.spread.transmission import shadow_agreement
+    bdir, tdir, trt, key = _synthetic_pair(tmp_path)        # the treated arm is 90 min late exactly where the shadow >= 0.5
+    a = shadow_agreement(bdir, tdir, trt, tolerances_min=(0.0, 60.0, 120.0)).set_index("tol_min")
+    assert a.loc[0.0, "recall"] == 1.0 and a.loc[0.0, "precision"] == 1.0 and a.loc[0.0, "auc"] > 0.99
+    assert a.loc[60.0, "n_changed"] == a.loc[0.0, "n_changed"]             # a 90 min delay clears 60 min
+    assert a.loc[120.0, "n_changed"] == 25 and a.loc[120.0, "recall"] == 1.0   # only the 25 cells the treated fire never reached
+    assert a.loc[120.0, "precision"] < 0.01
+    assert a.baseline.iloc[0] == "background" and a.treated.iloc[0] == "coswap"
+    # a shadow on the wrong ground carries no information
+    off = np.zeros(trt.shape, bool); off[10:40, 20:24] = True
+    b = shadow_agreement(bdir, tdir, off, tolerances_min=(0.0,))
+    assert b.recall.iloc[0] < 0.2
+
+
+def test_lead_time_is_clocked_from_the_upstream_treatment(tmp_path):
+    from fb_tools.spread.transmission import realization_transmission, treatment_entry_time
+    H, W, dt = 200, 300, 3.0
+    toa = (np.mgrid[:H, :W][1] * dt).astype("float32")                      # plane front: 3 min per column
+    trt = np.zeros((H, W), bool)
+    trt[:100, 20:24] = True                                                 # north strip reached at 1 h
+    trt[100:, 200:204] = True                                               # south strip reached at 10 h
+    blocks = np.zeros((H, W), "int32"); blocks[30:60, 240:260] = 1; blocks[140:170, 240:260] = 2
+    sh, entry = treatment_entry_time(toa, trt)
+    assert entry[45, 240] == pytest.approx(60.0) and entry[155, 240] == pytest.approx(600.0)
+    assert np.isnan(entry[199, 30]) and sh[199, 30] == 0 and sh[155, 100] < 1e-6   # south half is unshadowed before its strip
+    z = np.zeros((H, W))
+    _write_run(tmp_path / "run", toa, z, z, {"arm": "a"})
+    s, b, _ = realization_transmission(tmp_path / "run", treated=trt, block_ids=blocks, write_shadow=False)
+    b = b.set_index("block_id")
+    assert b.arrival_h.tolist() == pytest.approx([12.0, 12.0])
+    assert b.lead_h.tolist() == pytest.approx([11.0, 2.0])                  # was 11.0 for both
+    assert s["trt_arrival_h"] == pytest.approx(1.0)
+    # a wide unit is clocked from its first arrival, not from where the fire left it
+    wide = np.zeros((H, W), bool); wide[:, 50:150] = True
+    _, e2 = treatment_entry_time(toa, wide)
+    assert e2[100, 200] == pytest.approx(50 * dt)
+    # units given: two strips in one unit share that unit's first arrival
+    ids = np.where(trt, 1, 0).astype("int32")
+    _, e3 = treatment_entry_time(toa, trt, ids)
+    assert e3[155, 240] == pytest.approx(60.0)

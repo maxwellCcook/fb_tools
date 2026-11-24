@@ -112,8 +112,12 @@ def test_pad_bands_gives_one_spare_hour():
     out = pyre.pad_bands(w, duration_h=8)
     assert out["temperature"].shape == (9,) and out["wind_speed_10m"].shape == (9, 2, 3)   # ceil(8) + 1
     assert out["temperature"].tolist() == list(range(9))                                    # trimmed, not repeated
-    short = pyre.pad_bands({"temperature": np.arange(3, dtype="float32")}, duration_h=4.5)
-    assert short["temperature"].tolist() == [0, 1, 2, 2, 2, 2]                              # ceil(4.5) + 1, last repeated
+    exact = pyre.pad_bands({"temperature": np.arange(5, dtype="float32")}, duration_h=4.5)
+    assert exact["temperature"].tolist() == [0, 1, 2, 3, 4, 4]                              # ceil(4.5) + 1, only the spare repeated
+    const = pyre.pad_bands({"temperature": np.full(1, 30, "float32")}, duration_h=4.5)
+    assert const["temperature"].tolist() == [30] * 6                                        # one band = constant weather
+    with pytest.raises(ValueError, match="3 hourly bands"):                                 # never the last hour stretched over a run
+        pyre.pad_bands({"temperature": np.arange(3, dtype="float32")}, duration_h=4.5)
     assert all(a.dtype == np.float32 for a in out.values())
 
 
@@ -171,7 +175,17 @@ def test_aggregate_and_paired_deltas(tmp_path):
     _write_run(tmp_path / "a", toa_a, {**key, "arm": "a"})
     _write_run(tmp_path / "b", toa_b, {**key, "arm": "b"})
 
-    paths = po.aggregate_realizations([tmp_path / "a", tmp_path / "b"], tmp_path / "agg",
+    with pytest.raises(ValueError, match="one arm"):                # arms are never pooled silently
+        po.aggregate_realizations([tmp_path / "a", tmp_path / "b"], tmp_path / "agg", verbose=False)
+    with pytest.raises(ValueError, match="no run in arm"):
+        po.aggregate_realizations([tmp_path / "a", tmp_path / "b"], tmp_path / "agg", arm="z", verbose=False)
+    one = po.aggregate_realizations([tmp_path / "a", tmp_path / "b"], tmp_path / "agg_b", arm="b",
+                                    firebrands=False, verbose=False)
+    assert rasterio.open(one["n_burned"]).read(1).max() == 1        # arm= keeps b only
+    assert rasterio.open(one["AvgTime"]).read(1)[0, 0] == pytest.approx(2.0)
+
+    _write_run(tmp_path / "a2", toa_b, {**key, "arm": "a"})         # same arm, second realization
+    paths = po.aggregate_realizations([tmp_path / "a", tmp_path / "a2"], tmp_path / "agg",
                                       day_marks=(1, 2, 21), verbose=False)
     rd = lambda k: rasterio.open(paths[k]).read(1)                  # noqa: E731
     bp, at = rd("BurnProb"), rd("AvgTime")
@@ -188,7 +202,8 @@ def test_aggregate_and_paired_deltas(tmp_path):
                           "ArrivalProb_d2", "Firebrands"}
 
     res = pd.DataFrame({"out_dir": [tmp_path / "a", tmp_path / "b"], "status": ["ok", "ok"]})
-    summ = po.summarize_runs(res, day_marks=(1, 2))
+    summ = po.summarize_runs(res, day_marks=(1, 2, 21))
+    assert "area_d2_ha" in summ and "area_d21_ha" not in summ       # past the 2-day runs
     assert summ.area_d1_ha.tolist() == pytest.approx([0.08, 0.04])
     d = po.paired_deltas(summ, baseline="a", treated="b")
     assert len(d) == 1 and d.d_area_d1_ha.iloc[0] == pytest.approx(-0.04)
@@ -239,6 +254,11 @@ def test_rank_top_by_erc_and_explicit_dates(erc_cache):
     named = ep.select_episodes(9, cache, severity=None, n=None, duration_days=7, dates=["2015-07-20", "2015-07-22", "2030-01-01"])
     assert len(named) == 1 and named.source.iloc[0] == "dates" and 0 <= named.erc_pct.iloc[0] <= 100   # overlap + out-of-range dropped
     assert named.start_date.iloc[0] == pd.Timestamp("2015-07-20")
+    # a window must end inside the season: Oct 25 + 7 days is the last start, Oct 26 runs past Oct 31
+    late = ep.select_episodes(9, cache, severity=None, n=None, duration_days=7, dates=["2015-10-25", "2015-10-26"])
+    assert late.start_date.tolist() == [pd.Timestamp("2015-10-25")] and late.end_date.iloc[0] <= pd.Timestamp("2015-10-31")
+    with pytest.raises(ValueError, match="No candidate"):
+        ep.select_episodes(9, cache, severity=None, n=None, duration_days=7, dates=["2015-10-26"])
     with pytest.raises(ValueError, match="rank must be"):
         ep.select_episodes(9, cache, rank="hottest")
 
@@ -262,6 +282,24 @@ def test_dates_from_fast_fires_windows_and_area():
     assert len(ep.dates_from_fast_fires(tab, min_growth_ha=500, days_before=0)) == 3
 
 
+def test_ignition_matrix_reprojects_to_the_grid_crs():
+    import geopandas as gpd
+    from shapely.geometry import box
+    transform = from_origin(500_000, 4_400_000, 30, 30)                     # UTM 13N, 100 x 100 cells
+    x0, y0 = transform * (40, 60)
+    utm = gpd.GeoDataFrame(geometry=[box(x0 + 1, y0 - 89, x0 + 89, y0 - 1)], crs="EPSG:32613")
+    want = pyre.ignition_matrix(utm, transform, (100, 100), "EPSG:32613")
+    assert want[0] == (60, 40) and want[1].shape == (3, 3) and (want[1] == -1).all()
+
+    got = pyre.ignition_matrix(utm.to_crs("EPSG:4326"), transform, (100, 100), "EPSG:32613")
+    assert got[0] == want[0] and (got[1] == -1).sum() >= 8                  # same place, to within an edge cell
+
+    with pytest.raises(ValueError, match="no CRS"):
+        pyre.ignition_matrix(utm.set_crs(None, allow_override=True), transform, (100, 100), "EPSG:32613")
+    with pytest.raises(ValueError, match="zero cells"):                     # off the grid: never a silent wrong place
+        pyre.ignition_matrix(utm.set_geometry(utm.translate(xoff=1e6)), transform, (100, 100), "EPSG:32613")
+
+
 def test_build_fast_fires_table_from_fired(tmp_path):
     import pytest as _pt
     fp = ep.Path("/Users/mcc/Library/CloudStorage/Box-Box/MCC/data/wildfire/FIRED/raw/fired_v2025var_usa_lower48_2000-2026_s05_t11_events.gpkg")
@@ -276,3 +314,52 @@ def test_bundled_fast_fires_table_is_present():
     assert ep.FAST_FIRES_CSV.exists()
     pool = ep.dates_from_fast_fires(bbox=(-109.1, 36.9, -102.0, 41.1), days_before=3)     # Colorado, from the bundled table
     assert len(pool) > 20 and (pool.mx_grw_ha >= ep.FAST_FIRE_GROWTH_HA).all()
+
+
+@pytest.mark.parametrize("change", ["origin", "shape", "crs"])
+def test_run_batch_rejects_arms_on_different_grids(tmp_path, change):
+    def slope(name, n=20, x0=500000.0, crs="EPSG:32613"):
+        d = tmp_path / name
+        d.mkdir()
+        with rasterio.open(d / "slope.tif", "w", driver="GTiff", height=n, width=n, count=1, dtype="float32",
+                           transform=from_origin(x0, 4400000.0, 30.0, 30.0), crs=crs) as dst:
+            dst.write(np.zeros((n, n), dtype="float32"), 1)
+        return d
+    other = {"origin": dict(x0=500015.0), "shape": dict(n=21), "crs": dict(crs="EPSG:32612")}[change]
+    runs = pd.DataFrame({"arm": ["untreated", "treated"], "footprint": "ign.shp",
+                         "layers_dir": [slope("untreated"), slope("treated", **other)]})
+    with pytest.raises(ValueError, match="not on a congruent grid"):
+        pyre.run_batch(runs, duration_h=1, verbose=False)
+
+
+def test_aggregate_weights_keep_each_ignitions_share(tmp_path):
+    burn = lambda rows: np.where(np.arange(4)[:, None] < rows, 1440.0, np.nan) * np.ones((4, 4))   # noqa: E731
+    meta = lambda i, e: {"arm": "a", "condition_id": "c", "ignition_id": i, "episode_id": e}       # noqa: E731
+    _write_run(tmp_path / "i1e1", burn(1), meta("i1", "e1"))        # i1 burns row 0 in both episodes
+    _write_run(tmp_path / "i1e2", burn(1), meta("i1", "e2"))
+    _write_run(tmp_path / "i2e1", burn(2), meta("i2", "e1"))        # i2 lost its e2 run; burns rows 0-1
+    dirs = [tmp_path / d for d in ("i1e1", "i1e2", "i2e1")]
+    bp = lambda **kw: rasterio.open(po.aggregate_realizations(                                    # noqa: E731
+        dirs, tmp_path / "agg", firebrands=False, verbose=False, **kw)["BurnProb"]).read(1)
+    assert bp()[1, 0] == pytest.approx(1 / 3)                                    # unweighted: 1 run of 3
+    assert bp(weights={"i1": 0.5, "i2": 0.5})[1, 0] == pytest.approx(0.5)        # i2 keeps its half
+    assert bp(weights={"i1": 3.0, "i2": 1.0})[1, 0] == pytest.approx(0.25)       # normalized
+    assert bp(weights={"i1": 0.5, "i2": 0.5})[0, 0] == pytest.approx(1.0)
+    with pytest.raises(ValueError, match="no run to aggregate"):
+        bp(weights={"i1": 0.4, "i2": 0.4, "i3": 0.2})
+    with pytest.raises(ValueError, match="missing entries"):
+        bp(weights={"i1": 1.0})
+
+
+def test_prune_realizations_keeps_what_is_asked_and_says_what_is_gone(tmp_path):
+    toa = np.full((4, 4), 1440.0, dtype="float32")
+    _write_run(tmp_path / "r", toa, {"arm": "a", "ignition_id": "i", "episode_id": "e", "condition_id": "c"})
+    before = po.summarize_realization(tmp_path / "r", day_marks=(1,))
+    freed = po.prune_realizations([tmp_path / "r", tmp_path / "missing"], verbose=False)
+    assert freed > 0 and sorted(f.name for f in (tmp_path / "r").glob("*.tif")) == ["time_of_arrival.tif"]
+    man = json.loads((tmp_path / "r" / "manifest.json").read_text())
+    assert "flame_length" in man["pruned_layers"] and "time_of_arrival" not in man["pruned_layers"] and man["seed"] == 7
+    assert po.edge_contact([tmp_path / "r"]).burned_ha.iloc[0] == pytest.approx(before["burned_ha"])   # arrival-only readers still work
+    with pytest.raises(FileNotFoundError, match="prune_realizations"):
+        po.summarize_realization(tmp_path / "r")
+    assert po.prune_realizations([tmp_path / "r"], verbose=False) == 0                                  # idempotent

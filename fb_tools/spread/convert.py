@@ -277,7 +277,8 @@ def destack_lcp(lcp_fp, out_dir, *, layers=None, resolution=None, resample="near
         Azimuth written where LANDFIRE's aspect is ``-1`` (flat). Default ``0.0``.
     overwrite : bool
         Overwrite existing outputs (default False — an existing layer is reused
-        and reported, so re-running a campaign setup is cheap).
+        and reported, so re-running a campaign setup is cheap). A reused layer
+        must sit on the grid this call asks for.
     verbose : bool
         Print per-layer progress.
 
@@ -290,7 +291,8 @@ def destack_lcp(lcp_fp, out_dir, *, layers=None, resolution=None, resample="near
     ------
     ValueError
         On a missing band, unresolvable slope units, a converted layer outside
-        its physical range, or an FBFM40 code absent from Scott & Burgan 40.
+        its physical range, an FBFM40 code absent from Scott & Burgan 40, or an
+        existing layer on a different grid when ``overwrite`` is False.
     FileNotFoundError
         If *lcp_fp* does not exist.
 
@@ -356,6 +358,23 @@ def destack_lcp(lcp_fp, out_dir, *, layers=None, resolution=None, resample="near
             dst_transform = from_origin(
                 src.transform.c, src.transform.f, resolution, resolution
             )
+
+        # A reused layer must sit on the target grid; checked before any write.
+        if not overwrite:
+            for layer in selected:
+                out_fp = out_dir / f"{layer}.tif"
+                if not out_fp.exists():
+                    continue
+                with rasterio.open(out_fp) as old:
+                    same = (old.shape == (dst_height, dst_width) and old.crs == src.crs
+                            and np.allclose(np.asarray(old.transform)[:6], np.asarray(dst_transform)[:6],
+                                            rtol=0.0, atol=1e-4))
+                    if not same:
+                        raise ValueError(
+                            f"{out_fp} exists on a different grid ({old.width}x{old.height} @ "
+                            f"{old.transform.a:g}) than this call asks for ({dst_width}x{dst_height} @ "
+                            f"{dst_transform.a:g}). Pass overwrite=True or use a new out_dir."
+                        )
 
         for layer in selected:
             idx, desc = plan[layer]

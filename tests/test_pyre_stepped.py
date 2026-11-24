@@ -18,7 +18,7 @@ pytest.importorskip("pyretechnics", reason="run in the fb_pyre env")
 from fb_tools.models import pyre                                  # noqa: E402
 from fb_tools.spread.pyre_outputs import read_realization         # noqa: E402
 from fb_tools.suppression.containment import SectorContainment, sector_index, ELMFIRE_MODEL0  # noqa: E402
-from tests.test_pyre_runner import layers, weather, ignition, restore_gate, HOURS, N, TRANSFORM, CRS, SPOT  # noqa: E402,F401
+from tests.test_pyre_runner import layers, weather, ignition, restore_gate, HOURS, GATE, N, TRANSFORM, CRS, SPOT  # noqa: E402,F401
 
 SUPP = {"rule": "elmfire0", "max_containment_per_day": 400.0}     # fast so a 8 h toy fire shows it
 
@@ -37,7 +37,7 @@ def sdi_layers(layers, tmp_path_factory):
 
 
 def _run(layers, weather, ignition, out, seed, **kw):
-    kw.setdefault("crown_gate", 0.0 if pyre.is_patched_engine() else None)
+    kw.setdefault("crown_gate", GATE)
     man = pyre.run_realization(layers, weather, ignition, out, seed=seed, duration_h=HOURS,
                                spot_config=SPOT, overwrite=True, **kw)
     return man, read_realization(out)
@@ -79,7 +79,7 @@ def test_legacy_path_hash_and_outputs_unchanged(layers, weather, ignition, tmp_p
     """No step_h/suppression: the request hash has no new keys, so old manifests still answer."""
     man, _ = _run(layers, weather, ignition, tmp_path / "a", seed=5)
     again = pyre.run_realization(layers, weather, ignition, tmp_path / "a", seed=5, duration_h=HOURS,
-                                 spot_config=SPOT, crown_gate=man["crown_gate"] if pyre.is_patched_engine() else None)
+                                 spot_config=SPOT, crown_gate=man["crown_gate"])
     assert again["request_hash"] == man["request_hash"] and again["wall_s"] == man["wall_s"]
     assert man["step_h"] is None and man["n_steps"] == 1 and man["suppression"] is None
 

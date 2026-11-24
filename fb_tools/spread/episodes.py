@@ -84,7 +84,8 @@ def select_episodes(pyrome_id, erc_cache_dir, *, severity="p97", n=5, duration_d
         For ``rank="random"``.
     dates : iterable of date-like, optional
         Explicit start dates. Dates outside the climatology's years or the
-        April–October season are dropped and counted.
+        April–October season, and dates whose window would run past October 31,
+        are dropped and counted.
     rank : {"random", "erc_day1", "erc_mean"}
         Random draw, or highest day-1 / window-mean ERC first.
 
@@ -114,6 +115,8 @@ def select_episodes(pyrome_id, erc_cache_dir, *, severity="p97", n=5, duration_d
             y, d = ts.year, (ts - pd.Timestamp(year=ts.year, month=4, day=1)).days + 1
             if y not in yrs or not 1 <= d <= SEASON_DAYS:
                 dropped["outside the ERC climatology"] = dropped.get("outside the ERC climatology", 0) + 1
+            elif d > last_start:
+                dropped["window runs past the season"] = dropped.get("window runs past the season", 0) + 1
             elif threshold is not None and erc[int(np.where(yrs == y)[0][0]), d - 1] < threshold:
                 dropped[f"below {severity}"] = dropped.get(f"below {severity}", 0) + 1
             else:

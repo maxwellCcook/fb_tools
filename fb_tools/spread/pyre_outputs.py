@@ -37,6 +37,43 @@ def _flux(manifest, override=None):
     return override or (manifest.get("spot_config") or {}).get("firebrands_per_unit_heat", DEFAULT_FIREBRAND_FLUX)
 
 
+def raster_grid(fp):
+    """``{shape, transform, crs}`` of a raster, from its header."""
+    import rasterio
+    with rasterio.open(fp) as src:
+        return {"shape": src.shape, "transform": src.transform, "crs": src.crs}
+
+
+def assert_same_grid(ref, other, label="raster", atol=1e-4):
+    """
+    Raise unless two grids match in shape, transform and CRS.
+
+    Parameters
+    ----------
+    ref, other : dict
+        ``shape``, ``transform``, ``crs`` (:func:`raster_grid` or
+        :func:`read_realization`). A grid with no ``transform`` (a bare array)
+        is checked on shape only.
+    label : str
+        Names ``other`` in the error.
+    atol : float
+        Tolerance on the affine coefficients, CRS units.
+
+    Raises
+    ------
+    ValueError
+    """
+    if tuple(ref["shape"]) != tuple(other["shape"]):
+        raise ValueError(f"{label} is not on the same grid: shape {tuple(other['shape'])} != {tuple(ref['shape'])}")
+    if ref.get("transform") is None or other.get("transform") is None:
+        return
+    a, b = np.asarray(ref["transform"])[:6], np.asarray(other["transform"])[:6]
+    if not np.allclose(a, b, rtol=0.0, atol=atol):
+        raise ValueError(f"{label} is not on the same grid: transform {tuple(np.round(b, 4))} != {tuple(np.round(a, 4))}")
+    if ref.get("crs") is not None and other.get("crs") is not None and ref["crs"] != other["crs"]:
+        raise ValueError(f"{label} is not on the same grid: CRS {other['crs']} != {ref['crs']}")
+
+
 def read_realization(run_dir, layers=REALIZATION_LAYERS):
     """
     Load a realization's rasters and manifest.
@@ -44,18 +81,61 @@ def read_realization(run_dir, layers=REALIZATION_LAYERS):
     Returns
     -------
     dict
-        ``{layer: 2-D float32 array}`` plus ``manifest`` (dict), ``transform``,
-        ``crs`` and ``res_m``.
+        ``{layer: 2-D float32 array}`` plus ``manifest`` (dict), ``shape``,
+        ``transform``, ``crs`` and ``res_m``.
     """
     import rasterio
     run_dir = Path(run_dir)
     out = {"manifest": json.loads((run_dir / "manifest.json").read_text())}
+    gone = [n for n in layers if n in out["manifest"].get("pruned_layers", [])]
+    if gone:
+        raise FileNotFoundError(f"{run_dir}: {gone} removed by prune_realizations; re-run with overwrite=True to restore")
     for name in layers:
         with rasterio.open(run_dir / f"{name}.tif") as src:
             out[name] = src.read(1)
-            out["transform"], out["crs"] = src.transform, src.crs
+            out["shape"], out["transform"], out["crs"] = src.shape, src.transform, src.crs
     out["res_m"] = abs(out["transform"].a)
     return out
+
+
+def prune_realizations(run_dirs, keep=("time_of_arrival",), verbose=True):
+    """
+    Delete realization rasters that are no longer needed, once the summaries
+    and ensemble rasters have been taken from them.
+
+    Parameters
+    ----------
+    run_dirs : iterable of Path
+    keep : tuple of str
+        ``REALIZATION_LAYERS`` to keep. Files that are not realization layers
+        (manifest, treatment shadow) are never touched.
+
+    Returns
+    -------
+    int
+        Bytes freed. Each manifest gains ``pruned_layers``; the run still
+        counts as done for ``run_batch``, and :func:`read_realization` names
+        the fix when a pruned layer is asked for.
+    """
+    freed = n = 0
+    for rd in map(Path, run_dirs):
+        man_fp = rd / "manifest.json"
+        if not man_fp.exists():
+            continue
+        man = json.loads(man_fp.read_text())
+        gone = set(man.get("pruned_layers", []))
+        for name in REALIZATION_LAYERS:
+            fp = rd / f"{name}.tif"
+            if name not in keep and fp.exists():
+                freed += fp.stat().st_size
+                fp.unlink()
+                gone.add(name)
+        man["pruned_layers"] = sorted(gone)
+        man_fp.write_text(json.dumps(man, indent=2, default=str))
+        n += 1
+    if verbose:
+        print(f"[prune_realizations] {n} runs, kept {list(keep)}, freed {freed / 1e6:,.0f} MB")
+    return freed
 
 
 def firebrand_production(fireline_intensity, spread_rate, cell_area_m2, *, slope=None,
@@ -100,7 +180,8 @@ def summarize_realization(run_dir, *, zones=None, id_col="zone", day_marks=DAY_M
         or ``{zone_id: 2-D bool mask}`` on the run grid.
     id_col : str
     day_marks : tuple of int
-        Days at which burned area is read off ``time_of_arrival``.
+        Days at which burned area is read off ``time_of_arrival``. Marks past
+        the run's ``duration_h`` are dropped.
     firebrands_per_unit_heat : float, optional
         Flux for :func:`firebrand_production`; defaults to the run's
         ``spot_config`` value, else pyretechnics' 5e-11.
@@ -132,8 +213,10 @@ def summarize_realization(run_dir, *, zones=None, id_col="zone", day_marks=DAY_M
         "max_toa_h": round(float(np.nanmax(toa) / 60.0), 1),
         "firebrands": float(fb.sum()),
     })
+    max_h = float(man.get("duration_h", np.inf))
     for d in day_marks:
-        out[f"area_d{d}_ha"] = round(float((toa <= d * 1440).sum() * cell_ha), 3)
+        if d * 24.0 <= max_h:
+            out[f"area_d{d}_ha"] = round(float((toa <= d * 1440).sum() * cell_ha), 3)
 
     if zones is not None:
         for zid, m in zone_masks(zones, r["transform"], toa.shape, id_col).items():
@@ -226,16 +309,61 @@ def paired_deltas(summary, *, baseline, treated, cols=None):
     return d.reset_index()
 
 
-def aggregate_realizations(run_dirs, out_dir, *, day_marks=DAY_MARKS, firebrands=True,
+def one_arm(run_dirs, arm=None):
+    """
+    Run directories of a single arm, with their manifests.
+
+    Returns ``(run_dirs, manifests, arm)``. Raises ``ValueError`` if the runs
+    span several arms and ``arm`` is not given, or if no run is in ``arm``.
+    """
+    run_dirs = [Path(p) for p in run_dirs]
+    mans = [json.loads((rd / "manifest.json").read_text()) for rd in run_dirs]
+    arms = sorted({str(m.get("arm")) for m in mans})
+    if arm is not None:
+        keep = [m.get("arm") == arm for m in mans]
+        run_dirs = [rd for rd, k in zip(run_dirs, keep) if k]
+        mans = [m for m, k in zip(mans, keep) if k]
+        if not run_dirs:
+            raise ValueError(f"no run in arm {arm!r}; arms present: {arms}")
+    elif len(arms) > 1:
+        raise ValueError(f"run_dirs hold arms {arms}; an ensemble is one arm — pass arm= or one arm's runs")
+    return run_dirs, mans, arm if arm is not None else (arms[0] if arms else None)
+
+
+def _run_weights(weights, ignition_ids):
+    """Per-run weights from per-ignition ``weights``: each ignition's weight is split over its runs."""
+    n = len(ignition_ids)
+    if weights is None:
+        return np.ones(n, dtype="float64"), float(n)
+    from .bp import _resolve_weights
+    if not isinstance(weights, (dict, pd.Series)):
+        raise TypeError("weights must be a dict or Series keyed by ignition_id")
+    if any(i is None for i in ignition_ids):
+        raise ValueError("weights need an ignition_id in every run's manifest")
+    counts = pd.Series(ignition_ids).value_counts()
+    lost = [k for k, v in dict(weights).items() if v > 0 and k not in counts.index]
+    if lost:
+        raise ValueError(f"weighted ignition(s) with no run to aggregate: {lost[:5]}{' …' if len(lost) > 5 else ''}")
+    w_ign = dict(zip(counts.index, _resolve_weights(weights, len(counts), keys=list(counts.index))))
+    w = np.array([w_ign[i] / counts[i] for i in ignition_ids], dtype="float64")
+    return w, float(w.sum())
+
+
+def aggregate_realizations(run_dirs, out_dir, *, arm=None, weights=None, day_marks=DAY_MARKS, firebrands=True,
                            firebrands_per_unit_heat=None, verbose=True):
     """
-    Collapse realizations into ensemble rasters, streaming one run at a time.
+    Collapse one arm's realizations into ensemble rasters, streaming one run at a time.
 
     Parameters
     ----------
     run_dirs : iterable of Path
         Realization directories (``run_batch`` rows with ``status == "ok"``).
     out_dir : Path
+    arm : str, optional
+        Arm to aggregate. Required when ``run_dirs`` hold more than one arm.
+    weights : dict or pandas.Series, optional
+        ``{ignition_id: w_i}``. Each ignition keeps its weight, split equally
+        over the runs it has; default every run counts equally.
     day_marks : tuple of int
         Days ``d`` for which ``ArrivalProb_d{d}.tif`` = fraction of realizations
         that reached the cell by day ``d``. Marks past the longest run are dropped.
@@ -250,52 +378,62 @@ def aggregate_realizations(run_dirs, out_dir, *, day_marks=DAY_MARKS, firebrands
     dict
         ``{name: Path}`` for ``BurnProb`` (fraction burned, 0 unburned),
         ``AvgFlameLength`` (m, NaN outside), ``AvgTime`` (**days**, NaN outside),
-        ``n_burned``, ``ArrivalProb_d{d}``, ``Firebrands``.
+        ``n_burned`` (count of runs, unweighted), ``ArrivalProb_d{d}``, ``Firebrands``.
+
+    Raises
+    ------
+    ValueError
+        If the runs span several arms and ``arm`` is not given, if no run is in
+        ``arm``, or if a weighted ignition has no run.
     """
     import rasterio
     run_dirs = [Path(p) for p in run_dirs]
     if not run_dirs:
         raise ValueError("aggregate_realizations needs at least one run directory")
+    run_dirs, mans, arm = one_arm(run_dirs, arm)
+    w_run, w_total = _run_weights(weights, [m.get("ignition_id") for m in mans])
     layers = ["time_of_arrival", "flame_length"] + (["fireline_intensity", "spread_rate"] if firebrands else [])
     sums = None
     max_h = 0.0
-    for rd in run_dirs:
+    for rd, w in zip(run_dirs, w_run):
         r = read_realization(rd, layers=layers)
         toa = r["time_of_arrival"]
         b = np.isfinite(toa)
         if sums is None:
             z = lambda dt: np.zeros(b.shape, dtype=dt)          # noqa: E731
-            sums = {"n": z("int32"), "fl": z("float64"), "toa": z("float64"), "fb": z("float64"),
-                    "arr": {d: z("int32") for d in day_marks}}
+            sums = {"n": z("int32"), "w": z("float64"), "fl": z("float64"), "toa": z("float64"), "fb": z("float64"),
+                    "arr": {d: z("float64") for d in day_marks}}
             profile = dict(driver="GTiff", height=b.shape[0], width=b.shape[1], count=1,
                            crs=r["crs"], transform=r["transform"], compress="deflate")
             cell_m2 = r["res_m"] ** 2
-        elif b.shape != sums["n"].shape:
-            raise ValueError(f"{rd} has shape {b.shape}; expected {sums['n'].shape}")
+            ref = r
+        else:
+            assert_same_grid(ref, r, label=str(rd))
         sums["n"] += b
-        sums["fl"][b] += r["flame_length"][b]
-        sums["toa"][b] += toa[b] / 1440.0
+        sums["w"] += w * b
+        sums["fl"][b] += w * r["flame_length"][b]
+        sums["toa"][b] += w * toa[b] / 1440.0
         for d, a in sums["arr"].items():
-            a += toa <= d * 1440.0
+            a += w * (toa <= d * 1440.0)
         if firebrands:
             fb = firebrand_production(r["fireline_intensity"], r["spread_rate"], cell_m2,
                                       firebrands_per_unit_heat=_flux(r["manifest"], firebrands_per_unit_heat))
-            sums["fb"][b] += fb[b]
+            sums["fb"][b] += w * fb[b]
         max_h = max(max_h, float(r["manifest"].get("duration_h", np.nanmax(toa) / 60.0 if b.any() else 0.0)))
 
-    n_runs, n_b = len(run_dirs), sums["n"]
+    n_runs, n_b, w_b = len(run_dirs), sums["n"], sums["w"]
     with np.errstate(invalid="ignore", divide="ignore"):
         rasters = {
-            "BurnProb": (n_b / n_runs).astype("float32"),
-            "AvgFlameLength": np.where(n_b > 0, sums["fl"] / n_b, np.nan).astype("float32"),
-            "AvgTime": np.where(n_b > 0, sums["toa"] / n_b, np.nan).astype("float32"),
+            "BurnProb": (w_b / w_total).astype("float32"),
+            "AvgFlameLength": np.where(w_b > 0, sums["fl"] / w_b, np.nan).astype("float32"),
+            "AvgTime": np.where(w_b > 0, sums["toa"] / w_b, np.nan).astype("float32"),
             "n_burned": n_b,
         }
     for d, a in sums["arr"].items():
         if d * 24.0 <= max_h or d == min(day_marks):
-            rasters[f"ArrivalProb_d{d}"] = (a / n_runs).astype("float32")
+            rasters[f"ArrivalProb_d{d}"] = (a / w_total).astype("float32")
     if firebrands:
-        rasters["Firebrands"] = (sums["fb"] / n_runs).astype("float32")
+        rasters["Firebrands"] = (sums["fb"] / w_total).astype("float32")
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -307,7 +445,8 @@ def aggregate_realizations(run_dirs, out_dir, *, day_marks=DAY_MARKS, firebrands
             dst.write(a, 1)
         paths[name] = fp
     if verbose:
-        print(f"[aggregate_realizations] {n_runs} realizations -> {out_dir} ({', '.join(rasters)})")
+        print(f"[aggregate_realizations] {n_runs} realizations{'' if weights is None else ', weighted'} "
+              f"(arm {arm}) -> {out_dir} ({', '.join(rasters)})")
     return paths
 
 

@@ -1024,6 +1024,22 @@ def _uv10_byte_ranges(idx_text: str) -> list[tuple[int, int | None]]:
     return out
 
 
+def _get_retry(url, *, attempts: int = 4, wait_s: float = 2.0, **kwargs):
+    """``requests.get`` that retries dropped connections, timeouts and 5xx replies with a doubling wait."""
+    import time
+    import requests
+
+    for k in range(attempts):
+        try:
+            r = requests.get(url, **kwargs)
+            if r.status_code < 500 or k == attempts - 1:
+                return r
+        except (requests.ConnectionError, requests.Timeout):
+            if k == attempts - 1:
+                raise
+        time.sleep(wait_s * 2 ** k)
+
+
 def hrrr_uv10(dt, cache_dir=None, *, timeout: int = 60) -> dict:
     """
     One HRRR analysis hour's 10 m wind on the native grid.
@@ -1046,21 +1062,19 @@ def hrrr_uv10(dt, cache_dir=None, *, timeout: int = 60) -> dict:
     FileNotFoundError
         The hour is not in the archive.
     """
-    import requests
-
     dt = pd.Timestamp(dt)
     cache_dir = Path(cache_dir) if cache_dir is not None else default_hrrr_cache()
     cache_dir.mkdir(parents=True, exist_ok=True)
     fp = cache_dir / f"hrrr.{dt:%Y%m%d}.t{dt:%H}z.uv10.grib2"
     if not fp.exists():
         url = hrrr_url(dt)
-        r = requests.get(url + ".idx", timeout=timeout)
+        r = _get_retry(url + ".idx", timeout=timeout)
         if r.status_code in (403, 404):
             raise FileNotFoundError(f"No HRRR analysis for {dt}: {url}")
         r.raise_for_status()
         buf = b""
         for a, b in _uv10_byte_ranges(r.text):
-            g = requests.get(url, headers={"Range": f"bytes={a}-{'' if b is None else b}"}, timeout=timeout)
+            g = _get_retry(url, headers={"Range": f"bytes={a}-{'' if b is None else b}"}, timeout=timeout)
             g.raise_for_status()
             buf += g.content
         tmp = fp.with_suffix(".part")

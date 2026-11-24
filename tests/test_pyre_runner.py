@@ -23,6 +23,7 @@ N, RES = 60, 30.0
 TRANSFORM = from_origin(400000, 4400000, RES, RES)
 CRS = "EPSG:32613"
 HOURS = 8
+GATE = 0.0 if pyre.is_patched_engine() else pyre.STOCK_CROWN_COVER_THRESHOLD   # every run states its gate
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -74,7 +75,7 @@ SPOT = {**pyre.SPOT_CENTRAL, "firebrands_per_unit_heat": 1e-6}
 
 
 def _run(layers, weather, ignition, out, seed, **kw):
-    kw.setdefault("crown_gate", 0.0 if pyre.is_patched_engine() else None)
+    kw.setdefault("crown_gate", GATE)
     pyre.run_realization(layers, weather, ignition, out, seed=seed, duration_h=HOURS,
                          spot_config=SPOT, overwrite=True, **kw)
     return read_realization(out)
@@ -124,7 +125,7 @@ def test_worker_count_is_irrelevant(layers, weather, ignition, tmp_path):
                   "fm_woody": 0.787}).to_csv(ep_csv, index=False)
     sham = tmp_path / "sham"
     shutil.copytree(layers, sham)
-    cond = {"c": {"spot_config": SPOT, "crown_gate": 0.0 if pyre.is_patched_engine() else None}}
+    cond = {"c": {"spot_config": SPOT, "crown_gate": GATE}}
     outs = []
     for n_workers in (1, 2):
         runs = pyre.build_runs({"u": layers, "sham": sham}, {"i": fp}, {"e": ep_csv}, cond,
@@ -137,7 +138,7 @@ def test_worker_count_is_irrelevant(layers, weather, ignition, tmp_path):
 
 def test_cached_manifest_is_reused_only_for_the_identical_request(layers, weather, ignition, tmp_path):
     """Same out_dir, changed footprint or seed -> re-run; identical request -> cached manifest."""
-    gate = 0.0 if pyre.is_patched_engine() else None
+    gate = GATE
     kw = dict(duration_h=HOURS, spot_config=SPOT, crown_gate=gate)
     first = pyre.run_realization(layers, weather, ignition, tmp_path / "r", seed=11, **kw)
     again = pyre.run_realization(layers, weather, ignition, tmp_path / "r", seed=11, **kw)
@@ -154,6 +155,26 @@ def test_cached_manifest_is_reused_only_for_the_identical_request(layers, weathe
     man_fp = tmp_path / "r" / "manifest.json"
     man = json.loads(man_fp.read_text()); man.pop("request_hash"); man_fp.write_text(json.dumps(man))
     assert "request_hash" in pyre.run_realization(layers, hotter, ((r0 + 5, c0), win), tmp_path / "r", seed=12, **kw)
+
+
+def test_crown_gate_is_required_and_never_inherited(layers, weather, ignition, tmp_path):
+    kw = dict(seed=11, duration_h=HOURS, spot_config=None)
+    with pytest.raises(ValueError, match="crown_gate is required"):
+        pyre.run_realization(layers, weather, ignition, tmp_path / "x", crown_gate=None, **kw)
+    with pytest.raises(ValueError, match="crown_gate is required"):
+        pyre.burn_landscape(layers, weather, tmp_path / "y", crown_gate=None)
+    with pytest.raises(ValueError, match="crown_gate is required"):
+        pyre.build_runs({"a": layers}, {"i": "i.shp"}, {"e": "e.csv"}, {"c": {"spot_config": None}},
+                        base_seed=1, out_root=tmp_path)
+    if not pyre.is_patched_engine():
+        with pytest.raises(RuntimeError):                       # a stock build cannot honour any other gate
+            pyre.run_realization(layers, weather, ignition, tmp_path / "z", crown_gate=0.0, **kw)
+        return
+    a = pyre.run_realization(layers, weather, ignition, tmp_path / "a", crown_gate=0.0, **kw)
+    b = pyre.run_realization(layers, weather, ignition, tmp_path / "b", crown_gate=0.4, **kw)
+    c = pyre.run_realization(layers, weather, ignition, tmp_path / "c", crown_gate=0.0, **kw)   # after a 0.4 run
+    assert (a["crown_gate"], b["crown_gate"], c["crown_gate"]) == (0.0, 0.4, 0.0)
+    assert a["request_hash"] == c["request_hash"] != b["request_hash"]
 
 
 def _maybe_die(p):
@@ -174,7 +195,7 @@ def test_parallel_batch_survives_a_dying_worker():
 
 
 def test_burn_landscape_head_fire_vs_azimuth(layers, weather, tmp_path):
-    gate = 0.0 if pyre.is_patched_engine() else None
+    gate = GATE
     head = pyre.burn_landscape(layers, weather, tmp_path / "head", crown_gate=gate)
     az = pyre.burn_landscape(layers, weather, tmp_path / "az", azimuth=0.0, crown_gate=gate)
     assert head["product"] == "burn_landscape" and head["surface_lw_ratio_model"] == "behave"
@@ -186,7 +207,7 @@ def test_burn_landscape_head_fire_vs_azimuth(layers, weather, tmp_path):
     assert np.isfinite(fl_head[:, :30]).all()
     assert (fl_az[:, :30] < fl_head[:, :30]).all()     # burning toward N with W wind is off-axis
     with pytest.raises(TypeError, match="unknown fire-behavior option"):
-        pyre.burn_landscape(layers, weather, tmp_path / "x", bogus=1)
+        pyre.burn_landscape(layers, weather, tmp_path / "x", crown_gate=GATE, bogus=1)
 
 
 def test_spot_ignition_probability_is_monotone_and_bounded():

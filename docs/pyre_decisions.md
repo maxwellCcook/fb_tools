@@ -254,6 +254,31 @@ Duration is re-decided by `check_domain_adequacy` on the new domain, not fixed a
   8.1 min wall on 4 workers, no crash reports.** Fire size mean 11,386 ha, median 10,194, sd 9,290, range
   108–39,866; `Σ BP × area` = mean size. `BurnProb > 0` covers 171,780 ha of the 270,000 ha window.
 
+**2026-10-08** — Single-realization treatment counterfactual in `01f_PyreBuild.ipynb` §5b (Max's choices):
+- **Feature:** the OSM tertiary road the baseline fire crossed (Overland Road / James Canyon Drive), clipped to
+  the baseline perimeter + 500 m — not the whole road, not a road network. Roads come from `fetch_osm_roads`
+  within 2 km of the perimeter, cached in scratch; **osmnx is now in `environment-pyre.yml`** for this.
+  The baseline perimeter is itself held by LANDFIRE's non-burnable road cells on three sides (primary, trunk,
+  secondary): a 30 m NB line stops the level set, and central spotting did not carry it over in this draw.
+- **Prescriptions:** two treated arms from the tealom effects tables at the same width — *shaded fuel break*
+  (`Mech Thin` canopy × `Complete` surface) and *clear cut* (`Patch` × `Patch_SM` → GS1). No non-burnable arm:
+  the existing road cells already show what a hard barrier does.
+- **Width:** 120 m total (4 cells), fixed; a sweep is one more arm per width, not built.
+- **Mechanics:** `fuelscape.adjust.fuel_break(lcp, lines, width_m, canopy_df, surface_df, scenario, out_path)`
+  rasterizes the corridor (valid cells only), calls `apply_treatment` with the mask, writes an int16 LCP with
+  band descriptions kept; `destack_lcp` per arm; `changed_cells` = treatment footprint = `trt` zone; the
+  three arms go through `build_runs`/`run_batch` so the baseline row reproduces the single run bitwise.
+  Products kept minimal: arrival maps per arm, Δ arrival + lost-burn map, `paired_deltas`, treatment shadow
+  (share of baseline burn behind the break and how much of it still burned), in-break intensity against the
+  hauling chart. Tests: `tests/test_fuel_break.py` (engine-free).
+- **Measured (ep_000 × ign_000, 21 d, central spotting, 1.6 min for 3 arms):** footprint unchanged — 18,197 /
+  18,211 / 18,223 ha; corridor reached at 23 h in every arm; 100 % of the 11,094 ha behind the break (shadow
+  ≥ 0.5) burns in both treated arms, median arrival 0.4–0.6 h *earlier* (GS1 spreads faster than TL/TU litter).
+  In-corridor mean intensity 1,423 → 863 (shaded) → 35 kW/m (clear cut, hand class); collar unchanged
+  (~2,350). Reading: an unsuppressed 21-day fire fills the road-bounded block regardless; the break changes the
+  fire where a crew would stand, not where it ends. Next, if wanted: the same arms under the stepped
+  containment rule, and the arms through the §6 ensemble for breakout rates. Not built.
+
 ## Open items
 
 - **Realized spot ignitions are not exposed** by the engine's final matrices; `spot_ignitions` in the
@@ -262,7 +287,7 @@ Duration is re-decided by `check_domain_adequacy` on the new domain, not fixed a
 - ~~Domain adequacy on real episodes~~ — fails (2026-09-12 evening); waiting on the wider LCP.
 - **Next session**: (a) pause/fork wrapper over `SpreadState.copy()` for spot attribution and mid-run
   treatment forks (note: the RNG is re-seeded per call, so chunked ≠ single-run bitwise, but stays
-  deterministic); (b) `suppression.make_sdi_suppression_priority_fn` with `calculate_sdi` output — see the
+  deterministic); (b) ~~`suppression.make_sdi_suppression_priority_fn` with `calculate_sdi` output~~ (done: `PyreFirelines`, see 2026-11-23) — see the
   `sdi_static_layers` / `SDI_NODATA` commit on this branch (treatment-invariant SDI inputs cached
   once, SDI written on the slope band), which is the raster that hook would consume;
   (c) `fuel_spread_adjustment` from the COSWAP canopy-effects table; (d) per-pixel receptivity map
@@ -399,3 +424,112 @@ dropped with a count. ICS-209-PLUS can feed the same `dates=` interface later.
   all by embers). Not a level-set leak — but the reason the factorial has a spotting-off column and reports
   breakout rates. Direct attack (S2, `build_firelines`) is still not started; `fuel_spread_adjustment` vs crown
   spread still open.
+
+**2026-11-23 (audit + ELMFIRE scoping, Max)** — Code-reading QA/QC of the pyre path, prompted by ELMFIRE 1.1
+(2026-08-24). Full plan with file-level findings: the session plan "fb_tools pyretechnics audit, ELMFIRE
+scoping, and burn-probability options"; this entry is the record.
+- **Decided.** (1) ELMFIRE is a *spike first* — different tools for different jobs; compare with pyretechnics
+  only where a comparison means something; no `fb_tools.models.elmfire` until the spike reports.
+  (2) **Suppression stays out-of-the-box**: use what each engine ships, write no rules of our own for now.
+  (3) Test the pyretechnics upgrade **in `fb_pyre`** (no new env), pin kept in `environment-pyre.yml`.
+  (4) Tests stay light — small crop, short duration, few ignitions. (5) Correctness fixes before clean-up
+  before ELMFIRE/BP. (6) Work one item at a time; anything that changes a reported number is asked first.
+- **Log was behind the code.** The engine's own rule is implemented: `containment.py::PyreFirelines`
+  (`"pyre_firelines"`, `make_rule`'s default) drives `pyretechnics.suppression` (`order_frontier_cells` →
+  `score_frontier_cells` → `select_frontier_cells_for_suppression`, shipped SDI / flame-length priority).
+  So "S2 not started" above and open item (b) are closed. **Ours, not the engine's**, in that rule: the constant
+  construction rate (2,000 m/h), the optional flame-length gate on the rate, the median fill of unknown SDI,
+  SDI ÷ 100, the hourly cadence. `"elmfire0"` (rule S1) is our re-implementation of ELMFIRE model 0 —
+  **experimental from here, not extended.** Pending-spot logging per step is still not built (open item 1 stands).
+- **Found by reading, not yet fixed** (fix order = plan Phase 1a): `ignition_matrix` never reprojects (docstring
+  says it does); `pad_bands` repeats the last hour over any shortfall; `crown_gate=None` is hashed as `None`
+  while the process-global gate may be whatever the previous row set; `run_batch` rasterizes on the first arm's
+  grid without checking the others; `aggregate_realizations` pools arms; `summarize_realization` reports day
+  marks past the run; `destack_lcp(overwrite=False)` can mix grids; `select_episodes(dates=)` skips `last_start`;
+  `apply_treatment` overwrites `band_map`; pyre output grid checks are shape-only.
+- **Open questions for Max** (each changes a number): HRRR 10 m U/V are used unrotated (grid-relative on the
+  Lambert grid, ~5° in Colorado — confirm from the GRIB flag first); prevented arrivals drop out of
+  `paired_deltas` as NaN; delta sign differs between `bp.py` (baseline − treated) and `paired_deltas`
+  (treated − baseline); pyre `BurnProb` includes the ignition footprint; `Firebrands.tif` skips the slope
+  correction; rounding before differencing. Shadow: spotting roots a new path at 0, and only treated cells
+  that *burned* carry share — "passed through", not "affected by" — to be confirmed on synthetic cases.
+- **Upstream.** pyretechnics 2026.10.20 fixes underpredicted directional spread, intensity and flame length
+  (up to 2×) and changes the license (dual community/commercial); latest is 2026.11.20. Everything measured in
+  this log is on 2026.8.10. In the pinned build and untried here: `burn_cells_by_time_of_arrival`,
+  `SpreadState.render_at_new_resolution`.
+- **ELMFIRE 1.1, as documented**: initial attack and extended attack models 0/1 (SDI, PCL lines), WU-E building
+  spread (experimental), Monte Carlo BP with flame-length bins and pyrome tables, MPI. One global seed — ember
+  draws diverge between arms, so pairing is statistical (null bands), not exact. Linux/Docker; AGPL v3 + Commons
+  Clause. No Python wrapper exists; it is a namelist + GeoTIFF CLI, so the FlamMap/FSPro wrapper pattern applies.
+- **Burn probability**: undecided. Uses are QWRA inputs and landscape-scale treatment evaluation; regional /
+  national FSim may supply annual BP. The ensemble here is conditional exposure, not annual BP.
+- **Audit fixes applied (2026-11-23)**: `ignition_matrix` reprojects to the grid CRS; `pad_bands` raises on short
+  weather; `crown_gate` is required and set on every run; `run_batch` checks all arms sit on one grid;
+  `aggregate_realizations` is one arm per call (`arm=`) and takes per-ignition `weights`. **Weights rule (Max)**:
+  an ignition keeps its full `w_i`, split equally over the runs it has, so a failed run does not shrink its share;
+  a weighted ignition with no run raises. `AvgTime` / `AvgFlameLength` are weighted means where burned;
+  `n_burned` stays a count of runs.
+- **Year-round weather record — planned phase (Max, 2026-11-23)**: the April–October limit is in the extracts, not
+  the engine: GridMET ERC is Apr 1–Oct 31, 2008–2022 (214-day pivot); `RTMA_MONTHLY` holds months 04–10, 2011–2025.
+  HRRR cubes are already any-date. So Marshall (30 Dec 2021) and late-October 2020 at long durations cannot be
+  burned. To do, after the QA/QC items and before the ELMFIRE spike: (1) Max exports full-calendar GridMET ERC
+  through 2025 and RTMA months 11–03; (2) a calendar-day episode path beside the 214-day one (FSPro inputs keep
+  their season); (3) QC — winter RTMA gaps, NFDRS dead FM under snow/freezing, live FM out of season (cured
+  grass); (4) HRRR wind rotation settled before a downslope-wind event is run. **Open**: what a severity
+  percentile means over a full year. Until then `select_episodes` drops and counts a date whose window passes Oct 31.
+- **Shadow review (2026-11-24, Max)** — scripts `code/dev/pyre/s1`–`s5`. Exact for a full-width treatment and for
+  merging fires. Decided: (1) **bridge 3 cells** — the engine's arrival raster skips cells (a cell burns before all
+  8 neighbours with fire 2 cells away, spotting on or off); such a cell rooted its own path at 0 and 6–66% of the
+  burn in the example runs descended from them. A cell with no earlier neighbour now inherits from earlier cells
+  on the nearest ring out to `bridge_cells=3`. (2) **Ember landings stay 0** (the engine does not record an
+  ember's source); `ember_descent` / `ember_descent.tif` / `n_ember_starts`, `ember_descent_ha` report the burn
+  the shadow cannot trace (0–5.5% in the six runs after bridging). Shadows written before this date are stale.
+  **Open, not changed**: a treatment the fire flanks or that does not burn casts no shadow (the stronger the
+  treatment, the smaller the shadow); the 8-neighbour rule blurs a narrow shadow sideways with distance (centre
+  0.85 at 3 km, 0.70 at 6 km behind a 630 m block) and is direction-dependent; `lead_h` is clocked from the first
+  treatment touched anywhere; why the engine's raster skips cells is not traced.
+- **Shadow is a baseline-arm product (2026-11-24, Max)**: defined as where the *untreated* fire passed over the
+  treatment footprint. On a treated arm it shrinks as the treatment works — synthetic flanked block
+  (`s6_shadow_flanked_baseline.py`): the baseline shadow held 100% of the cells the block delayed, the
+  treated-arm shadow 81% / 3% / 0% for a block burning at 50% / 20% / 5% speed and 0% for one that did not burn.
+  `transmission_batch` and `shadow_probability` now take `arm=` and raise on mixed arms (`pyre_outputs.one_arm`,
+  shared with `aggregate_realizations`); shadow rasters carry an `arm` tag. The baseline shadow is a superset of
+  the delayed cells (the delay recovers with distance; the shadow does not), so it marks ground the treatment
+  could act on, not ground it changed — the paired deltas say that.
+- **Shadow validated against the paired change (2026-11-24)** — `shadow_agreement` (recall / precision / AUC of the
+  baseline shadow ≥ 0.5 for cells whose arrival differs between arms; treated cells excluded),
+  `code/dev/pyre/s7_shadow_agreement.py`. One 21-day fire, 300 m road corridor, front_range example:
+  **shaded** (burned area ≈ baseline): every shadow cell changed (precision 1.00); at a 10 min tolerance recall
+  0.88, precision 0.88, AUC 0.86. 91% of all burned cells differ by *something* (any nonzero difference), a third
+  of them outside the shadow — small changes propagate everywhere, so "changed" needs a tolerance.
+  **clearcut** (burned 45,890 ha vs 18,197 baseline): recall 0.25 — most changed cells burned only in the treated
+  arm, which a baseline-arm shadow cannot see. The weight exponent (1 → 50, i.e. single steepest path) moved no
+  score by more than 0.02, so the sideways blur is not what limits the shadow here; rule left at `power=1`.
+  One fire only; the COSWAP run folders in `coswap_pyre/results.csv` were not on disk to repeat it there.
+  **Standing reading**: paired deltas are the effect; the shadow is the stratifier and the siting product.
+- **Clear-cut arm of the 01f fuel-break example burns 2.5× the baseline (2026-11-24)** —
+  `code/dev/pyre/s8_clearcut_divergence.py`, one realization. Established: the prescription sets every corridor
+  cell to GS1 (121) with zero canopy; inside the corridor it behaves as intended (intensity p90 4,489 → 103 kW/m,
+  100% surface fire, 59% of cells reached > 1 h later). The arms track each other to day 10 (4,784 vs 4,931 ha),
+  then split in a wind run at h 264–300: clear cut 32,260 ha by day 14 vs 16,577. The extra 27,692 ha is not
+  ember-started (2.2%); 98% of it descends from fire that crossed the corridor, breaking out 4.3 km north of it
+  at h 269 on ground the baseline burned 6% of. 17% of corridor cells burned > 1 h *earlier* in the clear cut.
+  Reading (not proven): a timing difference at the corridor placed the clear-cut front where the wind event could
+  run it. All arms touch the domain edge on day 13. **Open for Max**: whether GS1 / no canopy is the intended
+  clear-cut fuel; one realization cannot rank prescriptions — this needs the ensemble.
+- **Lead-time clock (2026-11-24, Max)**: `lead_h` was block arrival minus the fire's first touch of *any* treated
+  cell, so with several treatments every block took the earliest one's clock (11 h where 2 h is right in the
+  two-strip test). Now clocked from the **first arrival at the treatment unit the block's fire came through**
+  (`treatment_entry_time`: units = `atom_ids`, else connected treated patches; several upstream units are
+  weighted by their share), read at the block's first mostly-shadowed cell. `trt_arrival_h` in the fire summary is
+  unchanged (first touch of any treatment). Block tables written before this date carry the old clock.
+  This closes the shadow review: bridged gaps, ember share reported, baseline-arm product, validated against the
+  paired change, lead clock. The sideways blur stays as measured, rule unchanged.
+- **01f §5b rebuilt around seeds (2026-11-24, Max)**: one named fire (`CF_XY`, `CF_START` 2018-06-15), three arms,
+  **20 spotting seeds at 14 days** — each seed a condition id, so every seed is an exact pair across arms. Baseline
+  seeds run first and the corridor is cut on the union of their perimeters. Reports growth by seed, paired Δ final
+  area, breakout rate (final area > 1.5× the arm's own median **and** > 1.5× the baseline median — the second is the
+  one that compares arms), edge contact, per-arm share-of-seeds maps, `shadow_agreement`. Only the seed varies;
+  ignition point, start hour and episode are the next experiment. **Storage**: summaries and ensemble rasters are
+  written once under input-named paths and read back; `prune_realizations` (§8) keeps arrival time and flame length
+  per run and drops the rest (~60%). Smoke-tested at 2 seeds × 2 days; the 20 × 14 run is Max's.

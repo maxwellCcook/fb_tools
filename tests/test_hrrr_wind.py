@@ -158,3 +158,30 @@ def test_build_runs_carries_one_cube_per_episode(tmp_path):
     broken.loc[(broken.arm == "b") & (broken.episode_id == "ep_0"), "wind_cube"] = "other.npz"
     with pytest.raises(AssertionError, match="CRN"):
         pyre.assert_crn_contract(broken, n_arms=2)
+
+
+def test_get_retry_rides_out_a_dropped_connection(monkeypatch):
+    import requests
+    calls = {"n": 0}
+
+    class R:
+        status_code = 200
+
+    def flaky(url, **kw):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise requests.ConnectionError("Failed to resolve")
+        return R()
+    monkeypatch.setattr(requests, "get", flaky)
+    assert hrrr._get_retry("https://x", wait_s=0.0).status_code == 200 and calls["n"] == 3
+
+    def down(url, **kw):
+        raise requests.ConnectionError("Failed to resolve")
+    monkeypatch.setattr(requests, "get", down)
+    with pytest.raises(requests.ConnectionError):
+        hrrr._get_retry("https://x", attempts=2, wait_s=0.0)
+
+    class Missing:
+        status_code = 404
+    monkeypatch.setattr(requests, "get", lambda url, **kw: Missing())      # a missing hour is not retried
+    assert hrrr._get_retry("https://x", wait_s=0.0).status_code == 404

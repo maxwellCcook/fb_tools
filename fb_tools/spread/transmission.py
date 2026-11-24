@@ -24,9 +24,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from .pyre_outputs import read_realization
+from .pyre_outputs import assert_same_grid, one_arm, raster_grid, read_realization
 
 SHADOW_LAYER = "treatment_shadow"
+EMBER_LAYER = "ember_descent"
 
 
 # ── values: structure blocks ──────────────────────────────────────────────────
@@ -87,41 +88,33 @@ def zone_id_raster(zones, transform, shape, id_col, *, all_touched=False):
 
 # ── per-realization shadow ────────────────────────────────────────────────────
 
-def treatment_shadow(toa, treated, *, power=1.0):
+BRIDGE_CELLS = 3
+
+
+def _fresh_starts(toa):
+    """Burned cells with no earlier-burning cell among their 8 neighbours."""
+    from scipy.ndimage import minimum_filter
+    burned = np.isfinite(toa)
+    t = np.where(burned, toa, np.inf)
+    return burned & (minimum_filter(t, size=3, mode="constant", cval=np.inf) >= t)
+
+
+def _propagate(toa, seed, *, power=1.0, bridge_cells=BRIDGE_CELLS, seed_value=None):
     """
-    Share of the fire reaching each cell that had passed through a treatment.
+    Share of the fire reaching each burned cell that descends from ``seed`` cells.
 
-    Every burned cell receives fire from its earlier-arriving neighbours in
-    proportion to the arrival-time gradient toward each (a multiple-flow-
-    direction rule, as in hydrology: the single steepest neighbour is
-    lattice-biased). Treated cells carry a share of 1; the shares propagate
-    forward in arrival time by one triangular solve. Cells with no earlier
-    neighbour — the ignition, ember landings, level-set wrinkles — root their
-    own paths and receive 0.
-
-    Parameters
-    ----------
-    toa : 2-D array
-        Arrival time (minutes), NaN outside the burn.
-    treated : 2-D bool array
-        Treatment cells.
-    power : float
-        Exponent on the gradient weights (1 = proportional).
-
-    Returns
-    -------
-    2-D float32 array
-        0–1 inside the burn, 0 outside.
+    Returns ``(share, starts)``: the 0–1 float32 share, and the bool mask of
+    cells that still have no earlier-burning cell within ``bridge_cells``.
+    With ``seed_value`` (2-D array) each seed carries that value instead of 1
+    and the result is the share-weighted sum of seed values (float64, unclipped).
     """
     from scipy.sparse import csr_matrix, identity
     from scipy.sparse.linalg import spsolve_triangular
 
     burned = np.isfinite(toa)
     H, W = toa.shape
-    out = np.zeros((H, W), dtype="float32")
-    seed = treated & burned
-    if not seed.any():
-        return out
+    out = np.zeros((H, W), dtype="float32" if seed_value is None else "float64")
+    starts = _fresh_starts(toa)
     n = int(burned.sum())
     t = np.where(burned, toa, np.inf)
     rank = np.full((H, W), -1, dtype=np.int64)              # cells numbered in arrival order
@@ -134,18 +127,144 @@ def treatment_shadow(toa, treated, *, power=1.0):
         with np.errstate(invalid="ignore"):
             w = ((t[a, k] - t[a2, k2]) / np.hypot(dr, dc)) ** power
         rows.append(rank[a, k][ok]); cols.append(rank[a2, k2][ok]); vals.append(w[ok])
+    # The arrival raster skips cells (a cell can burn before all 8 neighbours with fire 2 cells away), so a
+    # start inherits from earlier cells on the nearest ring that has any, out to bridge_cells.
+    rr, cc = np.where(starts)
+    for R in range(2, int(bridge_cells) + 1):
+        if rr.size == 0:
+            break
+        found = np.zeros(rr.size, dtype=bool)
+        for dr in range(-R, R + 1):
+            for dc in range(-R, R + 1):
+                if max(abs(dr), abs(dc)) != R:
+                    continue
+                r2, c2 = rr + dr, cc + dc
+                ok = (r2 >= 0) & (r2 < H) & (c2 >= 0) & (c2 < W)
+                ok[ok] = t[r2[ok], c2[ok]] < t[rr[ok], cc[ok]]
+                rows.append(rank[rr[ok], cc[ok]]); cols.append(rank[r2[ok], c2[ok]])
+                vals.append(((t[rr[ok], cc[ok]] - t[r2[ok], c2[ok]]) / np.hypot(dr, dc)) ** power)
+                found |= ok
+        starts[rr[found], cc[found]] = False
+        rr, cc = rr[~found], cc[~found]
+    seed = seed & burned
+    if not seed.any():
+        return out, starts
     rows, cols, vals = map(np.concatenate, (rows, cols, vals))
     s = np.zeros(n)
-    s[rank[seed]] = 1.0
-    keep = s[rows] == 0                                       # treated cells take no inflow: their share is 1
+    s[rank[seed]] = 1.0 if seed_value is None else np.asarray(seed_value, dtype="float64")[seed]
+    is_seed = np.zeros(n, dtype=bool)
+    is_seed[rank[seed]] = True
+    keep = ~is_seed[rows]                                     # seed cells take no inflow: their share is 1
     rows, cols, vals = rows[keep], cols[keep], vals[keep]
     inflow = csr_matrix((vals, (rows, cols)), shape=(n, n))   # strictly lower triangular in arrival order
     rs = np.asarray(inflow.sum(axis=1)).ravel()
     rs[rs == 0] = 1.0
     inflow.data /= np.repeat(rs, np.diff(inflow.indptr))
     x = spsolve_triangular((identity(n, format="csr") - inflow).tocsr(), s, lower=True, unit_diagonal=True)
-    out[burned] = np.clip(x[rank[burned]], 0.0, 1.0)
-    return out
+    out[burned] = np.clip(x[rank[burned]], 0.0, 1.0) if seed_value is None else x[rank[burned]]
+    return out, starts
+
+
+def treatment_shadow(toa, treated, *, power=1.0, bridge_cells=BRIDGE_CELLS):
+    """
+    Share of the fire reaching each cell that had passed through a treatment.
+
+    Every burned cell receives fire from its earlier-arriving neighbours in
+    proportion to the arrival-time gradient toward each (a multiple-flow-
+    direction rule, as in hydrology: the single steepest neighbour is
+    lattice-biased). Treated cells carry a share of 1; the shares propagate
+    forward in arrival time by one triangular solve. A cell with no earlier
+    neighbour inherits from earlier cells within ``bridge_cells``; one with
+    none there either — the ignition, an ember landing — roots its own path
+    and receives 0 (:func:`ember_descent` maps what grows from those).
+
+    Parameters
+    ----------
+    toa : 2-D array
+        Arrival time (minutes), NaN outside the burn.
+    treated : 2-D bool array
+        Treatment cells.
+    power : float
+        Exponent on the gradient weights (1 = proportional).
+    bridge_cells : int
+        Reach, in cells, of the search for an earlier-burning cell when none
+        of the 8 neighbours is earlier. 1 disables it.
+
+    Returns
+    -------
+    2-D float32 array
+        0–1 inside the burn, 0 outside.
+    """
+    return _propagate(toa, np.asarray(treated, dtype=bool), power=power, bridge_cells=bridge_cells)[0]
+
+
+def treatment_entry_time(toa, treated, unit_ids=None, *, power=1.0, bridge_cells=BRIDGE_CELLS):
+    """
+    When the fire reaching each cell first arrived at the treatment unit it
+    came through — the clock a lead time is read from.
+
+    Parameters
+    ----------
+    toa : 2-D array
+        Arrival time (minutes), NaN outside the burn.
+    treated : 2-D bool array
+    unit_ids : 2-D int array, optional
+        Treatment units (0 = none), e.g. :func:`zone_id_raster` of the atoms.
+        Treated cells outside any unit, or all of them when ``None``, are
+        grouped into connected patches.
+    power, bridge_cells : as :func:`treatment_shadow`.
+
+    Returns
+    -------
+    (2-D float32 array, 2-D float64 array)
+        The treatment shadow, and the entry time (minutes): each upstream
+        unit's first arrival weighted by its share of the fire at the cell.
+        NaN where the shadow is 0.
+    """
+    from scipy.ndimage import label
+    treated = np.asarray(treated, dtype=bool)
+    seed = treated & np.isfinite(toa)
+    units, _ = label(treated, structure=np.ones((3, 3)))
+    if unit_ids is not None:
+        units = np.where(unit_ids > 0, unit_ids, np.where(units > 0, units + int(np.max(unit_ids)), 0))
+    units = np.where(treated, units, 0)
+    first = _min_by_zone(toa, units, int(units.max())) if units.max() > 0 else np.array([])
+    value = np.zeros(toa.shape)
+    value[seed] = first[units[seed] - 1]
+    shadow, _ = _propagate(toa, seed, power=power, bridge_cells=bridge_cells)
+    total, _ = _propagate(toa, seed, power=power, bridge_cells=bridge_cells, seed_value=value)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return shadow, np.where(shadow > 0, total / shadow, np.nan)
+
+
+def ember_descent(toa, ignition=None, *, power=1.0, bridge_cells=BRIDGE_CELLS):
+    """
+    Share of the fire reaching each cell that descends from a fresh start
+    other than the ignition — fire whose path the treatment shadow cannot
+    trace, because the engine does not record where an ember came from.
+
+    Parameters
+    ----------
+    toa : 2-D array
+        Arrival time (minutes), NaN outside the burn.
+    ignition : 2-D bool array, optional
+        Ignition footprint; starts inside it are the ignition. Default: the
+        earliest-burning cell.
+    power, bridge_cells : as :func:`treatment_shadow`.
+
+    Returns
+    -------
+    (2-D float32 array, int)
+        0–1 share inside the burn (0 outside), and the number of fresh starts.
+    """
+    burned = np.isfinite(toa)
+    if not burned.any():
+        return np.zeros(toa.shape, dtype="float32"), 0
+    _, starts = _propagate(toa, np.zeros(toa.shape, dtype=bool), power=power, bridge_cells=bridge_cells)
+    if ignition is None:
+        ignition = toa == np.nanmin(toa)
+    starts &= ~np.asarray(ignition, dtype=bool)
+    return _propagate(toa, starts, power=power, bridge_cells=bridge_cells)[0], int(starts.sum())
 
 
 def _min_by_zone(values, zone_ids, n_zones):
@@ -168,6 +287,9 @@ def realization_transmission(run_dir, *, treated, block_ids, atom_ids=None, writ
     Parameters
     ----------
     run_dir : Path
+        A **baseline-arm** run: the shadow is where the untreated fire passed
+        over the treatment footprint. On a treated arm it shrinks as the
+        treatment works (a flanked or unburned treatment casts none).
     treated : 2-D bool array
         Treatment cells on the run grid.
     block_ids : 2-D int32 array
@@ -175,13 +297,17 @@ def realization_transmission(run_dir, *, treated, block_ids, atom_ids=None, writ
     atom_ids : 2-D int32 array, optional
         :func:`zone_id_raster` of the treatment atoms, for per-atom arrivals.
     write_shadow : bool
-        Write ``treatment_shadow.tif`` (float32, 0–1) beside the run's rasters.
+        Write ``treatment_shadow.tif`` and ``ember_descent.tif`` (float32, 0–1)
+        beside the run's rasters.
 
     Returns
     -------
     (dict, DataFrame, DataFrame)
-        Fire-level summary; one row per block the fire reached
-        (``block_id, arrival_h, shadow_frac, lead_h``); one row per atom
+        Fire-level summary (``n_ember_starts`` and ``ember_descent_ha`` size the
+        burn the shadow cannot trace); one row per block the fire reached
+        (``block_id, arrival_h, shadow_frac, lead_h`` — hours from the fire's
+        first arrival at the upstream treatment unit to the block's first
+        mostly-shadowed cell, :func:`treatment_entry_time`); one row per atom
         reached (``atom_id, arrival_h``), empty if ``atom_ids`` is None.
     """
     import rasterio
@@ -192,20 +318,35 @@ def realization_transmission(run_dir, *, treated, block_ids, atom_ids=None, writ
     burned = np.isfinite(toa)
     cell_ha = r["res_m"] ** 2 / 1e4
     keys = {k: man.get(k) for k in ("arm", "ignition_id", "episode_id", "condition_id")}
+    for name, a in (("treated", treated), ("block_ids", block_ids), ("atom_ids", atom_ids)):
+        if a is not None:
+            assert_same_grid(r, {"shape": np.shape(a)}, label=name)
 
-    shadow = treatment_shadow(toa, treated)
+    shadow, entry = treatment_entry_time(toa, treated, atom_ids)
+    ign = np.zeros(toa.shape, dtype=bool)
+    if man.get("ignition_window"):
+        r0, c0, h, w = man["ignition_window"]
+        ign[max(r0 - 1, 0):r0 + h + 1, max(c0 - 1, 0):c0 + w + 1] = True
+    ember, n_starts = ember_descent(toa, ign if ign.any() else None)
     hit = burned & treated
     t_trt = float(np.nanmin(toa[hit]) / 60.0) if hit.any() else np.nan
 
     n_blocks = int(block_ids.max())
     arr = _min_by_zone(toa, block_ids, n_blocks) / 60.0
-    arr_sh = _min_by_zone(np.where(shadow >= 0.5, toa, np.nan), block_ids, n_blocks) / 60.0   # first mostly-shadowed arrival
+    # lead: at each block's first mostly-shadowed cell, arrival minus the upstream unit's first arrival
+    lead = np.full(n_blocks, np.nan)
+    m = (shadow >= 0.5) & (block_ids > 0) & burned
+    if m.any():
+        bid, tt, ld = block_ids[m], toa[m], (toa - entry)[m] / 60.0
+        o = np.lexsort((tt, bid))
+        ids, first = np.unique(bid[o], return_index=True)
+        lead[ids - 1] = ld[o][first]
     n_b = _count_by_zone(burned, block_ids, n_blocks)
     sum_s = np.bincount(block_ids[burned], weights=shadow[burned], minlength=n_blocks + 1)[1:]
     reached = np.where(n_b > 0)[0]
     blocks = pd.DataFrame({**keys, "block_id": reached + 1, "arrival_h": arr[reached],
                            "shadow_frac": sum_s[reached] / n_b[reached],   # share of the fire in the block that came through a treatment
-                           "lead_h": arr_sh[reached] - t_trt})             # NaN where no cell of the block is mostly shadowed
+                           "lead_h": lead[reached]})                       # NaN where no cell of the block is mostly shadowed
 
     atoms = pd.DataFrame(columns=[*keys, "atom_id", "arrival_h"])
     if atom_ids is not None:
@@ -218,28 +359,52 @@ def realization_transmission(run_dir, *, treated, block_ids, atom_ids=None, writ
                "treated_ha_burned": round(float(hit.sum() * cell_ha), 2),
                "trt_arrival_h": t_trt,
                "shadow_ha": round(float(shadow.sum() * cell_ha), 2),       # expected area burned through a treatment
+               "n_ember_starts": n_starts,
+               "ember_descent_ha": round(float(ember.sum() * cell_ha), 2),  # expected area the shadow cannot trace
                "n_blocks_reached": int(len(reached)),
                "n_blocks_intercepted": int((blocks.shadow_frac >= 0.5).sum()),
                "n_atoms_reached": int(len(atoms))}
     if write_shadow:
         prof = dict(driver="GTiff", height=toa.shape[0], width=toa.shape[1], count=1, dtype="float32",
                     crs=r["crs"], transform=r["transform"], compress="deflate", nodata=None)
-        with rasterio.open(run_dir / f"{SHADOW_LAYER}.tif", "w", **prof) as dst:
-            dst.write(shadow, 1)
+        for name, a in ((SHADOW_LAYER, shadow), (EMBER_LAYER, ember)):
+            with rasterio.open(run_dir / f"{name}.tif", "w", **prof) as dst:
+                dst.write(a, 1)
+                dst.update_tags(arm=str(man.get("arm")))
     return summary, blocks, atoms
 
 
-def transmission_batch(results, **kwargs):
+def transmission_batch(results, *, arm=None, **kwargs):
     """
-    :func:`realization_transmission` over a ``run_batch`` result (rows with ``status == "ok"``).
+    :func:`realization_transmission` over one arm of a ``run_batch`` result
+    (rows with ``status == "ok"``).
+
+    Parameters
+    ----------
+    results : DataFrame
+    arm : str, optional
+        Arm to trace — the baseline. Required when ``results`` hold several arms.
 
     Returns
     -------
     (DataFrame, DataFrame, DataFrame)
         Fire-level summaries, block rows, atom rows.
+
+    Raises
+    ------
+    ValueError
+        If the ok rows span several arms and ``arm`` is not given, or none is in ``arm``.
     """
+    ok = results[results.status == "ok"]
+    arms = sorted(ok["arm"].astype(str).unique())
+    if arm is not None:
+        ok = ok[ok["arm"] == arm]
+        if ok.empty:
+            raise ValueError(f"no ok run in arm {arm!r}; arms present: {arms}")
+    elif len(arms) > 1:
+        raise ValueError(f"results hold arms {arms}; the shadow is read off one arm (the baseline) — pass arm=")
     fires, blocks, atoms = [], [], []
-    for _, row in results[results.status == "ok"].iterrows():
+    for _, row in ok.iterrows():
         s, b, a = realization_transmission(row["out_dir"], **kwargs)
         fires.append(s)
         blocks.append(b)
@@ -283,24 +448,35 @@ def summarize_blocks(block_rows, blocks, *, n_fires, intercept_frac=0.5):
     return out
 
 
-def shadow_probability(run_dirs, out_dir, *, verbose=True):
+def shadow_probability(run_dirs, out_dir, *, arm=None, verbose=True):
     """
     Ensemble rasters from the per-run shadows: ``ShadowProb`` (expected share
     of realizations in which fire reached the cell through a treatment) and
     ``ShadowGivenBurn`` (same, conditional on the cell burning).
+
+    Parameters
+    ----------
+    run_dirs : iterable of Path
+        Runs of one arm (the baseline) holding ``treatment_shadow.tif``.
+    out_dir : Path
+    arm : str, optional
+        Required when ``run_dirs`` hold several arms.
     """
     import rasterio
 
-    run_dirs = [Path(p) for p in run_dirs]
-    n_s = n_b = None
+    run_dirs, _, arm = one_arm(run_dirs, arm)
+    n_s = n_b = ref = None
     for rd in run_dirs:
+        grid = raster_grid(rd / "time_of_arrival.tif")
+        assert_same_grid(grid, raster_grid(rd / f"{SHADOW_LAYER}.tif"), label=f"{rd / SHADOW_LAYER}.tif")
         with rasterio.open(rd / "time_of_arrival.tif") as s:
             b = np.isfinite(s.read(1))
             profile = {**s.profile, "dtype": "float32", "nodata": np.nan, "compress": "deflate"}
         with rasterio.open(rd / f"{SHADOW_LAYER}.tif") as s:
             sh = s.read(1)
         if n_s is None:
-            n_s, n_b = np.zeros(b.shape, np.float64), np.zeros(b.shape, np.int32)
+            n_s, n_b, ref = np.zeros(b.shape, np.float64), np.zeros(b.shape, np.int32), grid
+        assert_same_grid(ref, grid, label=str(rd))
         n_s += sh
         n_b += b
     n = len(run_dirs)
@@ -315,7 +491,7 @@ def shadow_probability(run_dirs, out_dir, *, verbose=True):
         with rasterio.open(paths[name], "w", **profile) as dst:
             dst.write(a, 1)
     if verbose:
-        print(f"[shadow_probability] {n} realizations -> {out_dir} ({', '.join(rasters)})")
+        print(f"[shadow_probability] {n} realizations (arm {arm}) -> {out_dir} ({', '.join(rasters)})")
     return paths
 
 
@@ -461,8 +637,9 @@ def lee_profile(baseline_dir, treated_dir, *, bands, labels, shadow_dir=None, sh
     layers = ("time_of_arrival", "fireline_intensity", "fire_type")
     b, t = read_realization(baseline_dir, layers=layers), read_realization(treated_dir, layers=layers)
     toa_b, toa_t = b["time_of_arrival"], t["time_of_arrival"]
-    if toa_b.shape != toa_t.shape or toa_b.shape != np.shape(bands):
-        raise ValueError("lee_profile: arms and bands must share one grid")
+    assert_same_grid(b, t, label=f"treated run {treated_dir}")
+    assert_same_grid(b, {"shape": np.shape(bands)}, label="bands")
+    assert_same_grid(b, raster_grid(Path(shadow_dir or baseline_dir) / f"{SHADOW_LAYER}.tif"), label="treatment shadow")
     shadow = _read_shadow(shadow_dir or baseline_dir)
     keys = {k: b["manifest"].get(k) for k in ("ignition_id", "episode_id", "condition_id")}
     keys.update(baseline=b["manifest"].get("arm"), treated=t["manifest"].get("arm"))
@@ -493,6 +670,68 @@ def lee_profile(baseline_dir, treated_dir, *, bands, labels, shadow_dir=None, sh
                 share = np.bincount(np.digitize(fi[mb], edges), minlength=len(edges) + 1) / n
                 row.update({f"cls_{c}_{arm}": float(s) for c, s in zip(intensity_labels, share)})
             rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def shadow_agreement(baseline_dir, treated_dir, treated, *, power=1.0, bridge_cells=BRIDGE_CELLS,
+                     shadow_frac=0.5, tolerances_min=(0.0, 1.0, 30.0)):
+    """
+    How well the baseline run's treatment shadow marks the cells that differ
+    between the two arms of one exactly paired realization.
+
+    A cell has *changed* when it burned in one arm only, or its arrival time
+    differs by more than a tolerance (exact pairing makes an untouched cell's
+    difference exactly 0). Treated cells are left out: they change by
+    construction.
+
+    Parameters
+    ----------
+    baseline_dir, treated_dir : Path
+        The two arms of one paired realization.
+    treated : 2-D bool array
+        Treatment cells (:func:`changed_cells`).
+    power, bridge_cells : as :func:`treatment_shadow`.
+    shadow_frac : float
+        Shadow share at or above which a cell counts as in the shadow.
+    tolerances_min : tuple of float
+        Arrival-time differences (minutes) above which a cell counts as changed.
+
+    Returns
+    -------
+    DataFrame
+        One row per tolerance: ``tol_min``, ``n_cells`` (burned in either arm,
+        untreated), ``n_changed``, ``n_shadow``, ``recall`` (changed cells in
+        the shadow), ``precision`` (shadow cells that changed), ``auc``
+        (probability a changed cell has a higher shadow share than an
+        unchanged one; 0.5 = no information), plus the pairing keys.
+    """
+    from scipy.stats import rankdata
+
+    b = read_realization(baseline_dir, layers=("time_of_arrival",))
+    t = read_realization(treated_dir, layers=("time_of_arrival",))
+    assert_same_grid(b, t, label=f"treated run {treated_dir}")
+    assert_same_grid(b, {"shape": np.shape(treated)}, label="treated")
+    toa_b, toa_t = b["time_of_arrival"], t["time_of_arrival"]
+    treated = np.asarray(treated, dtype=bool)
+    shadow = treatment_shadow(toa_b, treated, power=power, bridge_cells=bridge_cells)
+    burned_b, burned_t = np.isfinite(toa_b), np.isfinite(toa_t)
+    dom = (burned_b | burned_t) & ~treated
+    one_only = (burned_b ^ burned_t)[dom]
+    with np.errstate(invalid="ignore"):
+        d = np.abs(toa_t - toa_b)[dom]
+    sh = shadow[dom]
+    in_sh = sh >= shadow_frac
+    ranks = rankdata(sh)
+    keys = {k: b["manifest"].get(k) for k in ("ignition_id", "episode_id", "condition_id")}
+    keys.update(baseline=b["manifest"].get("arm"), treated=t["manifest"].get("arm"), power=power)
+    rows = []
+    for tol in tolerances_min:
+        ch = one_only | (np.nan_to_num(d, nan=0.0) > tol)
+        n1, n0 = int(ch.sum()), int((~ch).sum())
+        rows.append({**keys, "tol_min": float(tol), "n_cells": int(dom.sum()), "n_changed": n1, "n_shadow": int(in_sh.sum()),
+                     "recall": float((ch & in_sh).sum() / n1) if n1 else np.nan,
+                     "precision": float((ch & in_sh).sum() / in_sh.sum()) if in_sh.any() else np.nan,
+                     "auc": float((ranks[ch].sum() - n1 * (n1 + 1) / 2) / (n1 * n0)) if n1 and n0 else np.nan})
     return pd.DataFrame(rows)
 
 

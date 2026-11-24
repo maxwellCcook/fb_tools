@@ -401,3 +401,13 @@ def test_cell2fire_stubs_are_kept():
         lcp_to_cell2fire()
     with pytest.raises(NotImplementedError):
         build_cell2fire_weather()
+
+
+def test_reusing_layers_on_a_different_grid_raises(synth_lcp, tmp_path):
+    out = tmp_path / "layers"
+    destack_lcp(synth_lcp, out, layers=["slope"], verbose=False)             # native grid
+    with pytest.raises(ValueError, match="different grid"):                  # would mix 30 m slope with 90 m fuels
+        destack_lcp(synth_lcp, out, resolution=90.0, verbose=False)
+    assert sorted(f.name for f in out.glob("*.tif")) == ["slope.tif"]        # nothing written before the raise
+    done = destack_lcp(synth_lcp, out, resolution=90.0, overwrite=True, verbose=False)
+    assert len({rasterio.open(fp).shape for fp in done.values()}) == 1

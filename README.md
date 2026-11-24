@@ -40,6 +40,11 @@ pip install -e . --no-deps
 
 ---
 
+## Status and development notes
+
+- [docs/STATUS.md](docs/STATUS.md) — what each module does and where it stands.
+- [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) — dated development notes, work in progress and planned work.
+
 ## Package Structure
 
 ```

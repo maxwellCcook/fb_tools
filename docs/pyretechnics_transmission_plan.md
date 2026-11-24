@@ -1,3 +1,6 @@
+> **Superseded.** This is the original plan of 2026-09-10, kept for reference. Where it disagrees with
+> [pyre_decisions.md](pyre_decisions.md), the decision log is right. Current state: [STATUS.md](STATUS.md).
+
 <!--
 SUPERSEDED IN PART: docs/pyre_decisions.md (dated log) wins wherever the two disagree —
 notably herbie is gone, the module layout is three modules, and wind is HRRR 3-D cubes.

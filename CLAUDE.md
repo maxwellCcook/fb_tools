@@ -17,11 +17,11 @@ pip install -e . --no-deps   # --no-deps is critical: conda manages GDAL/rasteri
 ```
 fuelscape/
   lfps.py      — LFPS REST API client
-  lcp.py       — stack_rasters, ignition ASCII/shapefile helpers, get_band_by_longname
-  ignitions.py — footprint sizing, FPA-FOD density surface, clustering test,
-                 downwind cone, select_design_ignitions  (Phase 2);
-                 load_fod, ignition_density_grid, convert_density_units, write_density_grids (IDG maps by cause)
-  adjust.py    — adjust_lcp, apply_treatment, build_surface_lut
+  lcp.py       — stack_rasters, clip_lcp, ignition ASCII/shapefile helpers, get_band_by_longname
+  ignitions.py — footprints, FPA-FOD density surface + sampling, clustering test, downwind cone,
+                 design ignitions; load_fod, ignition_density_grid, convert_density_units (IDG by cause)
+  adjust.py    — adjust_lcp, apply_treatment, fuel_break, build_surface_lut, mask_lcp
+  synthetic.py — create_synthetic_lcp; create_combination_lcp, expand_combinations, combination_spread
 models/
   base.py      — run_cli(), _write_shortterm_inputs()
   flammap.py   — run_flammap_scenarios()
@@ -29,31 +29,39 @@ models/
   mtt.py       — run_mtt(), run_mtt_batch()
   fspro.py     — build_fspro_inputs(), build_treatment_pair(), run_fspro(), run_fspro_batch()
   fspro_validate.py — parse_fspro_input(), validate_fspro_input(), assert_valid_fspro_input()
+  container.py — prepare_fspro_experiment() and the FSPro counterfactual set-up
+  pyre.py      — pyretechnics runner: run_realization, burn_landscape, build_runs, run_batch
   cell2fire.py — stub (NotImplementedError)
 spread/
   bp.py        — delta_burn_probability, aggregate_ignition_bp, summarize_bp_treatments,
-                 downwind_treatment_effect  (all reworked in Phase 3a)
-  noise.py     — P0.1 Monte Carlo null bands: bp_noise_floor, area_noise_floor,
-                 required_num_fires, annotate_noise_floor, describe_noise_floor
-  perimeters.py — load_fspro_perimeters, summarize_early_growth, compare_growth
-                  (BROKEN: _Perimeters.shp has malformed LinearRings — use fspro_outputs)
+                 downwind_treatment_effect
+  noise.py     — null bands: bp_noise_floor, area_noise_floor, required_num_fires, annotate_noise_floor
+  perimeters.py — BROKEN (_Perimeters.shp has malformed LinearRings) — use fspro_outputs
   fspro_outputs.py — read_daily_acres(), check_domain_adequacy()
-  convert.py   — stub: lcp_to_cell2fire, build_cell2fire_weather
+  episodes.py  — pyre weather episodes, hourly frames, wind cubes
+  pyre_outputs.py — per-run summaries, paired deltas, ensemble rasters, grid checks, pruning
+  transmission.py — treatment shadow, structure blocks, lead time, near-field profile
+  convert.py   — destack_lcp, raster_to_layers; Cell2Fire stubs
 suppression/
   roads.py     — fetch_osm_roads() via osmnx
   sdi.py       — calculate_sdi(), calculate_delta_sdi()
+  containment.py — containment rules for stepped pyre runs (PyreFirelines; SectorContainment experimental)
+active_fire/   — FIRMS access, QA, events, footprints, grids, treatments, plots
 utils/
-  geo.py       — mask_raster, rasterize, clip_raster_inplace, lookup_pyrome, is_valid_geom
-  io.py        — list_files()
+  geo.py       — mask_raster, rasterize, clip_raster_inplace, lookup_pyrome, snapped_grid, is_valid_geom
+  io.py        — list_files(), raster_write_kwargs()
   plot.py      — plot_bands()
 analysis/
   zonal.py     — zonal statistics helpers
   treatments.py — deprecated stub → import from tealom.analyses
+plotting/
+  treatments.py — flame-length, crown-state and SDI figures
 weather/
-  hrrr.py      — HRRR fire-hour wind extraction; pyrome wind climatology
+  hrrr.py      — HRRR fire-hour wind extraction; pyrome wind climatology; per-episode wind grids
   gridmet.py   — GEE GridMET CSV → ERC arrays, classes, stats; FlamMap scenario cache
   nfdrs.py     — NFDRS fuel moisture (EMC, 1-hr, 10-hr)
   rtma.py      — NWS RTMA → NFDRS78 dead FM (FM1/FM10/FM100) + GSI live FM; build_rtma_scenario_fm
+  fm_scenario.py — build_fm_timeseries, extract_scenario_fm
 ```
 
 ## Code conventions
@@ -63,12 +71,14 @@ weather/
 - `print()` for progress; no `logging` module
 - Deferred imports for heavy/optional deps (`osmnx`, `pyretechnics`) so `import fb_tools` never fails
 
-## Planned work
+## Status, history and planned work
 
-Not-yet-started items, written to be picked up cold: `docs/WORKPLAN.md` (urban fuel models);
-`docs/ACTIVE_FIRE_PLAN.md` (`fb_tools.active_fire`: FIRMS + minimal earthaccess swath access, QA, footprints,
-gridded FRP, first-detection grid, point-pattern metrics, TWIG/CFT treatment summaries, plots/animations — ported
-from potr5-fb and AspenAcres; decisions and open items logged there).
+- `docs/STATUS.md` — what each module does and its state. Update it when a module's state changes.
+- `docs/DEVELOPMENT.md` — dated development notes, work in progress, planned work, and the detailed FSPro
+  phase records. Add a dated entry there for any decision or finding; keep this file to what a session needs
+  to work correctly.
+- `docs/pyre_decisions.md` (pyretechnics) and `docs/ACTIVE_FIRE_PLAN.md` (`fb_tools.active_fire`) are the
+  detailed logs for those two areas.
 
 ## pyretechnics transmission (branch `pyre-transmission`) — prototype stage
 COSWAP transmission moves from FSPro to `pyretechnics` (pinned 2026.8.10, CFRI build `+cfri1`) for
@@ -171,88 +181,28 @@ rows actually written (including `None → 0`); leaving it set without rows made
 `BarrierFill` / `SavePerimeters` / `IgnitionFile` as forecast records (defect #8).
 
 ### FSPro counterfactual workflow
-Spatial container (HUC12/fireshed/POD) as analysis unit. Baseline vs. treated LCP runs share
-one input file and the same `SPOTTING_SEED` → paired comparison via `delta_burn_probability()`.
+Spatial container (HUC12/fireshed/POD) as analysis unit; arms share one input file. Full records of each
+phase (measurements, defects, reasoning) are in `docs/DEVELOPMENT.md` under "Detailed records".
 
-**P0.1 answered (2026-08-05, VM, 416 sample @ 100 fires / Duration 7): `SPOTTING_SEED` does NOT
-give common random numbers.** Two runs at the *same* seed differ on 66% of burned cells
-(|ΔBP| p95 = 0.07, max 0.18). Same-seed and different-seed noise are statistically
-indistinguishable (p95 0.07 vs 0.05) — the seed reaches only spotting, not the ERC stream or wind
-draws, so it buys **no variance reduction at all**. Consequences:
-- Pairing is statistical, never exact. **Every reported Δ needs a null band.**
-- Per-pixel ΔBP noise scales as 1/√N: p95 ≈ 0.022 at N=1,000, ≈ 0.011 at N=4,000.
-  Resolving a 0.01 BP effect needs **N ≈ 4,900**.
-- **`Σ BP × cell_area` (the Ager TF_ij estimator) is far more robust** — pixel errors average out.
-  Expected area burned varies only 1.46% run-to-run at N=100, ≈ 0.23% at N=4,000. Prefer
-  area-integrated transmission metrics over pixel-level ΔBP wherever the question allows.
-- Runtime measured at **1.22 s/fire at Duration 7** on this 740×783 @ 90 m grid → ~4.1 h per run at
-  `Duration=21, NumFires=4000`; 30 runs ≈ 5.1 days serial, ≈ 1.3 days at 4 concurrent processes.
-
-P0.2 (full runtime grid) and P0.3 (ignition footprint size) remain unrun — see
-`code/dev/FSPro/p0_experiments.py`.
-
-### Phase 2 — domain, arms, and design fires
-**`prepare_fspro_experiment()` is the entry point.** `prepare_container_fspro` and
-`prepare_counterfactual_fspro` are frozen (one/two arms, one ignition, no new features);
-`prepare_counterfactual_ignition_set` is a deprecated alias that raises on the removed
-`sector_deg` / `require_treatment_intersect` kwargs.
-
-- **N arms**: `lcps={"untreated": …, "background": …, "coswap": …}` + `contrasts`
-  (default = every ordered pair, so the Phase 3 additivity check has all three).
-  Two-arm `baseline_lcp_path`/`treated_lcp_path` shim still works; mixing the two raises.
-  `runs.csv` gains an `Arm` column and a `w_i` column; `output_basename` is the arm name.
-- **Grid congruence is asserted before any run** — CRS, transform, and shape must match
-  across arms, because `xr.align(join="left")` in `delta_burn_probability` would silently
-  paper over a mismatch and return a plausible, wrong Δ surface.
-- **`domain_gdf` is never used to clip** — validation and manifest provenance only. It
-  warns when the LCPs don't cover the domain. `container_gdf` in
-  `postprocess_fspro_outputs` is documented display-only; Δ statistics run unclipped.
-- **`ignition_mode` has no default** (defect #1). Omitting it raises with an explanation.
-  `"container"` is kept only for reproducing an observed fire from its real perimeter.
-- **One shapefile per ignition** (P2.5). `create_random_ignitions` and
-  `create_fod_ignitions` now return `list[Path]` and take an `out_dir`, not an `out_path`.
-  Both used to write all N circles into one file, which FSPro reads as one fire starting
-  simultaneously at all N points. `create_fod_ignitions`' old docstring claim that
-  overlapping circles weight dense areas proportionally was false for the same reason.
-- **Ignition footprint** defaults to a **10-acre** day-1 perimeter (`footprint_acres`);
-  `None` gives the old half-pixel circle. P0.3 has not been run — revisit when it is.
-  `footprint_ac` is measured off the written polygon (≈9.999 for a nominal 10), not the
-  nominal circle.
-- **Downwind cone replaces the zero-width ray test.** Measured on the real LCP: the ray
-  kept 7,219 of 20,732 candidates where the cone keeps 20,656 — **the ray discarded 65%
-  of sources whose fire would burn straight through the treatment.** Half-angle defaults
-  to the narrowest arc holding 50% of non-calm fire-hour wind frequency
-  (`wind_cone_half_angle`) — **±38° for pyrome 47**, vs ±16° at 25% coverage.
-- **Design fires** are stratified over bearing × distance (default 3×2), allocated
-  proportional to each stratum's density mass with ≥1 per non-empty stratum, and drawn
-  within a stratum ∝ density. Weights are Horvitz–Thompson,
-  `w_i = stratum_mass / draws_in_stratum`, normalized to sum 1.
-- `ignition_density_surface` smooths on a **coarsened working grid** (σ ≈ 4 cells) and
-  resamples back. Smoothing at LCP resolution with a 20 km bandwidth is a 667-cell σ over
-  a heavily padded array and does not terminate.
-- **The public clustering function is `check_ignition_clustering`, not `test_*`** — a
-  public `test_`-prefixed name gets collected by pytest in any suite that imports it.
-
-### P2.2 ANSWERED — Ager's uniform-ignition assumption FAILS for Colorado
-`code/dev/FSPro/p2_ignition_clustering.{py,json}` (committed; `data/` is gitignored).
-FPA-FOD Class D–G, **1992–2024**, CO pyromes, 199 sims. Mean nearest-neighbour distance,
-observed ÷ CSR null:
-
-| subset | n | obs NN | null NN | ratio | p | L(r)−r @ 50 km |
-|---|---|---|---|---|---|---|
-| all     | 2,864 | 5,561 m | 7,715 m  | 0.721 | ≤0.01 | +11,074 |
-| natural | 1,355 | 7,322 m | 11,320 m | **0.647** | ≤0.01 | **+27,158** |
-| human   | 1,184 | 8,835 m | 12,118 m | 0.729 | ≤0.01 | +12,497 |
-
-All clustered; `L(r)−r` is outside the envelope at every radius 5–50 km. **The Natural
-(lightning) subset is the most clustered** — exactly the population Ager described as
-*"lightning caused and randomly located"*. Density-weighted sampling is therefore a real
-methodological improvement here, not a refinement.
-
-**Caveat to state when reporting:** the null is CSR over the pyrome polygons, *not*
-restricted to burnable fuel, because no pyrome-wide FBFM40 is on disk. Some of the
-clustering is fuel availability rather than ignition process. `mask_burnable=True` with
-an `lcp_fp` runs the stronger test once such a landscape exists.
+- **`SPOTTING_SEED` does not give common random numbers** (P0.1, 2026-08-05): pairing is statistical, never
+  exact, and **every reported Δ needs a null band** (`spread/noise.py`, calibrated on P0.1 and scaled 1/√N;
+  `area_noise_floor(for_difference=True)`; `annotate_noise_floor(metric="area")` needs a `total_col`).
+  Prefer `Σ BP × cell_area` over pixel ΔBP. ~1.22 s/fire at Duration 7 on 740×783 @ 90 m.
+- **`prepare_fspro_experiment()` is the entry point** (`prepare_container_fspro` /
+  `prepare_counterfactual_fspro` are frozen). N arms via `lcps={...}` + `contrasts`; `runs.csv` carries
+  `Arm` and `w_i`. Grid congruence across arms is asserted before any run. `domain_gdf` never clips.
+  `ignition_mode` has no default. One shapefile per ignition (`create_*_ignitions` return `list[Path]`,
+  take `out_dir`). Default footprint 10 acres.
+- **Design fires**: downwind cone (half-angle = narrowest arc holding 50% of fire-hour wind; ±38° for
+  pyrome 47), stratified bearing × distance, Horvitz–Thompson weights. Colorado ignitions are clustered
+  (P2.2), so sampling is density-weighted. `ignition_density_surface` smooths on a coarsened grid. The public
+  clustering function is `check_ignition_clustering`, never `test_*`.
+- **Phase 3a API**: `summarize_bp_treatments(zones_gdf, delta_bp=…)` or `(…, baseline_bp=…, treatment_bp=…)`;
+  `delta_burn_probability` writes `DELTA_NODATA = -32768` and checks the grid (`strict_grid=True`);
+  `aggregate_ignition_bp` uses the design weights — mask BP surfaces with `n_burned`, not `n_ignitions`;
+  the ignition footprint is masked from every Δ statistic (`ignition=` / `ignitions=`);
+  `run_fspro(check=True)` fails unless the run exits 0 and writes output.
+- P0.2 (runtime grid) and P0.3 (footprint size) are unrun — `code/dev/FSPro/p0_experiments.py`.
 
 ### FPA-FOD on disk — mind the vintage
 - **Authoritative, through 2024**: `/Users/mcc/Library/CloudStorage/Box-Box/MCC/data/
@@ -263,47 +213,6 @@ an `lcp_fp` runs the stronger test once such a landscape exists.
   export holding only **1992–2009**. The `.accdb` beside it is the full draft 7th ed.
 - `_NB_CODES = {0, 91, 92, 93, 98, 99}` in `lcp.py` is **correct** — Scott & Burgan FBFM40
   defines NB1/2/3/8/9 only; 94–97 are unassigned. (Plan flagged this as needing a check.)
-
-### Phase 3a — pre-flight correctness (branch `fspro-phase3a`)
-Scoped ahead of the COSWAP production test: fix what would silently corrupt results or
-waste a multi-day campaign. The analysis layer (P3.1 remainder, P3.3 transmission matrix,
-P3.4 exposure, P3.5 decomposition) is deliberately deferred to Phase 3b, to be built
-against real output.
-
-- **`summarize_bp_treatments` is a rewrite, not a patch — its signature changed.** The old
-  one called `geom_to_raster_crs` with **three** args against a two-arg signature, so it
-  raised `TypeError` on the first polygon and **had never run**. It now takes
-  `(zones_gdf, delta_bp=…)` or `(zones_gdf, baseline_bp=…, treatment_bp=…)` and computes
-  zonal stats on the **aligned** Δ raster. Returns `dBP_sum_ha` — the area-integrated
-  ΔTF_ij estimator — alongside the pixel means.
-- **`delta_burn_probability` writes explicit nodata** (`DELTA_NODATA = -32768`). Masked
-  pixels used to descale to a plausible-looking **−327.68**. Overflow is now rejected.
-- **Grid congruence is enforced at difference time** (`strict_grid=True`), not just in
-  `prepare_fspro_experiment`. `xr.align(join="left")` silently papers over a shape or
-  half-pixel transform mismatch and returns a plausible, wrong Δ surface.
-- **`aggregate_ignition_bp` consumes the design weights.** Phase 2 wrote `w_i` to
-  `runs.csv` and nothing read it. Weights are resolved against the **full** input list
-  before dropping ignitions with missing output, so a dropped arm cannot shift the
-  weight-to-ignition correspondence. `delta_std` is now written to disk.
-- **`n_ignitions` cannot detect co-burn for BP** — unburned interior pixels are `0.0`, not
-  nodata, so it equals the ignition count almost everywhere. **Use the new `n_burned`** to
-  mask BP surfaces; `n_ignitions` remains correct for FL/arrival grids, which are NaN
-  outside the burn.
-- **The ignition footprint is masked from every Δ statistic** (`ignition=` on all four
-  entry points; `ignitions=` takes one footprint per design fire).
-- **`downwind_treatment_effect`**: `src_crs` was hard-set to `None` on both branches, so
-  the reprojection was unreachable and a WGS84 polygon returned all-NaN. Now resolves CRS
-  from the object, then `src_crs`. FlamMap's `-1`/`-2` slope sentinels are rejected.
-- **`run_fspro(check=True)` is the highest-value fix for production.** `subprocess.run`
-  had no `check`, the return code was never read, and `run_fspro_batch` marked any
-  non-raising run `"success"`. A run now fails loudly unless it exits `0` **and** writes
-  output; the batch prints a failure summary and carries `Arm`/`w_i` through.
-
-**Noise floors (`spread/noise.py`).** P0.1 settled that every reported Δ needs a null band
-and nothing computed one. Calibrated on the P0.1 measurement (N=100, Duration 7: pixel
-|ΔBP| p95 0.07, area CV 1.46%) and scaled by 1/√N. `area_noise_floor(for_difference=True)`
-applies the √2 two-run inflation; the area calibration is a **CV on the total**, so
-`annotate_noise_floor(metric="area")` requires a `total_col`, not just the delta.
 
 ### FSPro outputs
 - `_DailyAcres.txt` — `day,acres`, **daily increments**, one block of `Duration` rows per fire.
@@ -365,7 +274,7 @@ tags. `expand_combinations(combo_lcp, output, baseline, treatment)` rebuilds a f
 ## Tests
 `pytest` from the repo root (conda env `fb_tools`). Tests needing model output or cached weather
 **skip** when absent, since `data/` is gitignored. `tests/conftest.py` holds the data paths.
-335 tests as of Phase 3a: `test_fspro_input.py`, `test_fspro_outputs.py`, `test_erc_classes.py`,
+575 tests as of 2026-11-24 (335 at Phase 3a). FSPro and weather files: `test_fspro_input.py`, `test_fspro_outputs.py`, `test_erc_classes.py`,
 `test_current_erc.py`, `test_wind_cells.py`, `test_fspro_write_validation.py`,
 `test_fm_timeseries.py`, `test_ignitions.py`, `test_experiment_api.py`, plus Phase 3a's
 `test_bp_delta.py`, `test_noise_floor.py`, `test_fspro_runcheck.py`.

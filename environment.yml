@@ -70,7 +70,8 @@ dependencies:
   - osmnx>=1.9               # OSM road/trail network fetch for SDI inputs
 
   # ── HTTP / I-O ─────────────────────────────────────────────────────────────
-  - requests>=2.28           # LFPS REST API client
+  - requests>=2.28           # LFPS REST API client; FIRMS API (active_fire/firms.py)
+  - pyarrow>=14              # Parquet caches (FIRMS per-day cache, RTMA daily FM)
 
   # ── Visualization ──────────────────────────────────────────────────────────
   - matplotlib>=3.7

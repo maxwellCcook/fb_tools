@@ -32,6 +32,12 @@ pip install -e . --no-deps
 
 > **Windows:** Always create and activate the environment from Anaconda Prompt, not PowerShell.
 
+**Check the install:** `python -c "import fb_tools.active_fire"` should print nothing.
+
+**Updating:** `git pull` in the repo folder. The editable install picks up code changes; rebuild the environment only when `environment.yml` changes.
+
+**FIRMS key (active fire only):** `fb_tools.active_fire.fetch_firms` needs a free [FIRMS MAP_KEY](https://firms.modaps.eosdis.nasa.gov/api/map_key/). Pass it as `map_key=` or set `FIRMS_MAP_KEY` for the session; never save it in a notebook.
+
 ---
 
 ## Package Structure
@@ -44,6 +50,7 @@ fb_tools/
 ├── spread/        Burn probability analysis, treatment effects, FSPro perimeter growth
 ├── suppression/   Suppression Difficulty Index (SDI) via Rodriguez y Silva
 ├── analysis/      Zonal statistics and treatment-level fire behavior summaries
+├── active_fire/   VIIRS/MODIS detections (FIRMS): QA, footprints, gridded FRP, first detection, treatments, plots
 └── utils/         Shared geo helpers: mask, clip, rasterize, plot
 ```
 

@@ -36,6 +36,10 @@ fb_tools.plotting
 
 fb_tools.weather
     Weather input generation — GridMET, RAWS (coming soon).
+
+fb_tools.active_fire
+    Active-fire detections — FIRMS access, QA, event association, footprints,
+    gridded FRP and first-detection grids.
 """
 
 from .fuelscape import (
@@ -142,6 +146,30 @@ from .weather import (
     calc_emc,
     calc_1hr_fm,
     calc_10hr_fm,
+)
+from .active_fire import (
+    fetch_firms,
+    firms_sources,
+    standardize_firms,
+    map_events,
+    apply_qa,
+    drop_low_confidence,
+    drop_static_sources,
+    remove_interscan_duplicates,
+    assign_overpass,
+    to_local,
+    associate_detections,
+    fetch_wfigs_perimeters,
+    fired_events,
+    footprint_boxes,
+    afd_grid,
+    gridded_frp,
+    first_detection_grid,
+    treatment_detections,
+    plot_grid,
+    plot_detections,
+    plot_detection_series,
+    plot_footprint_workflow,
 )
 from .plotting import (
     plot_fl_stackedbar,
@@ -263,6 +291,29 @@ __all__ = [
     "plot_fl_delta_bar",
     "plot_cs_stackedbar_multipct",
     "plot_sdi_boxplot",
+    # active_fire
+    "fetch_firms",
+    "firms_sources",
+    "standardize_firms",
+    "map_events",
+    "apply_qa",
+    "drop_low_confidence",
+    "drop_static_sources",
+    "remove_interscan_duplicates",
+    "assign_overpass",
+    "to_local",
+    "associate_detections",
+    "fetch_wfigs_perimeters",
+    "fired_events",
+    "footprint_boxes",
+    "afd_grid",
+    "gridded_frp",
+    "first_detection_grid",
+    "treatment_detections",
+    "plot_grid",
+    "plot_detections",
+    "plot_detection_series",
+    "plot_footprint_workflow",
 ]
 
 

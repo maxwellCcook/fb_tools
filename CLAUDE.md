@@ -19,7 +19,8 @@ fuelscape/
   lfps.py      — LFPS REST API client
   lcp.py       — stack_rasters, ignition ASCII/shapefile helpers, get_band_by_longname
   ignitions.py — footprint sizing, FPA-FOD density surface, clustering test,
-                 downwind cone, select_design_ignitions  (Phase 2)
+                 downwind cone, select_design_ignitions  (Phase 2);
+                 load_fod, ignition_density_grid, convert_density_units, write_density_grids (IDG maps by cause)
   adjust.py    — adjust_lcp, apply_treatment, build_surface_lut
 models/
   base.py      — run_cli(), _write_shortterm_inputs()
@@ -62,6 +63,13 @@ weather/
 - `print()` for progress; no `logging` module
 - Deferred imports for heavy/optional deps (`osmnx`, `pyretechnics`) so `import fb_tools` never fails
 
+## Planned work
+
+Not-yet-started items, written to be picked up cold: `docs/WORKPLAN.md` (urban fuel models);
+`docs/ACTIVE_FIRE_PLAN.md` (`fb_tools.active_fire`: FIRMS + minimal earthaccess swath access, QA, footprints,
+gridded FRP, first-detection grid, point-pattern metrics, TWIG/CFT treatment summaries, plots/animations — ported
+from potr5-fb and AspenAcres; decisions and open items logged there).
+
 ## pyretechnics transmission (branch `pyre-transmission`) — prototype stage
 COSWAP transmission moves from FSPro to `pyretechnics` (pinned 2026.8.10, CFRI build `+cfri1`) for
 mechanistic spotting, exact pairing (common random numbers), and native arrival time. **Decisions and
@@ -78,15 +86,16 @@ what is logged there.
   `build_fast_fires_table` on a new FIRED release) or a named event — and a
   `rank` — seeded random (default) or top-n by `erc_day1`/`erc_mean`),
   `spread/pyre_outputs.py` (`summarize_realization`, `paired_deltas`, `suppression_summary`/`_batch`, `aggregate_realizations`,
-  `firebrand_production`, `edge_contact`), `spread/transmission.py` (`structure_blocks`, `treatment_shadow`,
+  `firebrand_production`, `edge_contact`, `prune_realizations` — drops per-run rasters once summaries and ensemble rasters are written), `spread/transmission.py` (`structure_blocks`, `treatment_shadow`,
   `realization_transmission`, `summarize_blocks`, `shadow_probability` — the location product: share of the
   fire reaching each cell that passed through a treatment, MFD-weighted, one triangular solve; and the
   near field: `changed_cells` (the treatment as the engine sees it), `distance_bands`, `near_field_zones`
-  (mask zones — `all_touched` polygons a few cells wide leak into their own collar), `lee_profile` /
+  (mask zones — `all_touched` polygons a few cells wide leak into their own collar), `ember_descent` (burn the shadow cannot trace), `treatment_entry_time` (the `lead_h` clock), `shadow_agreement` (shadow vs the paired change; the shadow is a baseline-arm product), `lee_profile` /
   `lee_profile_batch` / `summarize_lee_profile` / `near_field_headlines` — paired deltas by distance from
   the treatment, split by the baseline run's shadow; recovery distance, carried delay, hauling-chart classes),
   `spread/convert.py` (`destack_lcp`, `raster_to_layers` — a statewide raster windowed onto a layers grid), `fuelscape/lcp.py::clip_lcp` (SFA + buffer window, 100-cell
-  multiples), `fuelscape/ignitions.py::sample_density_ignitions` (FSim-style sites ∝ FOD density, uniform
+  multiples), `fuelscape/adjust.py::fuel_break` (treated corridor along lines via `apply_treatment` + tealom
+  effects tables → LCP for `destack_lcp`; notebook §5b is the fuel-break counterfactual: one named fire, three arms, 20 spotting seeds at 14 days, breakout rate and `shadow_agreement`), `fuelscape/ignitions.py::sample_density_ignitions` (FSim-style sites ∝ FOD density, uniform
   `w_i`). A fire that never leaves its footprint is `stop_condition == "no_spread"`, not an error. **Example**: `code/notebooks/01f_PyreBuild.ipynb` on the
   `front_range` test AOI (LFPS download in `data/spatial/mod/fuelscapes/front_range/`, 3000×1000 @ 30 m,
   pyrome 46): destack → potential map → 3 episodes + HRRR cubes → 30 IDG sites (FOD class ≥ C, 10 km
@@ -305,6 +314,53 @@ applies the √2 two-run inflation; the area calibration is a **CV on the total*
   `_EventCoverage.txt`, `_Suppression.asc`.
 - `Σ BP × cell_area` over the domain ≈ mean simulated fire size (verified within 7% on the p47 run) —
   the identity behind the Ager `TF_ij` transmission estimator.
+
+## Ignition density grids by cause (`fuelscape/ignitions.py`, 2026-11-12)
+`load_fod(fp, aoi=, buffer_m=, years=, size_classes=)` pushes bbox + where into the read (sub-second for a county
+set) and adds `cause` ∈ human/natural/unknown. `ignition_density_grid(fod, aoi, res_m, bandwidth_m)` → xarray
+Dataset in **fires/yr/100 km²**: one layer per cause, `all` (incl. unknown), `human_share` (NaN where the kernel
+holds < `share_min_fires`, effective count `rate × years × 4πσ²`), `difference`. Any projected `crs`; in
+EPSG:5070 edges snap to LANDFIRE pixel edges (15 m mod 30), elsewhere to multiples of `res_m`; or `template=` a raster. `adaptive=True` is Abramson's square-root
+law (σ_i = σ₀·√(g/f̃), clipped to [σ₀/`trim`, σ₀·`trim`]); σ is set from **all fires pooled** and shared by every
+cause (Davies et al. 2016 symmetric estimator) so `human_share` compares like with like — the lightning layer stays
+spotty on the plains for that reason. Per-fire σ is binned into `n_bandwidth_bins` log classes, each smoothed once
+(~4 s at 90 m for the Larimer AOI); adds `bandwidth_local` (kernel-weighted σ, m), which also feeds the share mask.
+Not burnable-masked — `ignition_density_surface` is the LCP sampling frame. Both share `_smooth_points_onto_grid`; the refactor fixed a resampling offset that put
+the surface ~σ/8 up-left of the points. Notebook `code/notebooks/ignitions/IgnitionDensity.ipynb` (was 00e) (Larimer + 6
+touching counties, UTM 13N, 90 m, adaptive σ₀ 2.5 km (2 km left 18% of the share map blank, 2.5 km 4%), all sizes, ≥1,000 ac fires as points by cause, light reference
+layers — OSM motorway/trunk/primary + place points cached in `data/spatial/raw/reference/`, TIGER 2020 urban areas,
+county-seat labels; pyrome/west/CONUS cells off by default). Overpass: set `ox.settings.max_query_area_size` large
+for a filtered query — osmnx's default subdivision (~20 sub-queries here) gets rate-limited for >10 min. A fixed
+σ ≤ 2 km turns lightning into a dot field and blanks most of the share map; that is why the adaptive kernel exists.
+FOD classes a fire Human when lightning is ruled out — 38% of CO+WY human-classed fires have an undetermined
+`NWCG_GENERAL_CAUSE` (48% of those ≥1,000 ac, e.g. Cameron Peak).
+`convert_density_units(ds, per_year=, area=)` re-expresses the layers (km2/100km2/mi2/100mi2, per year or over the
+record); 00e maps and GeoTIFFs use **ignitions per km² over `YEARS` = 2013–2024** on a shared classed log scale (1-3-10
+edges, so the ~16× people-vs-lightning gap shows as classes) with plain-language labels for a general audience, an ignitions-per-year-by-county chart and a federal-agency-only 1992–2024 series (§5), PNGs in
+`OUT/<aoi>/figures/`. Records named as prescribed/pile burns (`RX_PATTERN`, 7 here) are dropped; FPA-FOD already
+screens prescribed fire out. **FOD reporting changes over time here** (always tabulate spatially — `FIPS_NAME` is
+blank on many records): 1992–2009 is almost all federal-agency reports (federal land, mountains); state & local
+(`NWCG_REPORTING_AGENCY == "ST/C&L"`: ST-NASF to 2020, InFORM from 2021) begins 2010, but 2011 is ~1,400 no-cause
+records and 2012 only ~30 — complete from **2013**. Federal agencies moved from FS-FIRESTAT/DOI-WFMI to IRWIN (2020)
+and InFORM (2021+), so split federal vs state by `NWCG_REPORTING_AGENCY`, never `SOURCE_SYSTEM_TYPE`. **Cause detail**: `NWCG_GENERAL_CAUSE` is the finest cause field; in 2021–2024 InFORM codes state & local fires with no specific cause as "Other causes" (~3,650 here) where earlier years used "undetermined" — read the two together (~70% of ignitions have no specific cause). Tests: `tests/test_ignition_density.py`.
+**AGOL** (`code/notebooks/ignitions/IgnitionAGOL.ipynb`, run after IgnitionDensity, on the Mac; publish with `IgnitionAGOL_Publish.ipynb` in ArcGIS Pro on the VM — Pro's Python only, no `fb_tools`, the pods-atlas build/publish split): one GeoPackage → one hosted feature layer —
+`ignitions` (points, 2013–2024; public FOD services stop at 2020), `density_human`/`density_lightning`/`share_human`
+(the GeoTIFFs as classed polygons at `CLASS_EDGES`, coverage-simplified; hosted rasters need the Image extension),
+`counties`. Perimeters (NIFC history, WFIGS) and WFIGS current incidents are streamed in the web map, not published.
+Updates **overwrite** the item (keeps id/URL; same layers and fields); new datasets go in new items.
+
+## Combination LCP (`fuelscape/synthetic.py`, 2026-09-28)
+FlamMap once per unique fuel combination instead of once per pixel. Valid when a cell's output
+depends only on its own bands: uniform weather, upslope wind (`WIND_DIRECTION: -1`), no gridded
+winds, no conditioning. `combination_spread(lcp, output)` is the check (all zeros). A fixed wind
+direction adds `Asp` to `keys`; conditioning adds `Elev` and `Asp`; gridded winds rule it out.
+`create_combination_lcp(baseline, out, treatments)` writes block 0 = each unique baseline
+combination once (a real pixel's band row), then one block per treatment (``fn(DataArray)``, e.g.
+a `partial` of `apply_treatment`) applied to block 0 — cell *j* of every block traces to baseline
+combination *j*, so no treated rasters or lookup table are needed. Layout and keys live in GeoTIFF
+tags. `expand_combinations(combo_lcp, output, baseline, treatment)` rebuilds a full-grid stack
+(tagged `EXPANDED_TAG` when written). First used on treatment_effects: 22 arms + baseline in a
+4,393 x 192 LCP, 3 runs instead of 69. Tests: `tests/test_combination_lcp.py` (engine-free).
 
 ## Tests
 `pytest` from the repo root (conda env `fb_tools`). Tests needing model output or cached weather

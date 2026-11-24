@@ -106,7 +106,27 @@ def build_surface_lut(surface_df, scenario_col, fm_col="FBFM40"):
     return lut
 
 
-def apply_treatment(lcp, canopy_df, surface_df, scenario, band_map=None, mask=None, fill_val=-999):
+def _factor(band, af):
+    """AF as a scalar, or per pixel from a Series indexed by the pre-treatment band value.
+
+    Raises if a valid (non-negative) pixel value has no entry; nodata gets 1.0.
+    """
+    if np.ndim(af) == 0:
+        return float(af)
+    order = np.argsort(np.asarray(af.index, dtype=np.float64))
+    keys = np.asarray(af.index, dtype=np.float64)[order]
+    vals = np.asarray(af.values, dtype=np.float32)[order]
+    v = band.values
+    i = np.clip(np.searchsorted(keys, v), 0, len(keys) - 1)
+    hit = keys[i] == v
+    missing = ~hit & (v >= 0)
+    if missing.any():
+        raise ValueError(f"AF lookup has no entry for band values {np.unique(v[missing])}")
+    return band.copy(data=np.where(hit, vals[i], np.float32(1)))
+
+
+def apply_treatment(lcp, canopy_df, surface_df, scenario, band_map=None, mask=None, fill_val=-999,
+                    cc_floor=None):
     """
     Apply a fuel treatment scenario to an LCP DataArray.
 
@@ -121,7 +141,9 @@ def apply_treatment(lcp, canopy_df, surface_df, scenario, band_map=None, mask=No
         Multi-band landscape raster opened with rioxarray.
     canopy_df : pd.DataFrame
         Canopy effects table.  Must have a ``Treatment`` column plus
-        ``cc_AF``, ``ch_AF``, ``cbh_AF``, ``cbd_AF`` columns.
+        ``cc_AF``, ``ch_AF``, ``cbh_AF``, ``cbd_AF`` columns.  Each factor is a
+        scalar, or a Series indexed by the pre-treatment band value (object
+        column) for a factor that depends on pre-treatment condition.
     surface_df : pd.DataFrame
         Surface effects table.  Must have a ``FBFM40`` column and one
         column per treatment type containing the post-treatment fuel model.
@@ -133,11 +155,19 @@ def apply_treatment(lcp, canopy_df, surface_df, scenario, band_map=None, mask=No
         Maps band names to 1-based integer indices, e.g.
         ``{"FBFM40": 4, "CC": 5, "CH": 6, "CBH": 7, "CBD": 8}``.
         Auto-detected from the ``long_name`` raster attribute if ``None``.
+        ``CC`` and ``FBFM40`` are required; other canopy bands are optional.
     mask : xarray.DataArray, optional
         Boolean DataArray aligned to *lcp*.  Where ``True`` the treatment
         is applied; elsewhere the original values are kept.  Pass ``None``
         (default) to apply the treatment to every pixel (landscape-scale).
     fill_val : int, optional
+    cc_floor : int, optional
+        If given, only pixels whose post-treatment CC floors to 0 lose their
+        canopy; those with 0 < CC < *cc_floor* are held at *cc_floor*, and the
+        other canopy bands keep their own factors.  Pixels whose pre-treatment
+        CC is already below *cc_floor* keep every canopy band untouched (the
+        wall neither raises nor clears them).  ``None`` (default) keeps the
+        CC >= 10 forest rule.
 
     Returns
     -------
@@ -156,11 +186,18 @@ def apply_treatment(lcp, canopy_df, surface_df, scenario, band_map=None, mask=No
     if isinstance(lcp, (str, Path)):
         lcp = rxr.open_rasterio(Path(lcp), masked=True)
 
-    # --- Create a band map from the input LCP
-    long_names = lcp.attrs.get("long_name", [])
-    band_map = {
-        _normalize_band_name(name): idx for idx, name in enumerate(long_names, start=1)
-    }
+    # --- Band map: the caller's, else from the LCP's band names
+    if band_map is None:
+        long_names = lcp.attrs.get("long_name", [])
+        if isinstance(long_names, str):
+            long_names = [long_names]
+        band_map = {
+            _normalize_band_name(name): idx for idx, name in enumerate(long_names, start=1)
+        }
+    missing = [b for b in ("CC", "FBFM40") if b not in band_map]
+    if missing:
+        raise ValueError(f"apply_treatment needs band(s) {missing}; band_map resolves to {sorted(band_map)}. "
+                         "Pass band_map= for an LCP without band names.")
 
     out = lcp.copy(deep=True)
 
@@ -185,18 +222,24 @@ def apply_treatment(lcp, canopy_df, surface_df, scenario, band_map=None, mask=No
 
     # post-treatment forest mask (CC >= 10 after treatment)
     cc_band   = lcp.sel(band=band_map["CC"]).astype(np.float32)
-    cc_post   = np.floor(cc_band * float(r["cc_AF"]))
-    is_forest = cc_post >= 10
+    cc_post   = np.floor(cc_band * _factor(cc_band, r["cc_AF"]))
+    is_forest = cc_post >= 10 if cc_floor is None else cc_post > 0
+    # LF2020 has pre-treatment CC 1-9 (10% of canopy cells on NCFC): lifting them to the wall adds sheltering, and
+    # floor(1 x f) = 0 cleared every CC = 1 cell under any factor < 1. Below the wall there is no canopy to treat.
+    below = None if cc_floor is None else (cc_band > 0) & (cc_band < cc_floor)
 
     for band_name, af_col in band_af_pairs:
         if band_name not in band_map:
             continue
         idx = band_map[band_name]
-        arr = np.floor(
-            lcp.sel(band=idx).astype(np.float32) * float(r[af_col])
-        )
+        band = lcp.sel(band=idx).astype(np.float32)
+        arr = np.floor(band * _factor(band, r[af_col]))
         arr = arr.fillna(fill_val)
+        if band_name == "CC" and cc_floor is not None:
+            arr = arr.clip(min=cc_floor)                # cleared pixels are re-zeroed below
         arr = xr.where(is_forest, arr, 0)              # zero out non-forest post-treatment
+        if below is not None:
+            arr = xr.where(below, lcp.sel(band=idx), arr)
         if mask is not None:
             arr = xr.where(mask, arr, lcp.sel(band=idx))  # in-situ: only treated pixels
         out.loc[dict(band=idx)] = arr
@@ -219,6 +262,62 @@ def apply_treatment(lcp, canopy_df, surface_df, scenario, band_map=None, mask=No
     out.loc[dict(band=fidx)] = fm_new
 
     return out
+
+
+def fuel_break(lcp, lines, width_m, canopy_df, surface_df, scenario, out_path=None, **kwargs):
+    """
+    Treat a corridor ``width_m`` wide centred on line features (roads, POD lines,
+    ridgelines) with :func:`apply_treatment`; every cell outside it is unchanged.
+
+    Parameters
+    ----------
+    lcp : str, Path or xarray.DataArray
+        LCP path (opened unmasked, native int16) or an open DataArray with
+        ``long_name`` band metadata.
+    lines : GeoDataFrame or GeoSeries
+        Line (or polygon) features in any CRS; reprojected to the LCP.
+    width_m : float
+        Total corridor width, metres (``width_m / 2`` each side of the line).
+    canopy_df, surface_df, scenario, **kwargs
+        As for :func:`apply_treatment`.
+    out_path : str or Path, optional
+        Write the treated LCP here (int16, band descriptions and nodata kept),
+        ready for ``destack_lcp``.
+
+    Returns
+    -------
+    xarray.DataArray, xarray.DataArray
+        The treated LCP and the boolean corridor mask (valid cells only).
+    """
+    import geopandas as gpd
+    from ..utils.geo import rasterize
+
+    if isinstance(lcp, (str, Path)):
+        lcp = rxr.open_rasterio(Path(lcp), masked=False)
+    if not lcp.attrs.get("long_name"):
+        raise ValueError("lcp has no 'long_name' band metadata")
+    if width_m <= 0:
+        raise ValueError(f"width_m must be positive, got {width_m}")
+
+    geoms = lines.geometry if isinstance(lines, gpd.GeoDataFrame) else lines
+    if geoms.crs is None:
+        raise ValueError("lines need a CRS")
+    corridor = gpd.GeoDataFrame({"treated": [1]}, geometry=[geoms.to_crs(lcp.rio.crs).buffer(width_m / 2.0).union_all()],
+                                crs=lcp.rio.crs)
+    ref = lcp.isel(band=0)
+    mask = rasterize(corridor, ref, attr="treated", fill_val=0) > 0
+    nodata = lcp.rio.nodata
+    if nodata is not None:
+        mask = mask & (ref != nodata)                  # a nodata cell must never gain fuel
+    if not bool(mask.any()):
+        raise ValueError("the corridor touches no valid cell of the LCP")
+
+    out = apply_treatment(lcp, canopy_df, surface_df, scenario, mask=mask, **kwargs)
+    if out_path is not None:
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out.rio.to_raster(out_path, dtype=str(lcp.dtype), **raster_write_kwargs())
+    return out, mask
 
 
 def mask_lcp(lcp, mask, nodata=None, out_path=None, compress="deflate", tiled=True):

@@ -161,11 +161,11 @@ def test_input_is_not_mutated(lcp, keep):
     assert (lcp.values == before).all()
 
 
-def test_output_is_lzw_compressed_and_tiled_by_default(lcp, keep, tmp_path):
+def test_output_is_deflate_compressed_and_tiled_by_default(lcp, keep, tmp_path):
     out_fp = tmp_path / "masked.tif"
     mask_lcp(lcp, keep, out_path=out_fp)
     with rasterio.open(out_fp) as src:
-        assert src.profile["compress"] == "lzw"
+        assert src.profile["compress"] == "deflate"
         assert src.profile["tiled"] is True
 
 

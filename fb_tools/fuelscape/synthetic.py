@@ -1,14 +1,15 @@
 """
-Synthetic LCP (landscape) generation for parameterized fire behavior analysis.
+Synthetic LCP (landscape) generation for FlamMap point fire behavior.
 
-Creates homogeneous single-value GeoTIFFs suitable for FlamMap short-term
-runs where spatial spread is not of interest — only point fire behavior metrics
-(flame length, rate of spread, crown state) for a given combination of fuel
-type and weather conditions.
+Two tools, both for runs where spatial spread is not of interest:
 
-Because every pixel carries identical values, all FlamMap outputs are uniform
-across the raster and the central pixel can be extracted as the representative
-result.
+- :func:`create_synthetic_lcp` writes a homogeneous grid for one fuel /
+  topography combination given in physical units.
+- :func:`create_combination_lcp` writes each unique combination in a baseline
+  landscape once, plus one block per treatment, so a single FlamMap run replaces
+  a full-grid run on the baseline and on every treated version of it;
+  :func:`expand_combinations` maps the result back and
+  :func:`combination_spread` checks that the run settings allow it.
 
 LANDFIRE band encoding
 ----------------------
@@ -17,7 +18,7 @@ FlamMap reads LCP bands by position and expects LANDFIRE-encoded integers:
     Band  Name    Encoding
     ----  ------  -------------------------------------------------------
     1     ELEV    integer metres (stored as-is)
-    2     SLP     integer percent (stored as-is)
+    2     SLP     integer degrees (``create_synthetic_lcp`` converts from percent)
     3     ASP     integer degrees 0–360; -1 for flat terrain
     4     FBFM40  surface fuel model code (stored as-is)
     5     CC      canopy cover, integer percent 0–100
@@ -30,6 +31,7 @@ FlamMap reads LCP bands by position and expects LANDFIRE-encoded integers:
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import rioxarray  # noqa: F401 — activates .rio accessor
 import xarray as xr
 
@@ -86,7 +88,7 @@ def create_synthetic_lcp(
     out_path : str or Path
         Destination GeoTIFF path.  Parent directories are created if absent.
     n_pixels : int
-        Side length of the square output grid (default ``5``).
+        Side length of the square output grid (default ``9``).
     resolution : int or float
         Pixel size in CRS units — metres for EPSG:5070 (default ``30``).
     crs : str
@@ -191,3 +193,249 @@ def create_synthetic_lcp(
 
     print(f"  [create_synthetic_lcp] Wrote {n_pixels}×{n_pixels} LCP → {out_path.name}")
     return out_path.resolve()
+
+
+# ---------------------------------------------------------------------------
+# Combination LCP: one FlamMap cell per unique combination, not per pixel
+# ---------------------------------------------------------------------------
+
+#: LCP bands that determine FlamMap's per-cell output under uniform weather,
+#: upslope wind (``WIND_DIRECTION: -1``), no gridded winds and no fuel-moisture
+#: conditioning.  A fixed wind direction adds aspect; conditioning adds
+#: elevation and aspect.  Confirm with :func:`combination_spread`.
+COMBINATION_KEYS = ("FBFM40", "SlpD", "CC", "CH", "CBH", "CBD")
+
+#: Tag on stacks written by :func:`expand_combinations`, so they are never
+#: mistaken for FlamMap's own output.
+EXPANDED_TAG = {"source": "fb_tools.expand_combinations"}
+
+
+def _band_index(descriptions, name):
+    """0-based band index by name; ``'CC'`` matches ``'LF2016_CC_CONUS'``."""
+    short = [d.split("_")[1] if d and "_" in d else d for d in descriptions]
+    if name not in short:
+        raise ValueError(f"no band {name!r} in {descriptions}")
+    return short.index(name)
+
+
+def _keys(a, descriptions, keys, nodata):
+    """``(n, len(keys))`` int64 keys over the valid cells of a band stack, and the valid mask."""
+    k = a[[_band_index(descriptions, n) for n in keys]]
+    valid = np.ones(k.shape[1:], bool) if nodata is None else (k != nodata).all(0)
+    return k[:, valid].T.astype(np.int64), valid
+
+
+def _read_keys(src, keys):
+    """:func:`_keys` for an open raster, reading only the key bands."""
+    idx = [_band_index(src.descriptions, n) for n in keys]
+    return _keys(src.read([i + 1 for i in idx]), [src.descriptions[i] for i in idx],
+                 keys, src.nodata)
+
+
+def _pack(k, dims):
+    """One int64 per key row."""
+    if (k < 0).any() or (k >= np.asarray(dims)).any():
+        raise ValueError("combination values outside the combination LCP's range")
+    return np.ravel_multi_index(k.T, dims)
+
+
+def combination_spread(lcp_path, output_path, keys=COMBINATION_KEYS):
+    """
+    Largest range of each FlamMap output band within any one combination of *keys*.
+
+    All zeros means FlamMap's output on this landscape is a function of *keys*
+    alone, so the run can be replaced by one on a combination LCP.  Check one
+    full-grid run per project, and again whenever the run settings change.
+
+    Parameters
+    ----------
+    lcp_path, output_path : str or Path
+        A landscape and a FlamMap output stack run on it (same grid).
+    keys : sequence of str
+        LCP band names that define a combination.
+
+    Returns
+    -------
+    dict
+        ``{output band: max within-combination range}`` plus ``n_combinations``.
+    """
+    import rasterio
+
+    with rasterio.open(lcp_path) as src:
+        k, valid = _read_keys(src, keys)
+    packed = _pack(k, k.max(0) + 1)
+    order = np.argsort(packed, kind="stable")
+    p = packed[order]
+    starts = np.flatnonzero(np.r_[True, p[1:] != p[:-1]])
+    spread = {}
+    with rasterio.open(output_path) as src:
+        for i, d in enumerate(src.descriptions, start=1):
+            v = src.read(i)[valid][order]
+            spread[d] = float((np.maximum.reduceat(v, starts)
+                               - np.minimum.reduceat(v, starts)).max())
+    return {**spread, "n_combinations": len(starts)}
+
+
+def create_combination_lcp(lcp_path, out_path, treatments=None, keys=COMBINATION_KEYS):
+    """
+    Write a small LCP: each unique combination of *keys* in a baseline once, per treatment.
+
+    Block 0 holds the baseline's unique combinations, each as the complete band
+    row of a real pixel (the first with that combination), so no band value is
+    invented.  Every treatment is applied to a copy of that block, so cell *j*
+    of block *t* is what treatment *t* makes of baseline combination *j*: the
+    arithmetic is the treatment function's own, and no treated landscape has to
+    be written.  Blocks are stacked top to bottom.
+
+    FlamMap run on the result gives, cell for cell, what a full-grid run gives
+    every pixel with that combination -- provided :func:`combination_spread`
+    is zero under the run settings.  :func:`expand_combinations` maps a run
+    back onto the baseline grid, per treatment.
+
+    Parameters
+    ----------
+    lcp_path : str or Path
+        Baseline landscape.
+    out_path : str or Path
+        Destination GeoTIFF.  Band descriptions, CRS, origin, resolution, dtype
+        and nodata follow *lcp_path*; block layout and *keys* are stored as tags.
+    treatments : dict, optional
+        ``{name: fn}``.  ``fn`` takes and returns an LCP ``xarray.DataArray``
+        (``band`` x ``y`` x ``x`` with a ``long_name`` attribute, as
+        :func:`~fb_tools.fuelscape.adjust.apply_treatment` expects) and must act
+        cell by cell -- e.g. a ``functools.partial`` of ``apply_treatment``.
+    keys : sequence of str
+        LCP band names that define a combination.
+
+    Returns
+    -------
+    pd.DataFrame
+        One row per block: its name and the unique combinations in it.
+    """
+    import json
+
+    import rasterio
+
+    treatments = dict(treatments or {})
+    if "baseline" in treatments:
+        raise ValueError("'baseline' is reserved for block 0")
+    with rasterio.open(lcp_path) as src:
+        desc, profile = src.descriptions, src.profile
+        k, valid = _read_keys(src, keys)
+        _, first = np.unique(_pack(k, k.max(0) + 1), return_index=True)
+        cells = np.flatnonzero(valid)[first]
+        rows = np.stack([src.read(b).ravel()[cells] for b in range(1, src.count + 1)])
+
+    n = rows.shape[1]
+    width = int(np.ceil(np.sqrt(n)))
+    height = -(-n // width)
+    nodata = -9999 if profile["nodata"] is None else profile["nodata"]
+    pad = (np.arange(height * width) >= n).reshape(height, width)
+    base = np.full((len(desc), height * width), nodata, dtype=rows.dtype)
+    base[:, :n] = rows
+    base = base.reshape(len(desc), height, width)
+    da = xr.DataArray(base, dims=("band", "y", "x"),
+                      coords={"band": np.arange(1, len(desc) + 1)},
+                      attrs={"long_name": tuple(desc)})
+
+    blocks = [base]
+    for fn in treatments.values():
+        t = np.asarray(fn(da.copy(deep=True))).astype(base.dtype)
+        t[:, pad] = nodata
+        blocks.append(t)
+    names = ["baseline", *treatments]
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    grid = np.concatenate(blocks, axis=1)
+    profile.update(height=grid.shape[1], width=width, nodata=nodata, **raster_write_kwargs())
+    with rasterio.open(out_path, "w", **profile) as dst:
+        dst.write(grid)
+        dst.descriptions = desc
+        dst.update_tags(combination_blocks=json.dumps(names), combination_block_height=height,
+                        combination_keys=json.dumps(list(keys)))
+    print(f"  [create_combination_lcp] {n:,} combinations x {len(names)} blocks "
+          f"-> {grid.shape[1]} x {width} {out_path.name}")
+    return pd.DataFrame([dict(block=name, combinations=len(np.unique(
+        _keys(b, desc, keys, nodata)[0], axis=0))) for name, b in zip(names, blocks)])
+
+
+def expand_combinations(combo_lcp, combo_output, lcp_path, treatment=None,
+                        outside=0.0, out_path=None):
+    """
+    Rebuild the full-grid FlamMap output of one treatment from a run on a combination LCP.
+
+    Parameters
+    ----------
+    combo_lcp : str or Path
+        Written by :func:`create_combination_lcp`.
+    combo_output : str or Path
+        FlamMap output stack of a run on *combo_lcp*.
+    lcp_path : str or Path
+        The baseline *combo_lcp* was built from (or any landscape whose
+        combinations are all in its baseline block).
+    treatment : str, optional
+        Block to read; ``None`` for the baseline.
+    outside : float
+        Value for cells with no data in *lcp_path*.  FlamMap writes 0 there, not
+        nodata.
+    out_path : str or Path, optional
+        Also write the result, laid out like *combo_output* (dtype, nodata, band
+        descriptions) on *lcp_path*'s grid and tagged with ``EXPANDED_TAG``.
+
+    Returns
+    -------
+    np.ndarray
+        ``(bands, rows, cols)`` in *combo_output*'s dtype and band order.
+
+    Raises
+    ------
+    ValueError
+        If a valid cell of *lcp_path* has a combination absent from the baseline
+        block, or *treatment* is not a block.
+    """
+    import json
+
+    import rasterio
+
+    with rasterio.open(combo_lcp) as src:
+        tags, desc, nodata = src.tags(), src.descriptions, src.nodata
+        names = json.loads(tags["combination_blocks"])
+        h = int(tags["combination_block_height"])
+        keys = json.loads(tags["combination_keys"])
+        ck, cvalid = _keys(src.read(window=((0, h), (0, src.width))), desc, keys, nodata)
+    name = "baseline" if treatment is None else treatment
+    if name not in names:
+        raise ValueError(f"no block {name!r} in {Path(combo_lcp).name}: {names}")
+    b = names.index(name)
+    with rasterio.open(combo_output) as src:
+        profile, odesc = src.profile, src.descriptions
+        cvals = src.read(window=((b * h, (b + 1) * h), (0, src.width)))[:, cvalid]
+
+    dims = ck.max(0) + 1
+    cpacked = _pack(ck, dims)
+    order = np.argsort(cpacked)
+    cpacked, cvals = cpacked[order], cvals[:, order]
+
+    with rasterio.open(lcp_path) as src:
+        k, valid = _read_keys(src, keys)
+        transform, crs = src.transform, src.crs
+    packed = _pack(k, dims)
+    i = np.minimum(np.searchsorted(cpacked, packed), len(cpacked) - 1)
+    missing = int((cpacked[i] != packed).sum())
+    if missing:
+        raise ValueError(f"{Path(lcp_path).name}: {missing:,} cells have combinations "
+                         f"not in the baseline block of {Path(combo_lcp).name}")
+    out = np.full((len(odesc),) + valid.shape, outside, dtype=cvals.dtype)
+    out[:, valid] = cvals[:, i]
+
+    if out_path is not None:
+        out_path = Path(out_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        profile.update(height=valid.shape[0], width=valid.shape[1], transform=transform,
+                       crs=crs, **raster_write_kwargs())
+        with rasterio.open(out_path, "w", **profile) as dst:
+            dst.write(out)
+            dst.descriptions = odesc
+            dst.update_tags(**EXPANDED_TAG)
+    return out

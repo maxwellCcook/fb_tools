@@ -443,3 +443,77 @@ def rasterize(zones, to_img, attr="id", fill_val=-9999):
     da = da.rio.write_transform(to_img.rio.transform())
     da.rio.set_spatial_dims(x_dim="x", y_dim="y", inplace=True)
     return da
+
+
+# ── Snapped grids ──────────────────────────────────────────────────────────────
+
+# LANDFIRE CONUS pixel edges in EPSG:5070 fall on 15 m mod 30.
+LANDFIRE_GRID_ORIGIN = (15.0, 15.0)
+
+
+def snapped_grid(aoi, crs, res_m, origin=(0.0, 0.0)):
+    """
+    North-up grid covering ``aoi`` with edges on ``origin + k * res_m``.
+
+    Parameters
+    ----------
+    aoi : GeoDataFrame or GeoSeries
+    crs : any
+        Projected CRS of the grid.
+    res_m : float
+    origin : tuple of float
+        Any (x, y) point the cell edges must pass through.
+
+    Returns
+    -------
+    transform : affine.Affine
+    shape : tuple of int
+        ``(nrows, ncols)``.
+    """
+    from rasterio.transform import from_origin
+
+    x0, y0 = origin
+    left, bottom, right, top = aoi.to_crs(crs).total_bounds
+    left = x0 + np.floor((left - x0) / res_m) * res_m
+    bottom = y0 + np.floor((bottom - y0) / res_m) * res_m
+    right = x0 + np.ceil((right - x0) / res_m) * res_m
+    top = y0 + np.ceil((top - y0) / res_m) * res_m
+    ncols = int(round((right - left) / res_m))
+    nrows = int(round((top - bottom) / res_m))
+    return from_origin(left, top, res_m, res_m), (nrows, ncols)
+
+
+def snap_origin(snap, crs, res_m):
+    """
+    Resolve a snap target to the ``(crs, origin)`` that :func:`snapped_grid` takes.
+
+    Parameters
+    ----------
+    snap : None, "landfire", or path-like
+        None snaps edges to multiples of ``res_m``. ``"landfire"`` snaps to LANDFIRE
+        pixel edges (EPSG:5070 only). A raster path snaps to that raster's pixel edges
+        and takes its CRS; ``res_m`` must be a whole multiple of its pixel size.
+    crs : any
+    res_m : float
+
+    Returns
+    -------
+    crs : rasterio.crs.CRS
+    origin : tuple of float
+    """
+    from rasterio.crs import CRS
+
+    crs = CRS.from_user_input(crs)
+    if snap is None:
+        return crs, (0.0, 0.0)
+    if isinstance(snap, str) and snap.lower() == "landfire":
+        if crs.to_epsg() != 5070:
+            raise ValueError("snap='landfire' needs crs EPSG:5070.")
+        px, origin = (30.0, 30.0), LANDFIRE_GRID_ORIGIN
+    else:
+        with rio.open(snap) as src:
+            crs, px, origin = src.crs, src.res, (src.transform.c, src.transform.f)
+    n = np.array([res_m / px[0], res_m / px[1]])
+    if not np.allclose(n, np.round(n)):
+        raise ValueError(f"res_m ({res_m}) is not a whole multiple of the snap pixel size {px}.")
+    return crs, origin

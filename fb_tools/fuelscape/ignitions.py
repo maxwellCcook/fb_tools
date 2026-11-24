@@ -21,6 +21,10 @@ footprint_radius_m, build_ignition_footprints, write_ignition_shapefiles
 ignition_density_surface, sample_density_at_points, write_density_raster
     Kernel-density ignition-likelihood surface from FPA-FOD, masked to
     burnable FBFM40 (P2.2).
+load_fod, ignition_density_grid, convert_density_units, write_density_grids
+    FSim-style ignition-density maps by cause (human / natural / combined,
+    human share, difference) in fires per year per 100 km², on any snapped
+    grid or a template raster.
 check_ignition_clustering
     Monte-Carlo test of Ager's uniform-ignition assumption against a
     burnable-restricted CSR null (P2.2).
@@ -295,6 +299,153 @@ def _scott_bandwidth_m(xy: np.ndarray) -> float:
     return float(n ** (-1.0 / 6.0) * sigma)
 
 
+def _interp_matrix(n_out: int, scale: float, offset: int, n_in: int):
+    """
+    Sparse 1-D linear-interpolation operator from a working axis to an output
+    axis, sampling at output cell centres.
+
+    Output cell *i* has its centre at working coordinate
+    ``(i + 0.5) / scale - 0.5 + offset``, with working cell *j*'s centre at *j*.
+    Positions past the ends are clamped (``mode="nearest"``).
+    """
+    from scipy import sparse
+
+    pos = (np.arange(n_out) + 0.5) / scale - 0.5 + offset
+    pos = np.clip(pos, 0.0, n_in - 1)
+    i0 = np.floor(pos).astype(int)
+    i1 = np.minimum(i0 + 1, n_in - 1)
+    f = pos - i0
+    rows = np.concatenate([np.arange(n_out), np.arange(n_out)])
+    cols = np.concatenate([i0, i1])
+    vals = np.concatenate([1.0 - f, f])
+    return sparse.csr_matrix((vals, (rows, cols)), shape=(n_out, n_in))
+
+
+def _smooth_points_onto_grid(x, y, transform, shape, bandwidth_m, pad_m):
+    """
+    Gaussian kernel density of points onto a north-up grid, in points per cell.
+
+    The one smoother behind :func:`ignition_density_surface` and
+    :func:`ignition_density_grid`.  The kernel is smooth at scale
+    ``bandwidth_m``, so binning and smoothing on a working grid of
+    ~bandwidth/4 costs nothing in accuracy and keeps the separable Gaussian a
+    few cells wide; doing it at output resolution would mean a sigma of
+    hundreds of cells over a heavily padded array.  The working grid is
+    resampled back to output cell centres with a separable bilinear operator,
+    so a CONUS grid never materializes a full coordinate array.
+
+    Parameters
+    ----------
+    x, y : array-like
+        Point coordinates in the grid CRS.
+    transform : affine.Affine
+        North-up output grid transform (square cells).
+    shape : tuple of int
+        ``(rows, cols)`` of the output grid.
+    bandwidth_m : float
+        Gaussian standard deviation, grid CRS units.
+    pad_m : float
+        Points out to this distance beyond the grid contribute; farther points
+        are dropped.
+
+    Returns
+    -------
+    density : numpy.ndarray
+        Expected points per output cell.  Mass-conserving: summed over a grid
+        that extends well past every point, it equals the point count.
+    n_used : int
+        Points within the padded extent.
+    n_in_domain : int
+        Points inside the grid itself.
+    sigma_cells : float
+        Bandwidth in working-grid cells.
+    """
+    from scipy.ndimage import gaussian_filter
+
+    nrows, ncols = shape
+    res_m = float(min(abs(transform.a), abs(transform.e)))
+    x = np.asarray(x, dtype="float64")
+    y = np.asarray(y, dtype="float64")
+
+    work_res = max(res_m, bandwidth_m / _SMOOTH_CELLS)
+    scale = work_res / res_m                       # output cells per working cell
+    sigma_cells = bandwidth_m / work_res
+
+    pad_cells = int(np.ceil(pad_m / work_res))
+    work_rows = int(np.ceil(nrows / scale)) + 2 * pad_cells
+    work_cols = int(np.ceil(ncols / scale)) + 2 * pad_cells
+
+    inv = ~transform
+    cols_f, rows_f = inv * (x, y)
+    pad_f = pad_m / res_m
+    keep = ((rows_f >= -pad_f) & (rows_f < nrows + pad_f)
+            & (cols_f >= -pad_f) & (cols_f < ncols + pad_f))
+    rows_f, cols_f = rows_f[keep], cols_f[keep]
+    n_used = int(keep.sum())
+    n_in_domain = int(
+        ((rows_f >= 0) & (rows_f < nrows) & (cols_f >= 0) & (cols_f < ncols)).sum()
+    )
+
+    rows_w = np.floor(rows_f / scale).astype(int) + pad_cells
+    cols_w = np.floor(cols_f / scale).astype(int) + pad_cells
+    ok = (rows_w >= 0) & (rows_w < work_rows) & (cols_w >= 0) & (cols_w < work_cols)
+
+    counts = np.zeros((work_rows, work_cols), dtype="float64")
+    np.add.at(counts, (rows_w[ok], cols_w[ok]), 1.0)
+    smoothed = gaussian_filter(counts, sigma=sigma_cells, mode="constant", cval=0.0)
+
+    if scale == 1.0:
+        density = smoothed[pad_cells:pad_cells + nrows,
+                           pad_cells:pad_cells + ncols].copy()
+    else:
+        wr = _interp_matrix(nrows, scale, pad_cells, work_rows)
+        wc = _interp_matrix(ncols, scale, pad_cells, work_cols)
+        density = np.asarray((wc @ (wr @ smoothed).T).T)
+        # Working-cell mass → output-cell mass, so the units stay points/cell.
+        density = density / (scale ** 2)
+
+    return density, n_used, n_in_domain, float(sigma_cells)
+
+
+def _adaptive_bandwidths(x, y, h0: float, trim: float = 5.0, h_floor: float = 0.0):
+    """
+    Per-point bandwidths by Abramson's (1982) square-root law.
+
+    ``h_i = h0 · sqrt(g / f̃(x_i))``, with ``f̃`` a fixed-kernel pilot density
+    at bandwidth ``h0`` and ``g`` its geometric mean over the points, so a
+    point at typical density gets ``h0``, denser points less, sparser more.
+    The factor is clipped to ``[1/trim, trim]`` (``sparr``'s ``trim``) and
+    the result floored at ``h_floor``.
+    """
+    from rasterio.transform import from_origin
+
+    x = np.asarray(x, dtype="float64")
+    y = np.asarray(y, dtype="float64")
+    res = h0 / 2.0
+    pad = 3.0 * h0
+    left, top = x.min() - pad, y.max() + pad
+    ncols = int(np.ceil((x.max() + pad - left) / res)) + 1
+    nrows = int(np.ceil((top - (y.min() - pad)) / res)) + 1
+    t = from_origin(left, top, res, res)
+    pilot, *_ = _smooth_points_onto_grid(x, y, t, (nrows, ncols), h0, pad)
+    cols, rows = ~t * (x, y)
+    f = pilot[np.floor(rows).astype(int), np.floor(cols).astype(int)]
+    f = np.maximum(f, f[f > 0].min())       # each point's own kernel keeps f > 0
+    g = float(np.exp(np.mean(np.log(f))))
+    lam = np.clip(np.sqrt(g / f), 1.0 / trim, trim)
+    return np.maximum(h0 * lam, h_floor)
+
+
+def _bandwidth_bins(h, n_bins: int = 24):
+    """Group per-point bandwidths into log-spaced classes → (class index, class σ)."""
+    lo, hi = float(h.min()), float(h.max())
+    if hi / lo < 1.0 + 1e-6:
+        return np.zeros(len(h), dtype=int), np.array([lo])
+    edges = np.geomspace(lo, hi, n_bins + 1)
+    idx = np.clip(np.searchsorted(edges, h, side="right") - 1, 0, n_bins - 1)
+    return idx, np.sqrt(edges[:-1] * edges[1:])
+
+
 def ignition_density_surface(
     fod_gdf,
     lcp_fp: "str | Path",
@@ -359,13 +510,9 @@ def ignition_density_surface(
     ValueError
         If no points fall within the buffered LCP extent.
     """
-    from scipy.ndimage import gaussian_filter, map_coordinates
-    from shapely.geometry import box
-
     grid = _read_burnable_mask(lcp_fp)
     transform, crs, shape = grid["transform"], grid["crs"], grid["shape"]
     res_m = grid["res_m"]
-    nrows, ncols = shape
 
     pts = fod_gdf.to_crs(crs)
     pts = pts[pts.geometry.notna() & ~pts.geometry.is_empty]
@@ -379,65 +526,18 @@ def ignition_density_surface(
               f"a sensible spatial scale for your domain.")
     bandwidth_m = max(float(bandwidth_m), min_bandwidth_cells * res_m)
 
-    # ── Retain points out to N bandwidths beyond the grid ─────────────────────
-    left = transform.c
-    top = transform.f
-    right = left + ncols * transform.a
-    bottom = top + nrows * transform.e  # transform.e is negative
+    # ── Bin, smooth, and resample back onto the LCP grid ─────────────────────
     pad = clip_buffer_bandwidths * bandwidth_m
-    padded = box(min(left, right) - pad, min(top, bottom) - pad,
-                 max(left, right) + pad, max(top, bottom) + pad)
-    pts = pts[pts.within(padded)]
-    if len(pts) == 0:
+    density, n_used, n_in_domain, sigma_cells = _smooth_points_onto_grid(
+        pts.geometry.x.values, pts.geometry.y.values,
+        transform, shape, bandwidth_m, pad,
+    )
+    if n_used == 0:
         raise ValueError(
             "No ignition points fall within the LCP extent buffered by "
             f"{pad:,.0f} m. Check that fod_gdf covers the study area and is "
             "not over-filtered."
         )
-
-    # ── Bin, smooth, and resample back onto the LCP grid ─────────────────────
-    # The kernel is smooth at scale `bandwidth_m`, so binning and smoothing on
-    # a working grid of ~bandwidth/4 costs nothing in accuracy and keeps the
-    # separable Gaussian at a few cells wide.  Doing it at LCP resolution would
-    # mean a sigma of hundreds of cells over a heavily padded array.
-    work_res = max(res_m, bandwidth_m / _SMOOTH_CELLS)
-    scale = work_res / res_m                       # LCP cells per working cell
-    sigma_cells = bandwidth_m / work_res
-
-    pad_cells = int(np.ceil(pad / work_res))
-    work_rows = int(np.ceil(nrows / scale)) + 2 * pad_cells
-    work_cols = int(np.ceil(ncols / scale)) + 2 * pad_cells
-
-    inv = ~transform
-    cols_f, rows_f = inv * (pts.geometry.x.values, pts.geometry.y.values)
-    n_in_domain = int(
-        ((rows_f >= 0) & (rows_f < nrows) & (cols_f >= 0) & (cols_f < ncols)).sum()
-    )
-
-    rows_w = np.floor(rows_f / scale).astype(int) + pad_cells
-    cols_w = np.floor(cols_f / scale).astype(int) + pad_cells
-
-    counts = np.zeros((work_rows, work_cols), dtype=float)
-    ok = (
-        (rows_w >= 0) & (rows_w < work_rows)
-        & (cols_w >= 0) & (cols_w < work_cols)
-    )
-    np.add.at(counts, (rows_w[ok], cols_w[ok]), 1.0)
-
-    smoothed = gaussian_filter(counts, sigma=sigma_cells, mode="constant", cval=0.0)
-
-    if scale == 1.0:
-        density = smoothed[pad_cells:pad_cells + nrows,
-                           pad_cells:pad_cells + ncols]
-    else:
-        # Bilinear sample of the working grid at every LCP cell centre
-        rr = np.arange(nrows) / scale + pad_cells
-        cc = np.arange(ncols) / scale + pad_cells
-        coords = np.array(np.meshgrid(rr, cc, indexing="ij"))
-        density = map_coordinates(smoothed, coords, order=1, mode="nearest")
-        # Working-cell mass → LCP-cell mass, so `normalize=False` stays in
-        # points per LCP cell.
-        density = density / (scale ** 2)
 
     if mask_burnable:
         density = np.where(grid["mask"], density, 0.0)
@@ -453,7 +553,7 @@ def ignition_density_surface(
         density = density / total
 
     print(f"  [ignition_density_surface] bandwidth={bandwidth_m:,.0f} m "
-          f"({sigma_cells:.1f} cells), {len(pts)} points "
+          f"({sigma_cells:.1f} cells), {n_used} points "
           f"({n_in_domain} inside the LCP), "
           f"{'burnable-masked, ' if mask_burnable else ''}"
           f"{'normalized' if normalize else 'counts per cell'}")
@@ -464,7 +564,7 @@ def ignition_density_surface(
         "crs":          crs,
         "shape":        shape,
         "bandwidth_m":  float(bandwidth_m),
-        "n_points":     int(len(pts)),
+        "n_points":     int(n_used),
         "n_in_domain":  n_in_domain,
         "cell_area_m2": grid["cell_area_m2"],
         "normalized":   bool(normalize),
@@ -542,6 +642,398 @@ def write_density_raster(density: dict, out_path: "str | Path") -> Path:
         )
     print(f"  [write_density_raster] → {out_path.name}")
     return out_path.resolve()
+
+
+# ── Ignition density grids by cause (FSim-style IDG maps) ─────────────────────
+
+#: FPA-FOD ``NWCG_CAUSE_CLASSIFICATION`` → short cause label.  Anything else
+#: ("Missing data/not specified/undetermined") becomes ``"unknown"``.
+FOD_CAUSES = {"Human": "human", "Natural": "natural"}
+
+#: A pixel-edge origin of the LANDFIRE CONUS grid (EPSG:5070): LF 30 m edges
+#: sit at 15 m mod 30.  Grids snapped to it at any multiple of 30 m nest whole
+#: LANDFIRE pixels.  To match one specific raster exactly, pass ``template``.
+from ..utils.geo import LANDFIRE_GRID_ORIGIN, snapped_grid  # noqa: E402  (shared grid snapping)
+
+_FOD_COLUMNS = [
+    "FOD_ID", "FIRE_NAME", "FIRE_YEAR", "DISCOVERY_DATE", "FIRE_SIZE", "FIRE_SIZE_CLASS",
+    "NWCG_CAUSE_CLASSIFICATION", "NWCG_GENERAL_CAUSE", "SOURCE_SYSTEM_TYPE", "NWCG_REPORTING_AGENCY", "STATE",
+]
+
+
+def load_fod(
+    fod_fp: "str | Path",
+    aoi=None,
+    buffer_m: float = 0.0,
+    years: "tuple[int, int] | None" = None,
+    size_classes=None,
+    columns=None,
+    layer: str = "Fires",
+):
+    """
+    Read FPA-FOD ignition points with the filters pushed into the read.
+
+    Parameters
+    ----------
+    fod_fp : str or Path
+        FPA-FOD GeoPackage (e.g. ``FPA_FOD_20260615.gpkg``).
+    aoi : geopandas.GeoDataFrame or GeoSeries, optional
+        Area of interest, any CRS.  Only points inside its bounding box,
+        expanded by ``buffer_m``, are read.  ``None`` reads the whole layer.
+    buffer_m : float
+        Expansion of the AOI box in metres (applied in EPSG:5070).  Pass at
+        least 3 kernel bandwidths so the density surface is not biased low at
+        the AOI edge.
+    years : (int, int), optional
+        Inclusive ``FIRE_YEAR`` range.
+    size_classes : iterable of str, optional
+        ``FIRE_SIZE_CLASS`` letters to keep (e.g. ``"CDEFG"`` for ≥ 10 ac).
+    columns : list of str, optional
+        Attribute columns to read; defaults to the year, size, cause and state
+        fields.
+    layer : str
+        GeoPackage layer.
+
+    Returns
+    -------
+    geopandas.GeoDataFrame
+        Points in the file CRS with an added ``cause`` column —
+        ``"human"``, ``"natural"`` or ``"unknown"`` (see :data:`FOD_CAUSES`).
+    """
+    import pyogrio
+
+    fod_fp = Path(fod_fp)
+    where = []
+    if years is not None:
+        y0, y1 = (int(v) for v in years)
+        where.append(f"FIRE_YEAR BETWEEN {y0} AND {y1}")
+    if size_classes is not None:
+        cls = ", ".join(f"'{c}'" for c in size_classes)
+        where.append(f"FIRE_SIZE_CLASS IN ({cls})")
+
+    bbox = None
+    if aoi is not None:
+        file_crs = pyogrio.read_info(fod_fp, layer=layer)["crs"]
+        box_gs = aoi.to_crs(5070).envelope.buffer(buffer_m, join_style=2)
+        bbox = tuple(box_gs.to_crs(file_crs).total_bounds)
+
+    cols = list(columns) if columns is not None else list(_FOD_COLUMNS)
+    if "NWCG_CAUSE_CLASSIFICATION" not in cols:
+        cols.append("NWCG_CAUSE_CLASSIFICATION")
+    gdf = pyogrio.read_dataframe(
+        fod_fp, layer=layer, columns=cols, bbox=bbox,
+        where=" AND ".join(where) or None,
+    )
+    gdf["cause"] = gdf["NWCG_CAUSE_CLASSIFICATION"].map(FOD_CAUSES).fillna("unknown")
+    counts = gdf["cause"].value_counts().to_dict()
+    print(f"  [load_fod] {len(gdf):,} records "
+          f"({', '.join(f'{k} {v:,}' for k, v in sorted(counts.items()))})")
+    return gdf
+
+
+def ignition_density_grid(
+    fod_gdf,
+    aoi=None,
+    *,
+    template: "str | Path | None" = None,
+    res_m: float = 1000.0,
+    bandwidth_m: float = 5000.0,
+    crs="EPSG:5070",
+    origin: "tuple | None" = None,
+    years: "tuple[int, int] | None" = None,
+    by: str = "cause",
+    pad_bandwidths: float = 3.0,
+    mask_to_aoi: bool = True,
+    share_min_fires: float = 10.0,
+    adaptive: bool = False,
+    trim: float = 5.0,
+    n_bandwidth_bins: int = 24,
+):
+    """
+    Annual ignition-density grids by cause, in fires per year per 100 km².
+
+    The FSim ignition-density-grid idea, but kept in absolute units so that
+    causes can be added and differenced: each group's points are kernel-
+    smoothed (isotropic Gaussian) onto one grid and divided by the record
+    length and cell area.  Not masked to burnable fuel — this is a map of
+    where fires have started, not a sampling frame.  For a burnable-masked,
+    sum-to-one surface on an LCP grid use :func:`ignition_density_surface`.
+
+    Parameters
+    ----------
+    fod_gdf : geopandas.GeoDataFrame
+        Ignition points, any CRS, with a ``by`` column (``cause`` from
+        :func:`load_fod`).  Include points out to ``pad_bandwidths`` ×
+        ``bandwidth_m`` beyond the AOI so edge cells are not biased low.
+    aoi : geopandas.GeoDataFrame or GeoSeries, optional
+        Defines the grid extent (snapped to ``origin``) and, with
+        ``mask_to_aoi``, the cells kept.  Required unless ``template`` is given.
+    template : str or Path, optional
+        Raster whose CRS, transform and shape define the grid exactly (e.g. an
+        LCP).  Overrides ``res_m``, ``crs`` and ``origin``.
+    res_m : float
+        Cell size in metres.  Default 1 km.
+    bandwidth_m : float
+        Kernel standard deviation in metres.  Default 5 km.
+    crs : str or CRS
+        Output CRS (projected, metres).  Default CONUS Albers, EPSG:5070.
+        A UTM zone (e.g. ``"EPSG:26913"``, NAD83 / UTM 13N) suits a county
+        or forest extent.
+    origin : (float, float), optional
+        Any grid-edge coordinate; edges sit at ``origin + k * res_m``.
+        Default: :data:`LANDFIRE_GRID_ORIGIN` in EPSG:5070 (cells nest
+        LANDFIRE pixels), ``(0, 0)`` in any other CRS.
+    years : (int, int), optional
+        Inclusive record span used to annualize.  Defaults to the min–max
+        ``FIRE_YEAR`` in ``fod_gdf`` — pass it explicitly when a filter could
+        leave the first or last year empty.
+    by : str
+        Grouping column.  Default ``"cause"``.
+    pad_bandwidths : float
+        Points beyond this many bandwidths from the grid are ignored.
+    mask_to_aoi : bool
+        Set cells whose centre is outside ``aoi`` to NaN (default True).
+    share_min_fires : float
+        ``human_share`` is NaN where the kernel holds fewer than this many
+        human + natural fires over the record (effective count
+        ``rate × years × 4πσ²``, with the local σ when ``adaptive``); below
+        it the share is mostly noise.
+    adaptive : bool
+        Variable-bandwidth kernel (Abramson's square-root law): each fire's σ
+        is ``bandwidth_m · sqrt(g / f̃)``, ``f̃`` a fixed-``bandwidth_m``
+        pilot density at the fire and ``g`` its geometric mean — narrow where
+        fires are dense, wide where sparse.  σ is set once from **all** fires
+        pooled and shared by every cause (the symmetric adaptive estimator of
+        Davies, Jones & Hazelton 2016), so ``human_share`` compares like with
+        like and ``all`` still equals the sum of the causes.  Adds a
+        ``bandwidth_local`` layer (m): the kernel-weighted mean σ per cell.
+    trim : float
+        With ``adaptive``, σ is clipped to ``[bandwidth_m / trim,
+        bandwidth_m · trim]``, and floored at 2 cells.
+    n_bandwidth_bins : int
+        With ``adaptive``, per-fire σ is grouped into this many log-spaced
+        classes, each smoothed once (±~7 % in σ at the defaults).
+
+    Returns
+    -------
+    xarray.Dataset
+        One float32 variable per group, plus ``all`` (every record, including
+        unknown cause).  When the groups include ``human`` and ``natural``,
+        also ``human_share`` = H / (H + N) and ``difference`` = H − N.
+        Coordinates ``y``/``x`` are cell centres; CRS is written via
+        rioxarray.  ``attrs`` carry units, bandwidth, resolution, years and
+        per-group point counts.
+
+    Raises
+    ------
+    ValueError
+        If neither ``aoi`` nor ``template`` is given, the CRS is geographic,
+        or no points reach the grid.
+    """
+    import rasterio
+    import xarray as xr
+    import rioxarray  # noqa: F401  (registers .rio)
+    from rasterio.crs import CRS
+    from rasterio.features import geometry_mask
+
+    if template is not None:
+        with rasterio.open(template) as src:
+            transform, shape, grid_crs = src.transform, src.shape, src.crs
+    elif aoi is not None:
+        grid_crs = CRS.from_user_input(crs)
+        if origin is None:
+            origin = LANDFIRE_GRID_ORIGIN if grid_crs.to_epsg() == 5070 else (0.0, 0.0)
+        transform, shape = snapped_grid(aoi, grid_crs, float(res_m), origin)
+    else:
+        raise ValueError("Pass an `aoi` or a `template` raster to define the grid.")
+    if grid_crs.is_geographic:
+        raise ValueError(f"Grid CRS must be projected (metres); got {grid_crs}.")
+
+    nrows, ncols = shape
+    res = float(min(abs(transform.a), abs(transform.e)))
+    cell_km2 = abs(transform.a * transform.e) / 1e6
+
+    if years is None:
+        years = (int(fod_gdf["FIRE_YEAR"].min()), int(fod_gdf["FIRE_YEAR"].max()))
+        print(f"  [ignition_density_grid] years inferred from data: {years[0]}–{years[1]}")
+    n_years = int(years[1]) - int(years[0]) + 1
+
+    pts = fod_gdf.to_crs(grid_crs)
+    pts = pts[pts.geometry.notna() & ~pts.geometry.is_empty]
+    x_all, y_all = pts.geometry.x.values, pts.geometry.y.values
+    pad = pad_bandwidths * bandwidth_m * (trim if adaptive else 1.0)
+
+    if adaptive:
+        h_pts = _adaptive_bandwidths(x_all, y_all, bandwidth_m, trim=trim, h_floor=2.0 * res)
+        bin_idx, bin_sigma = _bandwidth_bins(h_pts, n_bandwidth_bins)
+    else:
+        bin_idx, bin_sigma = np.zeros(len(pts), dtype=int), np.array([float(bandwidth_m)])
+    h_sum = np.zeros((nrows, ncols))       # Σ σ·density, for the local-σ layer
+
+    def rate(sel, track_sigma=False):
+        total, n_used = np.zeros((nrows, ncols)), 0
+        for b, sigma in enumerate(bin_sigma):
+            s = sel & (bin_idx == b)
+            if not s.any():
+                continue
+            d, n, _, _ = _smooth_points_onto_grid(
+                x_all[s], y_all[s], transform, (nrows, ncols), sigma, pad_bandwidths * sigma)
+            total += d
+            n_used += n
+            if track_sigma:
+                h_sum[...] += d * sigma
+        return (total / n_years / cell_km2 * 100.0).astype("float32"), n_used, total
+
+    layers, n_points = {}, {}
+    groups = sorted(pts[by].dropna().unique())
+    for g in groups:
+        layers[str(g)], n_points[str(g)], _ = rate((pts[by] == g).values)
+    layers["all"], n_points["all"], all_mass = rate(np.ones(len(pts), dtype=bool), track_sigma=True)
+    if n_points["all"] == 0:
+        raise ValueError("No ignition points fall within the grid extent "
+                         f"buffered by {pad:,.0f} m.")
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        sigma_local = np.where(all_mass > 1e-12, h_sum / all_mass, float(bin_sigma.max()))
+    if adaptive:
+        layers["bandwidth_local"] = sigma_local.astype("float32")
+
+    if "human" in layers and "natural" in layers:
+        hn = layers["human"].astype("float64") + layers["natural"]
+        # Expected fires under the kernel over the record: rate per km² per yr
+        # × years × the Gaussian's effective area 4πσ².
+        n_eff = hn / 100.0 * n_years * 4.0 * np.pi * (sigma_local / 1000.0) ** 2
+        with np.errstate(invalid="ignore", divide="ignore"):
+            share = np.where(n_eff >= share_min_fires, layers["human"] / hn, np.nan)
+        layers["human_share"] = share.astype("float32")
+        layers["difference"] = (layers["human"] - layers["natural"]).astype("float32")
+
+    if mask_to_aoi and aoi is not None:
+        geoms = aoi.to_crs(grid_crs).geometry
+        outside = geometry_mask(geoms, out_shape=(nrows, ncols), transform=transform)
+        for k in layers:
+            layers[k] = np.where(outside, np.nan, layers[k]).astype("float32")
+
+    xs = transform.c + (np.arange(ncols) + 0.5) * transform.a
+    ys = transform.f + (np.arange(nrows) + 0.5) * transform.e
+    ds = xr.Dataset({k: (("y", "x"), v) for k, v in layers.items()},
+                    coords={"y": ys, "x": xs})
+    ds = ds.rio.write_crs(grid_crs).rio.write_transform(transform)
+    for k in ds.data_vars:
+        ds[k].attrs["units"] = {"human_share": "-", "bandwidth_local": "m"}.get(k, "fires / yr / 100 km2")
+    ds.attrs.update({
+        "bandwidth_m": float(bandwidth_m),
+        "res_m": res,
+        "years": f"{years[0]}-{years[1]}",
+        "n_years": n_years,
+        "by": by,
+        "share_min_fires": float(share_min_fires),
+        "adaptive": str(bool(adaptive)),
+        **({"trim": float(trim),
+            "bandwidth_p05_m": float(np.percentile(h_pts, 5)),
+            "bandwidth_p50_m": float(np.percentile(h_pts, 50)),
+            "bandwidth_p95_m": float(np.percentile(h_pts, 95))} if adaptive else {}),
+        **{f"n_points_{k}": int(v) for k, v in n_points.items()},
+    })
+    kern = (f"adaptive σ₀={bandwidth_m:,.0f} m (fires p5–p95 {ds.attrs['bandwidth_p05_m']:,.0f}–"
+            f"{ds.attrs['bandwidth_p95_m']:,.0f} m)") if adaptive else f"σ={bandwidth_m:,.0f} m"
+    print(f"  [ignition_density_grid] {nrows}×{ncols} @ {res:,.0f} m, "
+          f"{kern}, {n_years} yr; points used: "
+          + ", ".join(f"{k} {v:,}" for k, v in n_points.items()))
+    return ds
+
+
+DENSITY_AREAS_KM2 = {"km2": 1.0, "100km2": 100.0, "mi2": 2.589988110336, "100mi2": 258.9988110336}
+_AREA_LABEL = {"km2": "km2", "100km2": "100 km2", "mi2": "sq mi", "100mi2": "100 sq mi"}
+_UNSCALED = {"human_share", "bandwidth_local"}
+
+
+def convert_density_units(ds, *, per_year: bool = True, area: str = "100km2"):
+    """
+    Re-express :func:`ignition_density_grid` layers in other density units.
+
+    The map pattern is unchanged — only the numbers and ``units`` labels. For a
+    general audience, fires over the whole record per square mile
+    (``per_year=False, area="mi2"``) is often easier to read than an annual rate.
+
+    Parameters
+    ----------
+    ds : xarray.Dataset
+        Output of :func:`ignition_density_grid`, or of this function.
+    per_year : bool
+        ``True`` → fires per year; ``False`` → total fires over the record
+        (``ds.attrs["years"]``, ``n_years`` years).
+    area : {"km2", "100km2", "mi2", "100mi2"}
+        Reference area.
+
+    Returns
+    -------
+    xarray.Dataset
+        A copy; ``human_share`` and ``bandwidth_local`` are left as they are.
+
+    Raises
+    ------
+    ValueError
+        On an unknown ``area``.
+    """
+    if area not in DENSITY_AREAS_KM2:
+        raise ValueError(f"area must be one of {sorted(DENSITY_AREAS_KM2)}, got {area!r}")
+    cur_per_year = ds.attrs.get("density_per_year", "True") == "True"
+    cur_area = ds.attrs.get("density_area", "100km2")
+    n_years = float(ds.attrs["n_years"])
+    factor = (DENSITY_AREAS_KM2[area] / DENSITY_AREAS_KM2[cur_area]
+              * (1.0 if per_year else n_years) / (1.0 if cur_per_year else n_years))
+    units = (f"fires / yr / {_AREA_LABEL[area]}" if per_year
+             else f"fires / {_AREA_LABEL[area]} ({ds.attrs['years']})")
+    out = ds.copy(deep=True)
+    for k in out.data_vars:
+        if k in _UNSCALED:
+            continue
+        out[k] = (out[k] * factor).astype("float32")
+        out[k].attrs["units"] = units
+    out.attrs.update(density_per_year=str(bool(per_year)), density_area=area, density_units=units)
+    return out
+
+
+def write_density_grids(ds, out_dir: "str | Path", prefix: str = "idg") -> "list[Path]":
+    """
+    Write each variable of :func:`ignition_density_grid` to its own GeoTIFF.
+
+    Parameters
+    ----------
+    ds : xarray.Dataset
+        Output of :func:`ignition_density_grid`.
+    out_dir : str or Path
+        Destination directory (created if needed).
+    prefix : str
+        Files are ``{prefix}_{variable}.tif``.
+
+    Returns
+    -------
+    list of Path
+    """
+    import rasterio
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    transform = ds.rio.transform()
+    crs = ds.rio.crs
+    tags = {k: str(v) for k, v in ds.attrs.items()}
+    paths = []
+    for name, da in ds.data_vars.items():
+        fp = out_dir / f"{prefix}_{name}.tif"
+        profile = {
+            "driver": "GTiff", "dtype": "float32", "count": 1,
+            "height": da.shape[0], "width": da.shape[1],
+            "transform": transform, "crs": crs, "nodata": np.nan,
+            "compress": "deflate", "predictor": 3, "tiled": True,
+        }
+        with rasterio.open(fp, "w", **profile) as dst:
+            dst.write(da.values.astype("float32"), 1)
+            dst.update_tags(**tags, units=da.attrs.get("units", ""), variable=name)
+        paths.append(fp.resolve())
+    print(f"  [write_density_grids] {len(paths)} rasters → {out_dir}")
+    return paths
 
 
 def sample_density_ignitions(
